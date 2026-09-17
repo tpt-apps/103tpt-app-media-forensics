@@ -1,0 +1,2716 @@
+TPT App Media Forensics
+
+1. Product Definition
+
+Product name: TPT Media Forensics
+Repository: tpt-app-media-forensics
+Product family: TPT Apps
+Category: Professional media inspection, forensic analysis, validation, and evidence preservation
+Primary distribution: Offline desktop application
+Primary target: Post-production, broadcast, media engineering, legal/evidentiary workflows, archives, security/media investigators, and technical QA
+Target platforms: Windows first; Linux/macOS later
+
+2. Executive Summary
+
+TPT Media Forensics is an offline professional desktop application for answering a deceptively simple question:
+
+What exactly is inside this media file, how was it produced, and is there anything technically wrong, unusual, inconsistent, or suspicious about it?
+
+The application provides deep inspection of:
+
+video
+
+audio
+
+containers
+
+codecs
+
+metadata
+
+timestamps
+
+frame structure
+
+GOP structure
+
+packet structure
+
+streams
+
+subtitles
+
+attachments
+
+colour information
+
+synchronisation
+
+corruption
+
+discontinuities
+
+encoding anomalies
+
+file structure
+
+media provenance indicators
+
+It should not initially position itself as a consumer "AI deepfake detector." That market is crowded, difficult to validate, and prone to overclaiming.
+
+Instead, the product should establish a much stronger technical position:
+
+Forensic-grade inspection of media structure, timing, encoding, metadata, and integrity — performed locally.
+
+The application should leverage the TPT media foundation:
+
+tpt-kinetix
+
+tpt-cadence
+
+tpt-visual
+
+tpt-audio
+
+tpt-voice
+
+tpt-av-asset
+
+tpt-av-sync
+
+tpt-av-test
+
+tpt-dsp
+
+The application is therefore a commercial layer on top of a substantial media technology stack.
+
+3. Commercial Objective
+
+The product should target professional users who have a financial reason to answer media questions accurately.
+
+Potential customers:
+
+Broadcast engineering teams
+
+Post-production facilities
+
+Media archivists
+
+Digital preservation teams
+
+Film restoration specialists
+
+Media QA teams
+
+Video production companies
+
+Content distributors
+
+Legal/eDiscovery teams
+
+Insurance investigators
+
+Corporate security teams
+
+Journalists and investigative organisations
+
+Digital forensics consultants
+
+Government agencies
+
+Universities/research institutions
+
+The product should not attempt to sell primarily on "better video player" functionality.
+
+The commercial proposition is:
+
+When the media file matters, inspect it at engineering depth.
+
+4. Commercial Positioning
+
+Avoid competing directly with general-purpose media players.
+
+Avoid positioning as:
+
+"A better VLC."
+
+Instead:
+
+Professional forensic inspection for audio and video files.
+
+The software should be useful when:
+
+a file fails to ingest
+
+a client disputes what was delivered
+
+a video has unexplained glitches
+
+audio goes out of sync
+
+metadata is inconsistent
+
+a file has unexpected encoding properties
+
+an archive needs validation
+
+a suspicious file requires technical inspection
+
+a media asset needs to be preserved with a defensible technical record
+
+5. Core Product Workflow
+
+The primary workflow:
+
+OPEN FILE
+    ↓
+HASH / IDENTIFY
+    ↓
+PARSE CONTAINER
+    ↓
+ENUMERATE STREAMS
+    ↓
+INSPECT CODECS
+    ↓
+ANALYSE TIMING
+    ↓
+ANALYSE VIDEO
+    ↓
+ANALYSE AUDIO
+    ↓
+ANALYSE METADATA
+    ↓
+CHECK INTEGRITY
+    ↓
+RUN FORENSIC RULES
+    ↓
+GENERATE FINDINGS
+    ↓
+CAPTURE EVIDENCE
+    ↓
+EXPORT REPORT
+
+Every stage should preserve raw observations.
+
+6. Design Principles
+
+6.1 Evidence before interpretation
+
+The application must clearly distinguish:
+
+Observed fact
+Derived measurement
+Heuristic finding
+Interpretation
+
+Example:
+
+Observed:
+Frame 12873 has decode timestamp discontinuity.
+
+Derived:
+Timestamp delta = -41.7 ms.
+
+Finding:
+Non-monotonic timestamp detected.
+
+Interpretation:
+Potential editing, corruption, or muxing anomaly.
+
+The final interpretation must never be presented as fact unless the evidence supports it.
+
+6.2 No false certainty
+
+The application must avoid claims such as:
+
+"This video is fake."
+
+Instead:
+
+"The following technical inconsistencies were detected."
+
+This is essential for professional and legal use.
+
+6.3 Reproducibility
+
+A forensic analysis should be reproducible.
+
+Record:
+
+input hash
+
+application version
+
+TPT library versions
+
+analysis profile
+
+enabled rules
+
+timestamps
+
+machine-independent measurements
+
+generated findings
+
+A second user should be able to run the same analysis and understand how the result was produced.
+
+6.4 Offline first
+
+No upload should be necessary.
+
+This is a major commercial feature for:
+
+confidential footage
+
+unreleased productions
+
+legal material
+
+corporate media
+
+sensitive investigations
+
+7. Foundation Integration
+
+7.1 tpt-kinetix
+
+Primary video engine.
+
+Use for:
+
+decoding
+
+frame inspection
+
+video timing
+
+pixel-format analysis
+
+frame extraction
+
+codec structures
+
+7.2 tpt-cadence
+
+Primary audio codec/media timing foundation.
+
+Use for:
+
+audio codec parsing
+
+packet-level analysis
+
+timestamps
+
+frame structures
+
+codec metadata
+
+7.3 tpt-visual
+
+Use for:
+
+frame analysis
+
+image statistics
+
+colour analysis
+
+visual comparisons
+
+artefact detection
+
+7.4 tpt-audio
+
+Use for:
+
+waveform analysis
+
+channel analysis
+
+audio extraction
+
+audio statistics
+
+7.5 tpt-voice
+
+Potential future features:
+
+speech segmentation
+
+voice characteristics
+
+transcription-assisted inspection
+
+speaker changes
+
+Do not make AI voice detection a core MVP feature.
+
+7.6 tpt-av-sync
+
+Use for:
+
+audio/video timing analysis
+
+timestamp correlation
+
+drift detection
+
+synchronisation measurements
+
+7.7 tpt-av-asset
+
+Use for:
+
+asset identification
+
+media asset metadata
+
+evidence storage
+
+generated derivatives
+
+7.8 tpt-av-test
+
+Use for:
+
+deterministic test infrastructure
+
+corruption testing
+
+codec edge cases
+
+media fixture management
+
+7.9 tpt-dsp
+
+Use for:
+
+spectral analysis
+
+signal statistics
+
+noise analysis
+
+frequency-domain measurements
+
+audio anomaly detection
+
+8. Repository Structure
+
+tpt-app-media-forensics/
+├── Cargo.toml
+├── README.md
+├── LICENSE
+├── CHANGELOG.md
+├── docs/
+│   ├── architecture.md
+│   ├── evidence-model.md
+│   ├── analysis-model.md
+│   ├── findings.md
+│   ├── report-format.md
+│   └── rules.md
+├── crates/
+│   ├── tpt-app-media-forensics-core/
+│   ├── tpt-app-media-forensics-model/
+│   ├── tpt-app-media-forensics-container/
+│   ├── tpt-app-media-forensics-video/
+│   ├── tpt-app-media-forensics-audio/
+│   ├── tpt-app-media-forensics-timing/
+│   ├── tpt-app-media-forensics-metadata/
+│   ├── tpt-app-media-forensics-rules/
+│   ├── tpt-app-media-forensics-evidence/
+│   ├── tpt-app-media-forensics-report/
+│   ├── tpt-app-media-forensics-cli/
+│   └── tpt-app-media-forensics-tauri/
+├── rules/
+│   ├── container/
+│   ├── video/
+│   ├── audio/
+│   ├── timing/
+│   └── metadata/
+├── fixtures/
+└── tests/
+
+9. Case Model
+
+A forensic analysis should be organised around a case rather than a file.
+
+struct Case {
+    id: CaseId,
+    name: String,
+    description: Option<String>,
+    assets: Vec<AssetId>,
+    analyses: Vec<AnalysisId>,
+    findings: Vec<FindingId>,
+    evidence: Vec<EvidenceId>,
+    reports: Vec<ReportId>,
+}
+
+One case may contain:
+
+original.mp4
+edited.mp4
+reference.mov
+audio.wav
+export.mp4
+screenshots
+notes
+
+This allows comparison between related media.
+
+10. Asset Model
+
+struct MediaAsset {
+    id: AssetId,
+    path: PathBuf,
+    size_bytes: u64,
+    hashes: HashSet,
+    media_type: MediaType,
+}
+
+Hashes should initially include:
+
+SHA-256
+
+Potential additional hashes:
+
+SHA-512
+
+BLAKE3
+
+BLAKE3 is useful for high-speed local processing, while SHA-256 is useful for interoperability.
+
+11. Acquisition Record
+
+Before analysis, record:
+
+Original path
+File size
+Modification timestamp
+Creation timestamp where available
+SHA-256
+BLAKE3
+Filesystem information
+
+Do not modify the source file.
+
+The application should make it obvious that analysis operates on a read-only source.
+
+12. Container Analysis
+
+The container layer should inspect:
+
+container type
+
+version
+
+duration
+
+stream count
+
+stream ordering
+
+packet counts
+
+index structures
+
+timebase
+
+start time
+
+duration consistency
+
+interleaving
+
+padding
+
+trailing data
+
+malformed structures
+
+unexpected data
+
+Potential containers:
+
+MP4
+
+MOV
+
+MKV
+
+WebM
+
+AVI
+
+MPEG-TS
+
+MXF
+
+WAV
+
+AIFF
+
+FLAC
+
+Ogg
+
+Matroska
+
+The implementation should prioritise formats already supported by TPT media crates.
+
+13. Stream Analysis
+
+Every stream should receive an independent report.
+
+struct StreamAnalysis {
+    stream_id: StreamId,
+    kind: StreamKind,
+    codec: CodecInfo,
+    timing: TimingAnalysis,
+    metadata: MetadataAnalysis,
+    integrity: IntegrityAnalysis,
+}
+
+Stream types:
+
+Video
+Audio
+Subtitle
+Data
+Attachment
+Unknown
+
+14. Video Analysis
+
+The video analyzer should inspect:
+
+Structural
+
+codec
+
+profile
+
+level
+
+pixel format
+
+bit depth
+
+chroma subsampling
+
+frame count
+
+keyframe count
+
+GOP structure
+
+Temporal
+
+PTS
+
+DTS
+
+frame duration
+
+frame-rate stability
+
+timestamp discontinuities
+
+duplicate frames
+
+missing frames
+
+cadence changes
+
+Spatial
+
+resolution
+
+crop
+
+aspect ratio
+
+SAR
+
+DAR
+
+rotation
+
+Colour
+
+colour primaries
+
+transfer function
+
+matrix
+
+range
+
+HDR metadata
+
+15. GOP Analysis
+
+Produce a visual representation:
+
+I ─ P ─ B ─ B ─ P ─ B ─ B ─ I
+
+Analyse:
+
+GOP length
+
+GOP variance
+
+open/closed GOP
+
+keyframe distribution
+
+unusual patterns
+
+Example finding:
+
+GOP structure changes from approximately 60 frames
+to approximately 15 frames at 00:37:21.120.
+
+This is an observation, not proof of editing.
+
+16. Frame Analysis
+
+Provide:
+
+frame stepping
+
+frame extraction
+
+frame hashes
+
+perceptual hashes
+
+duplicate detection
+
+near-duplicate detection
+
+frame statistics
+
+Potential statistics:
+
+Mean luminance
+Variance
+Min/max
+Histogram
+Entropy
+Edge density
+Motion estimate
+
+17. Duplicate Frame Detection
+
+Detect:
+
+Frame 1002 ≈ Frame 1001
+Frame 1003 ≈ Frame 1002
+Frame 1004 ≠ Frame 1003
+
+Report:
+
+Repeated frame sequence:
+00:01:12.033 – 00:01:12.133
+Length: 3 frames
+
+This can identify:
+
+freeze frames
+
+encoding anomalies
+
+inserted stills
+
+frame duplication
+
+18. Video Scene Change Analysis
+
+Build a scene-change timeline.
+
+00:00:00
+     │
+     ├── Scene
+     │
+00:01:32
+     │
+     ├── Scene
+     │
+00:04:18
+     │
+     └── Scene
+
+Use image statistics and perceptual similarity.
+
+The application should distinguish:
+
+Detected scene change
+
+from:
+
+Potential edit
+
+19. Audio Analysis
+
+Inspect:
+
+codec
+
+sample rate
+
+bit depth
+
+channels
+
+channel layout
+
+duration
+
+packet structure
+
+timestamps
+
+silence
+
+clipping
+
+DC offset
+
+dynamic range
+
+loudness
+
+spectral characteristics
+
+20. Audio Channel Analysis
+
+Display:
+
+Channel 1 ─────────────
+Channel 2 ─────────────
+Channel 3 ─────────────
+Channel 4 ─────────────
+
+Detect:
+
+missing channels
+
+identical channels
+
+phase inversion
+
+unusual channel correlation
+
+unexpected silence
+
+sudden channel changes
+
+21. Audio Loudness
+
+Where meaningful, calculate:
+
+integrated loudness
+
+short-term loudness
+
+momentary loudness
+
+loudness range
+
+true peak
+
+Measurements must specify the standard/method used.
+
+Never report a number without identifying the methodology.
+
+22. Audio Spectral Analysis
+
+Provide:
+
+waveform
+
+spectrogram
+
+FFT
+
+frequency distribution
+
+noise floor estimate
+
+Allow users to inspect regions.
+
+Example:
+
+00:12:30 → 00:12:40
+
+and compare against:
+
+00:12:20 → 00:12:30
+
+23. Synchronisation Analysis
+
+Use tpt-av-sync.
+
+Calculate:
+
+Audio PTS
+Video PTS
+Estimated offset
+Drift
+
+Report:
+
+Initial offset: +42 ms
+Final offset: +117 ms
+Estimated drift: +75 ms / 90 min
+
+This is significantly more useful than simply saying "audio is out of sync."
+
+24. Timestamp Forensics
+
+Inspect:
+
+PTS
+
+DTS
+
+timebase
+
+monotonicity
+
+discontinuities
+
+negative timestamps
+
+duration mismatches
+
+stream offset
+
+edit lists
+
+Potential findings:
+
+Non-monotonic PTS
+Timestamp gap
+Timestamp overlap
+Unexpected stream start
+Audio/video duration mismatch
+
+25. Metadata Analysis
+
+Extract metadata into a structured tree.
+
+Examples:
+
+Container
+├── creation_time
+├── encoder
+├── software
+└── comment
+
+Video
+├── codec
+├── profile
+├── colour
+└── mastering metadata
+
+Audio
+├── encoder
+├── language
+└── channel layout
+
+Metadata should preserve:
+
+key
+
+value
+
+source
+
+stream/container location
+
+26. Metadata Consistency
+
+Cross-check metadata.
+
+Examples:
+
+Container creation time:
+2026-08-01
+
+Track creation time:
+2026-08-03
+
+or:
+
+Declared frame rate:
+29.97
+
+Measured frame timing:
+approximately 30 fps
+
+Flag inconsistencies without asserting their cause.
+
+27. Encoder Fingerprinting
+
+Where technically defensible, identify encoder signatures.
+
+Potential evidence:
+
+codec profile
+
+encoder metadata
+
+GOP structure
+
+quantisation characteristics
+
+bitstream features
+
+container conventions
+
+Output:
+
+Observed encoder indicators:
+FFmpeg-like metadata
+
+Confidence:
+Medium
+
+Never claim exact provenance from weak evidence.
+
+28. Compression Analysis
+
+Analyse:
+
+bitrate
+
+bitrate variation
+
+quantisation statistics where available
+
+frame complexity
+
+I/P/B distribution
+
+resolution/bitrate relationship
+
+Plot:
+
+Bitrate
+│      /\      /\
+│  /\ /  \____/  \__
+│_/  \______________
+└────────────────────
+       Timeline
+
+This can reveal unusual segments.
+
+29. Bitrate Anomaly Detection
+
+Detect sudden changes.
+
+Example:
+
+Average:
+8.2 Mbps
+
+Segment:
+00:17:31 – 00:17:34
+
+Observed:
+1.1 Mbps
+
+Possible explanations include:
+
+low-complexity content
+
+encoder behaviour
+
+scene change
+
+corruption
+
+editing/export differences
+
+The application should report the observation and possible explanations separately.
+
+30. Corruption Detection
+
+Detect:
+
+truncated files
+
+invalid packets
+
+decode failures
+
+damaged indexes
+
+invalid timestamps
+
+malformed headers
+
+missing frames
+
+audio decode errors
+
+unexpected EOF
+
+invalid stream references
+
+A scan should continue after recoverable errors.
+
+The report should state:
+
+Analysis completed with 17 recoverable decode errors.
+
+31. Error Timeline
+
+All anomalies should be placed on a timeline.
+
+Example:
+
+00:00 ─────────────── 01:30
+            ▲
+            │
+       Timestamp gap
+
+00:00 ─────────────── 01:30
+                    ▲
+                    │
+               Decode error
+
+Clicking an anomaly should jump directly to the relevant media position.
+
+32. Evidence Capture
+
+Evidence may include:
+
+original hash
+
+raw metadata
+
+frame
+
+frame range
+
+waveform region
+
+spectrogram region
+
+packet information
+
+decoder error
+
+timestamp data
+
+analysis result
+
+user note
+
+Each evidence item must reference its source asset and analysis version.
+
+33. Evidence Integrity
+
+Evidence exports should include:
+
+SHA-256
+Source asset hash
+Analysis version
+Evidence creation time
+
+If an image is extracted from a frame, record:
+
+Source file
+Source hash
+Frame index
+PTS
+Extraction method
+Pixel format
+
+This makes the evidence reproducible.
+
+34. Finding Model
+
+Findings are not simply errors.
+
+enum FindingSeverity {
+    Info,
+    Notice,
+    Warning,
+    Significant,
+    Critical,
+}
+
+A finding contains:
+
+struct Finding {
+    id: FindingId,
+    rule_id: RuleId,
+    severity: FindingSeverity,
+    title: String,
+    description: String,
+    evidence: Vec<EvidenceId>,
+    location: Option<MediaLocation>,
+    confidence: Option<Confidence>,
+}
+
+35. Rule Engine
+
+Rules must be independent of UI.
+
+trait ForensicRule {
+    fn id(&self) -> RuleId;
+    fn description(&self) -> &str;
+    fn evaluate(&self, analysis: &AnalysisContext) -> Vec<Finding>;
+}
+
+Rules should be composable.
+
+Example:
+
+TIMING.NON_MONOTONIC_PTS
+VIDEO.FRAME_RATE_CHANGE
+AUDIO.CHANNEL_SILENCE
+CONTAINER.TRAILING_DATA
+METADATA.CONFLICT
+VIDEO.DUPLICATE_FRAMES
+
+36. Rule Profiles
+
+Users should be able to select:
+
+General Media
+Broadcast
+Archive
+Post Production
+Legal / Evidence
+Delivery QA
+Custom
+
+Each profile enables an appropriate rule set.
+
+37. Rule Configuration
+
+Example:
+
+rule:
+  id: video.frame_rate_change
+  enabled: true
+
+  thresholds:
+    tolerance_percent: 0.1
+
+  severity:
+    default: warning
+
+Users must be able to customise thresholds without changing application code.
+
+38. Comparative Analysis
+
+A major feature should be file-to-file comparison.
+
+Example:
+
+ORIGINAL.MOV
+      ↕
+DELIVERY.MP4
+
+Compare:
+
+duration
+
+streams
+
+codec
+
+frame rate
+
+resolution
+
+colour
+
+audio
+
+metadata
+
+timestamps
+
+scene structure
+
+frame similarity
+
+This is particularly valuable for:
+
+quality control
+
+post-production
+
+legal disputes
+
+archive migration
+
+39. Media Difference View
+
+Provide:
+
+File A
+───────────────
+Resolution: 4K
+Audio: 8 ch
+
+        VS
+
+File B
+───────────────
+Resolution: 4K
+Audio: 2 ch
+
+Highlight differences.
+
+For visual differences, support:
+
+side-by-side
+difference
+blink
+overlay
+
+40. Segment Comparison
+
+Users should be able to select:
+
+File A:
+00:10:00 – 00:10:30
+
+File B:
+00:10:00 – 00:10:30
+
+Then compare:
+
+frames
+
+audio
+
+timing
+
+signal statistics
+
+This can help determine whether a delivery/export changed media unexpectedly.
+
+41. Search
+
+The case should be searchable.
+
+Search:
+
+timestamp
+finding
+codec
+metadata
+device/software
+filename
+hash
+frame
+stream
+error
+
+42. Timeline UI
+
+The timeline is central.
+
+Layers:
+
+VIDEO
+████████████████████████
+
+AUDIO
+████████████████████████
+
+SCENE CHANGES
+   │    │        │
+
+ERRORS
+       ▲            ▲
+
+FINDINGS
+             ●
+
+Clicking an event should synchronise all relevant views.
+
+43. Media Viewer
+
+The viewer should support:
+
+frame-by-frame stepping
+
+frame number
+
+PTS/DTS
+
+zoom
+
+pixel inspection
+
+histogram
+
+vectorscope where appropriate
+
+waveform
+
+audio playback
+
+A/B comparison
+
+44. Pixel Inspector
+
+For a selected pixel display:
+
+X: 1920
+Y: 540
+
+RGB:
+120 / 122 / 125
+
+Y'CbCr:
+...
+
+Also display source colour space.
+
+Do not silently convert values without indicating the conversion.
+
+45. Colour Analysis
+
+Inspect:
+
+primaries
+
+transfer
+
+matrix
+
+range
+
+HDR metadata
+
+bit depth
+
+chroma format
+
+Detect contradictions such as:
+
+10-bit source
+8-bit decoded output
+
+The application must distinguish source bit depth from decoder/output representation.
+
+46. HDR Inspection
+
+Where supported, inspect:
+
+HDR10 metadata
+
+mastering display metadata
+
+content light level metadata
+
+transfer characteristics
+
+Provide a readable interpretation while preserving raw metadata.
+
+47. Subtitle/Data Stream Analysis
+
+Inspect:
+
+stream presence
+
+language
+
+timing
+
+encoding
+
+overlap
+
+gaps
+
+malformed entries
+
+Potential future support:
+
+subtitle OCR
+
+subtitle-to-audio alignment
+
+translation comparison
+
+These are not MVP requirements.
+
+48. Archive Validation
+
+Create an archive profile.
+
+Validate:
+
+file readability
+
+hash
+
+container validity
+
+codec compatibility
+
+metadata completeness
+
+duration
+
+stream consistency
+
+corruption
+
+preservation warnings
+
+Allow batch operation over directories.
+
+49. Batch Analysis
+
+A professional customer may need:
+
+1000 files
+
+The application should support batch analysis.
+
+Example:
+
+tpt-app-media-forensics batch \
+    --input ./deliveries \
+    --profile broadcast \
+    --output ./reports
+
+The GUI should show:
+
+1,000 files
+────────────────────────────
+Passed      842
+Warnings    131
+Failed       27
+
+50. Watch Folder
+
+Optional later feature:
+
+Incoming/
+    ↓
+TPT Forensics
+    ↓
+Analyse
+    ↓
+Pass / Fail
+    ↓
+Reports/
+
+This is commercially useful for production environments.
+
+51. CLI
+
+The CLI must use the same analysis engine as the GUI.
+
+Example:
+
+tpt-app-media-forensics inspect file.mp4
+
+Hash:
+
+tpt-app-media-forensics hash file.mp4
+
+Run profile:
+
+tpt-app-media-forensics analyze \
+    file.mp4 \
+    --profile broadcast
+
+Export:
+
+tpt-app-media-forensics report \
+    case.tptcase \
+    --format pdf
+
+JSON:
+
+tpt-app-media-forensics analyze \
+    file.mp4 \
+    --format json
+
+52. Database
+
+Use SQLite for case metadata and analysis state.
+
+Store:
+
+cases
+
+assets
+
+hashes
+
+analyses
+
+streams
+
+findings
+
+evidence
+
+rules
+
+reports
+
+notes
+
+Do not store entire media files inside SQLite.
+
+53. Case Directory
+
+Recommended:
+
+Case/
+├── case.sqlite
+├── manifest.toml
+├── evidence/
+├── reports/
+├── exports/
+└── cache/
+
+The original source media should normally remain outside the case directory and be referenced by path plus hash.
+
+Optional evidence copies can be explicitly created.
+
+54. Cache
+
+Analysis of large media is expensive.
+
+Cache derived results using:
+
+asset hash
++
+analysis version
++
+profile hash
++
+rule-set hash
+
+If any changes, invalidate the appropriate analysis.
+
+This avoids rescanning unchanged assets.
+
+55. Large File Handling
+
+The application must support very large media files.
+
+Requirements:
+
+streaming analysis
+
+bounded memory
+
+random access where container permits
+
+background workers
+
+cancellation
+
+progress reporting
+
+Never load a multi-gigabyte media file into RAM simply to inspect it.
+
+56. Parallelism
+
+Parallelise independent work:
+
+Container analysis
+       │
+       ├── metadata
+       ├── video
+       ├── audio
+       └── timing
+
+However, decoding must respect codec/threading constraints.
+
+The application should avoid oversubscribing CPU cores.
+
+57. Performance Targets
+
+Target:
+
+UI remains responsive during analysis.
+
+Analysis can use all available CPU cores where safe.
+
+Large files stream rather than requiring full memory residency.
+
+Cancellation should respond within a few seconds.
+
+Batch mode should maintain high throughput.
+
+Repeated analyses should benefit substantially from caching.
+
+Performance benchmarks must use representative media rather than synthetic tiny files.
+
+58. Project Format
+
+Example:
+
+case:
+  schema_version: 1
+  name: "Client Delivery Investigation"
+
+assets:
+  - id: original
+    path: "/media/original.mp4"
+    sha256: "..."
+
+analyses:
+  - profile: forensic
+    asset: original
+
+The manifest should be human-readable.
+
+59. Report Structure
+
+PDF report:
+
+Cover
+Case Information
+Asset Identification
+Hashes
+Media Summary
+Container Analysis
+Video Analysis
+Audio Analysis
+Timing Analysis
+Metadata
+Integrity
+Findings
+Evidence
+Comparison Results
+Methodology
+Software Version
+Rule Set
+Limitations
+
+The report should explicitly include:
+
+Findings are technical observations and should not be interpreted as proof of intent, authorship, manipulation, or authenticity unless independently established.
+
+This protects the product from overclaiming.
+
+60. Technical Methodology
+
+Every report should state:
+
+software version
+
+analysis engine version
+
+enabled rules
+
+profile
+
+input hash
+
+analysis timestamp
+
+applicable standards/methodologies
+
+If a measurement is approximate, say so.
+
+61. Export Formats
+
+Support:
+
+PDF
+HTML
+JSON
+CSV
+CSV findings
+CSV measurements
+
+JSON should contain machine-readable raw findings.
+
+Example:
+
+{
+  "rule": "video.non_monotonic_pts",
+  "severity": "warning",
+  "stream": 0,
+  "frame": 12873,
+  "pts": 123456789
+}
+
+62. Evidence Bundle
+
+Allow export:
+
+case-report.pdf
+case-data.json
+asset-hashes.csv
+findings.csv
+evidence/
+
+The bundle should include a manifest containing hashes of all generated files.
+
+63. Reproducibility
+
+A report should be reproducible from:
+
+Original asset
+Analysis profile
+Rule set
+TPT version
+Application version
+
+The application should provide:
+
+Analysis fingerprint
+
+Example:
+
+TPT-MF:
+9e31...a7c
+
+This is not a cryptographic proof by itself; it identifies the analysis configuration/result set.
+
+64. Chain-of-Custody Mode
+
+This should be a later premium feature.
+
+Record:
+
+Acquired
+Imported
+Analysed
+Exported
+Reviewed
+Signed
+
+Each event is append-only.
+
+Do not claim legal chain-of-custody compliance without jurisdiction-specific review.
+
+The software should instead provide a technical audit trail.
+
+65. Analyst Notes
+
+Allow notes attached to:
+
+asset
+
+stream
+
+timestamp
+
+frame
+
+finding
+
+evidence
+
+Example:
+
+00:14:32.300
+
+"Visible jump cut. Further inspection required."
+
+Notes should not modify raw evidence.
+
+66. Review Workflow
+
+Findings should support:
+
+New
+Reviewed
+Accepted
+Rejected
+Requires investigation
+
+A reviewer can add a conclusion without changing the original observation.
+
+Example:
+
+Finding:
+Unexpected timestamp discontinuity.
+
+Reviewer:
+Likely caused by known export process.
+
+Status:
+Accepted
+
+67. Comparison with Known Reference
+
+Users should be able to define a reference asset.
+
+Example:
+
+Master.mov
+      ↓
+Delivery.mp4
+
+The application can answer:
+
+What changed?
+
+This is likely one of the most commercially useful workflows.
+
+68. Delivery Validation
+
+Create a dedicated delivery profile.
+
+Example requirements:
+
+video:
+  codec: h264
+  width: 1920
+  height: 1080
+  frame_rate: 25
+
+audio:
+  codec: pcm
+  channels: 2
+  sample_rate: 48000
+
+container:
+  format: mov
+
+The result should be:
+
+PASS
+FAIL
+PASS WITH WARNINGS
+
+69. Custom Profiles
+
+Customers should be able to create their own specifications.
+
+Example:
+
+profile:
+  name: "Client X Delivery"
+
+  rules:
+    - video.resolution
+    - video.frame_rate
+    - audio.channels
+    - metadata.required
+    - timing.av_sync
+
+  requirements:
+    video.resolution: "3840x2160"
+    audio.channels: 2
+
+This is a major path to professional adoption.
+
+70. Profile Versioning
+
+Profiles must be versioned.
+
+Client X Delivery v1.4
+
+A report must identify the exact profile version used.
+
+Never silently change an existing profile.
+
+71. Rule Explainability
+
+Every finding should have an explanation.
+
+Example:
+
+Rule:
+VIDEO.FRAME_RATE_CHANGE
+
+What it checks:
+Whether measured frame timing changes beyond the configured tolerance.
+
+Why it matters:
+Unexpected changes may indicate cadence conversion,
+editing, encoding behaviour, or malformed timestamps.
+
+Observed:
+29.97 fps → 30.00 fps
+
+Limitations:
+This finding alone does not establish manipulation.
+
+This is important for professional credibility.
+
+72. AI Features
+
+AI should be optional and secondary.
+
+Potential future features:
+
+natural-language case summary
+
+automated finding explanation
+
+media segment classification
+
+transcription-assisted investigation
+
+semantic scene search
+
+Do not make AI responsible for the core forensic conclusions.
+
+The deterministic Rust analysis engine must remain authoritative.
+
+73. Why TPT Can Build This
+
+The existing media ecosystem provides an unusually strong foundation.
+
+The application is not starting with:
+
+Open file
+→ call FFmpeg
+→ display metadata
+
+The intended stack is:
+
+tpt-kinetix
+      +
+tpt-cadence
+      +
+tpt-visual
+      +
+tpt-audio
+      +
+tpt-dsp
+      +
+tpt-av-sync
+      +
+tpt-av-asset
+      +
+tpt-av-test
+      ↓
+TPT Media Forensics
+
+The commercial application therefore becomes a high-value workflow around TPT's media primitives.
+
+74. Potential TPT Ecosystem Advantage
+
+The application can eventually share components with:
+
+TPT Media QC
+TPT Media Forensics
+TPT Media Transcoder
+TPT Media Restoration
+TPT AV Commissioning
+
+For example:
+
+tpt-kinetix
+      ↓
+decode/inspect
+      ↓
+┌──────────────┬───────────────┬────────────────┐
+│ Media QC     │ Forensics     │ Restoration    │
+└──────────────┴───────────────┴────────────────┘
+
+This increases the value of the open-source foundation work.
+
+75. Testing Strategy
+
+Unit tests
+
+Test:
+
+parsers
+
+timing calculations
+
+hash calculations
+
+rule evaluation
+
+tolerances
+
+finding generation
+
+metadata comparison
+
+Property tests
+
+Important for:
+
+timestamps
+
+frame ordering
+
+container parsing
+
+malformed metadata
+
+numerical analysis
+
+Fuzzing
+
+Media parsers should be aggressively fuzzed.
+
+Targets:
+
+container parser
+
+codec parser
+
+metadata parser
+
+packet parser
+
+timestamp handling
+
+No malformed media should be able to crash the application.
+
+Golden tests
+
+Maintain known media fixtures and expected:
+
+metadata
+
+stream structures
+
+findings
+
+timing results
+
+76. Corrupt Media Test Corpus
+
+Build a dedicated test corpus containing:
+
+valid.mp4
+truncated.mp4
+bad-header.mp4
+invalid-timestamps.mp4
+missing-index.mp4
+bad-audio-packet.mp4
+duplicate-frame.mp4
+duration-mismatch.mp4
+metadata-conflict.mp4
+
+Each fixture should document the intended anomaly.
+
+77. Determinism
+
+The deterministic parts of analysis should produce identical results across runs.
+
+Avoid:
+
+nondeterministic rule ordering
+
+floating-point accumulation where deterministic alternatives are practical
+
+random sampling without recorded seeds
+
+If a heuristic uses sampling, record the methodology.
+
+78. GUI Technology
+
+Use a Rust-native desktop architecture consistent with the broader TPT app strategy.
+
+Suggested:
+
+Rust core
+   ↓
+Tauri
+   ↓
+Desktop UI
+
+The media engine must remain independent of Tauri.
+
+This allows:
+
+GUI
+CLI
+Automation
+Future services
+
+to reuse the same core.
+
+79. UI Architecture
+
+Major screens:
+
+Case
+├── Assets
+├── Overview
+├── Streams
+├── Timeline
+├── Video
+├── Audio
+├── Metadata
+├── Findings
+├── Comparisons
+├── Evidence
+└── Reports
+
+80. Dashboard
+
+Display:
+
+Case
+────────────────────────────
+
+Assets             7
+Analyses           12
+Findings           18
+Critical            0
+Significant         2
+Warnings           11
+
+Analysis:
+COMPLETE
+
+Overall:
+REVIEW REQUIRED
+
+Do not reduce the entire forensic result to a single "authentic/fake" score.
+
+81. Timeline Interaction
+
+The timeline should be the central navigation mechanism.
+
+Selecting:
+
+Finding #17
+
+should jump to:
+
+relevant timestamp
+
+frame
+
+audio region
+
+stream
+
+evidence
+
+This is much faster than forcing analysts to manually locate anomalies.
+
+82. Side-by-Side Analysis
+
+Support:
+
+Original                  Comparison
+────────                  ──────────
+frame 1042                frame 1042
+PTS 34.733                PTS 34.767
+
+Highlight differences.
+
+83. Batch Results Dashboard
+
+For many assets:
+
+File                  Status      Findings
+------------------------------------------------
+master01.mov          PASS        0
+master02.mov          WARN        4
+master03.mov          FAIL        2
+master04.mov          PASS        0
+
+Allow sorting by severity.
+
+84. MVP Scope
+
+The first release should focus on technical media inspection, not full digital forensics.
+
+Required
+
+Case management
+
+File hashing
+
+Container inspection
+
+Stream inspection
+
+Video inspection
+
+Audio inspection
+
+Metadata inspection
+
+Timestamp analysis
+
+AV sync analysis
+
+Basic corruption detection
+
+Rule engine
+
+Findings
+
+Timeline
+
+Evidence capture
+
+PDF/JSON/CSV reports
+
+File comparison
+
+Batch analysis
+
+Offline operation
+
+CLI
+
+Exclude initially
+
+AI deepfake detection
+
+cloud processing
+
+facial recognition
+
+legal certification
+
+automatic attribution of authorship
+
+proprietary DRM bypass
+
+password cracking
+
+deleted-file recovery
+
+The application is a media analysis tool, not a general computer-forensics suite.
+
+85. Phase 2
+
+Add:
+
+advanced codec internals
+
+richer container analysis
+
+MXF/broadcast workflows
+
+archive validation
+
+watch folders
+
+delivery profiles
+
+more advanced audio measurements
+
+more advanced visual anomaly detection
+
+richer comparison
+
+86. Phase 3
+
+Add:
+
+chain-of-custody audit mode
+
+hardware acceleration
+
+large-scale batch processing
+
+plugin rule system
+
+enterprise profile management
+
+automated ingestion
+
+advanced media provenance analysis
+
+87. Commercial Packaging
+
+The product should be sold as a professional application.
+
+Potential product tiers:
+
+TPT Media Forensics
+
+Core analysis.
+
+TPT Media Forensics Professional
+
+Adds:
+
+batch analysis
+
+custom profiles
+
+advanced reports
+
+comparison
+
+automation
+
+TPT Media Forensics Enterprise
+
+Potential future features:
+
+team deployment
+
+shared profiles
+
+central licence management
+
+network workers
+
+Do not build enterprise features before customers actually ask for them.
+
+88. Pricing Strategy
+
+Initial target:
+
+$499–$999
+
+for individual professional use.
+
+Professional:
+
+$1,499–$2,499
+
+Enterprise:
+
+Custom
+
+The correct price should ultimately be based on the value of the workflow rather than development cost.
+
+A product that saves a professional several hours per investigation can justify substantially more than consumer software.
+
+89. Gumroad Packaging
+
+The Gumroad product should include:
+
+Windows installer
+License key
+Quick-start guide
+Example media corpus
+Example forensic case
+Example reports
+Documentation
+Changelog
+
+The customer should be able to download and start analysing media without creating a cloud account.
+
+90. Licensing
+
+Core TPT libraries:
+
+MIT
+
+Commercial application:
+
+Choose a commercial licence appropriate to the business model.
+
+A possible model is:
+
+Single-user perpetual licence
+
+with optional:
+
+major-version upgrade
+support
+
+The open-source foundation should remain clearly separated from the commercial workflow application.
+
+91. Product Boundary
+
+Do not turn this into a general-purpose video editor.
+
+It should not become:
+
+NLE
+
+DAW
+
+transcoder
+
+media player
+
+VFX application
+
+It may play media and extract frames because those are necessary for analysis.
+
+But the product's centre of gravity must remain:
+
+Inspect
+Measure
+Compare
+Detect
+Document
+Explain
+
+92. High-Value Differentiator
+
+The strongest feature is not "more metadata."
+
+It is the combination of:
+
+Technical media analysis
+        +
+Timeline-based findings
+        +
+Evidence
+        +
+Reproducible analysis
+        +
+File comparison
+        +
+Custom rules
+        +
+Offline execution
+
+That creates a professional investigation environment rather than another media information utility.
+
+93. Long-Term Differentiator: Media Fingerprint
+
+Create a deterministic technical fingerprint:
+
+Container
+Codec
+Encoding structure
+Timing
+Colour
+Audio
+Metadata
+Frame statistics
+
+The fingerprint could be used to compare:
+
+Asset A
+Asset B
+Asset C
+
+and determine how technically similar they are.
+
+This is useful for:
+
+duplicate detection
+
+archive management
+
+delivery verification
+
+media lineage
+
+migration validation
+
+It must not be presented as proof of common authorship.
+
+94. Long-Term Differentiator: Media Lineage
+
+A case could eventually represent:
+
+Camera Master
+     ↓
+Edit Master
+     ↓
+Colour Master
+     ↓
+Delivery Master
+     ↓
+Streaming Encode
+
+The application could record the expected lineage and compare actual assets.
+
+This creates a powerful bridge between:
+
+forensic analysis
+
+production QA
+
+archival management
+
+95. Long-Term Differentiator: Executable Media Specification
+
+A delivery specification could become executable:
+
+delivery:
+  video:
+    resolution: 3840x2160
+    frame_rate: 25
+    codec: h265
+
+  audio:
+    sample_rate: 48000
+    channels: 2
+
+  timing:
+    max_av_offset_ms: 40
+
+Then:
+
+tpt-app-media-forensics validate delivery.mp4 \
+    --profile client-x-v3
+
+returns:
+
+PASS
+
+or:
+
+FAIL
+
+VIDEO.FRAME_RATE
+Expected: 25
+Observed: 24.0
+
+AUDIO.CHANNELS
+Expected: 2
+Observed: 6
+
+This makes the same engine useful for media QC and forensic analysis without collapsing the two products into one.
+
+96. Definition of Done
+
+The MVP is complete when:
+
+A case can be created offline.
+
+Media assets can be imported without modifying originals.
+
+SHA-256 and BLAKE3 hashes can be calculated.
+
+Containers can be inspected.
+
+Streams can be enumerated.
+
+Video properties can be inspected.
+
+Audio properties can be inspected.
+
+Metadata can be extracted.
+
+PTS/DTS can be analysed.
+
+AV synchronisation can be measured.
+
+Basic corruption can be detected.
+
+Findings can be generated through rules.
+
+Findings have severity and evidence.
+
+Findings can be located on a timeline.
+
+Frames can be inspected.
+
+Audio can be inspected.
+
+Two assets can be compared.
+
+Analysis results can be cached.
+
+Batch analysis works.
+
+PDF reports work.
+
+JSON reports work.
+
+CSV exports work.
+
+CLI and GUI use the same engine.
+
+No internet connection is required.
+
+Malformed media cannot crash the application.
+
+Analysis is reproducible from the recorded profile and software version.
+
+A real-world professional workflow has been completed successfully.
+
+97. Recommended Implementation Order
+
+Create workspace.
+
+Define case/asset models.
+
+Implement SQLite persistence.
+
+Implement asset hashing.
+
+Integrate tpt-kinetix.
+
+Integrate tpt-cadence.
+
+Implement container/stream inspection.
+
+Implement video analysis.
+
+Implement audio analysis.
+
+Integrate tpt-av-sync.
+
+Implement timestamp analysis.
+
+Implement metadata analysis.
+
+Implement integrity/error collection.
+
+Define finding model.
+
+Implement rule engine.
+
+Implement first 20 forensic rules.
+
+Implement evidence model.
+
+Implement frame extraction/evidence.
+
+Implement timeline.
+
+Implement media comparison.
+
+Implement batch engine.
+
+Implement analysis cache.
+
+Implement report generation.
+
+Implement CLI.
+
+Implement Tauri application.
+
+Implement custom delivery profiles.
+
+Build corrupt-media test corpus.
+
+Add fuzzing.
+
+Benchmark large files.
+
+Test against real professional media workflows.
+
+Package Windows release.
+
+Produce example forensic cases and reports.
+
+Beta test with media professionals.
+
+Refine the commercial feature set from real customer feedback.
+
+98. Strategic Product Boundary
+
+This application should occupy the space between:
+
+Media Player
+        ↓
+Media Inspector
+        ↓
+TPT MEDIA FORENSICS
+        ↓
+Digital Forensics Suite
+
+It should deliberately dominate the media-specific layer rather than attempting to become a general computer-forensics product.
+
+The core commercial idea is:
+
+When a media file needs to be understood rather than merely played, TPT Media Forensics provides a reproducible technical examination of what is actually inside it.
