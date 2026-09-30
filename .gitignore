@@ -32,3 +32,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Editor swap/backup files
+*~
+*.orig
+*.rej
+

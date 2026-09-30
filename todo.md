@@ -4,26 +4,43 @@ Tracks all work for the whole project, organized in phases per `spec.txt`.
 License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 
 ## Phase 0 — Repository & Foundation Setup
-- [ ] Initialize git repository
-- [ ] Add dual license: `LICENSE-MIT` + `LICENSE-APACHE`, copyright TPT Solutions
-- [ ] Add `README.md`, `CHANGELOG.md`
-- [ ] Create Cargo workspace (`Cargo.toml`) and crate skeletons per spec §8:
+- [x] Initialize git repository
+- [x] Add dual license: `LICENSE-MIT` + `LICENSE-APACHE`, copyright TPT Solutions
+- [x] Add `README.md`, `CHANGELOG.md`
+- [x] Create Cargo workspace (`Cargo.toml`) and crate skeletons per spec §8:
       core, model, container, video, audio, timing, metadata, rules,
       evidence, report, cli, tauri
-- [ ] Add TPT foundation crates as workspace dependencies (tpt-kinetix,
+- [x] Add TPT foundation crates as workspace dependencies (tpt-kinetix,
       tpt-cadence, tpt-visual, tpt-audio, tpt-voice, tpt-av-asset,
       tpt-av-sync, tpt-av-test, tpt-dsp)
-- [ ] Set up `docs/` skeleton (architecture, evidence-model, analysis-model,
+      — **declared but not yet inherited**: not on crates.io, most are private
+      repos, so referencing them would break offline builds. Analyzer crates
+      depend on abstraction traits until they are available.
+- [x] Set up `docs/` skeleton (architecture, evidence-model, analysis-model,
       findings, report-format, rules)
-- [ ] Set up `rules/`, `fixtures/`, `tests/` directories
+- [x] Set up `rules/`, `fixtures/`, `tests/` directories
+
+### Phase 0 — completed beyond the checklist
+- [x] Define Case model (§9) and Asset model (§10) — implemented in `-model`
+- [x] Implement asset acquisition record (§11): size, timestamps, SHA-256 /
+      BLAKE3 hash *types* and integrity verification; hashing I/O lands with
+      the acquisition step
+- [x] Define Finding model with severity + evidence + confidence (§34)
+- [x] Define Evidence model with integrity metadata and provenance (§32–33)
+- [x] Implement analysis cache keying on asset hash + analysis version +
+      profile hash + rule-set hash (§54)
+
 
 ## Phase 1 — MVP (spec §84, §96, §97)
-- [ ] Define Case model (§9) and Asset model (§10)
+- [x] Define Case model (§9) and Asset model (§10)
 - [ ] Implement SQLite persistence (§52) for cases/assets/analyses/streams/
       findings/evidence/rules/reports/notes
-- [ ] Implement case directory layout (§53) and manifest format (§58)
+- [x] Implement case directory layout (§53) and manifest format (§58)
 - [ ] Implement asset acquisition record (§11): path, size, timestamps,
       SHA-256, BLAKE3, filesystem info — read-only source guarantee
+      — model types and integrity verification are done; hashing I/O and
+      filesystem metadata capture remain
+
 - [ ] Integrate tpt-kinetix (video decoding/inspection)
 - [ ] Integrate tpt-cadence (audio codec/timing)
 - [ ] Implement container/stream inspection (§12–13)

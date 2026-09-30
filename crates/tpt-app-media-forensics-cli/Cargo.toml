@@ -1,0 +1,34 @@
+[package]
+name = "tpt-app-media-forensics-cli"
+description = "Command-line interface sharing the same engine as the GUI: inspect, hash, analyze, report, and batch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+
+[dependencies]
+tpt-app-media-forensics-model = { workspace = true }
+tpt-app-media-forensics-container = { workspace = true }
+tpt-app-media-forensics-core = { workspace = true }
+tpt-app-media-forensics-report = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,32 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "tpt-app-media-forensics-tauri"
+description = "Tauri desktop shell for TPT Media Forensics. Wraps the same core engine as the CLI; contains no analysis logic."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["TPT Solutions"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tpt-apps/tpt-app-media-forensics"
+homepage = "https://github.com/tpt-apps/tpt-app-media-forensics"
+publish = false
+
+[dependencies]
+# The shell depends on the engine crates, never the reverse: the media engine
+# must stay independent of Tauri so the CLI and any future service reuse it
+# identically (spec §78).
+tpt-app-media-forensics-model = { path = "../tpt-app-media-forensics-model" }
+tpt-app-media-forensics-core = { path = "../tpt-app-media-forensics-core" }
+tpt-app-media-forensics-report = { path = "../tpt-app-media-forensics-report" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

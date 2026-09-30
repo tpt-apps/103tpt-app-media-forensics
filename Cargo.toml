@@ -1,0 +1,115 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tpt-app-media-forensics-model",
+    "crates/tpt-app-media-forensics-core",
+    "crates/tpt-app-media-forensics-container",
+    "crates/tpt-app-media-forensics-video",
+    "crates/tpt-app-media-forensics-audio",
+    "crates/tpt-app-media-forensics-timing",
+    "crates/tpt-app-media-forensics-metadata",
+    "crates/tpt-app-media-forensics-evidence",
+    "crates/tpt-app-media-forensics-rules",
+    "crates/tpt-app-media-forensics-report",
+    "crates/tpt-app-media-forensics-cli",
+]
+
+# `tpt-app-media-forensics-tauri` is intentionally excluded from the default
+# workspace build:
+#   * Tauri pulls in the webview frontend toolchain (Node/pnpm) and platform
+#     webview SDKs, so `cargo build/test --workspace` cannot gate it the way it
+#     gates the deterministic engine crates.
+#   * The media engine must stay independent of Tauri (spec §78); the Tauri
+#     crate is a thin shell that only depends on `-core` and `-report`.
+# It is a standalone workspace verified separately (`cargo build` inside that dir).
+exclude = ["crates/tpt-app-media-forensics-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["TPT Solutions"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tpt-apps/tpt-app-media-forensics"
+homepage = "https://github.com/tpt-apps/tpt-app-media-forensics"
+description = "Offline professional media inspection, forensic analysis, validation, and evidence preservation."
+keywords = [
+    "forensics",
+    "media",
+    "video",
+    "audio",
+    "qc",
+    "metadata",
+]
+categories = ["multimedia::video", "multimedia::audio", "command-line-utilities"]
+
+[workspace.dependencies]
+# ---------------------------------------------------------------------------
+# Internal crates (spec §8)
+# ---------------------------------------------------------------------------
+tpt-app-media-forensics-model = { path = "crates/tpt-app-media-forensics-model", version = "0.1.0" }
+tpt-app-media-forensics-core = { path = "crates/tpt-app-media-forensics-core", version = "0.1.0" }
+tpt-app-media-forensics-container = { path = "crates/tpt-app-media-forensics-container", version = "0.1.0" }
+tpt-app-media-forensics-video = { path = "crates/tpt-app-media-forensics-video", version = "0.1.0" }
+tpt-app-media-forensics-audio = { path = "crates/tpt-app-media-forensics-audio", version = "0.1.0" }
+tpt-app-media-forensics-timing = { path = "crates/tpt-app-media-forensics-timing", version = "0.1.0" }
+tpt-app-media-forensics-metadata = { path = "crates/tpt-app-media-forensics-metadata", version = "0.1.0" }
+tpt-app-media-forensics-evidence = { path = "crates/tpt-app-media-forensics-evidence", version = "0.1.0" }
+tpt-app-media-forensics-rules = { path = "crates/tpt-app-media-forensics-rules", version = "0.1.0" }
+tpt-app-media-forensics-report = { path = "crates/tpt-app-media-forensics-report", version = "0.1.0" }
+
+# ---------------------------------------------------------------------------
+# TPT foundation crates (spec §2, §73)
+#
+# These provide the media primitives the forensics engine is built on.
+#
+# HOW THESE ARE CONSUMED
+#
+# None of the TPT media crates are published on crates.io. The ecosystem
+# convention (see tpt-solutions/tpt-av-asset) is to depend on them as git
+# dependencies with a PINNED REVISION. The `rev` below is deliberate and must
+# not be replaced with a branch:
+#
+#   * A branch pin makes the build non-reproducible. Spec §77 requires identical
+#     analysis results across runs, and spec §63 requires a report to record
+#     exactly what produced it. A moving dependency silently changes what the
+#     engine does.
+#   * When a pin is updated, `AnalysisVersion::CURRENT` must be reviewed and
+#     bumped if any analysis result could change, so cached results are never
+#     served against a changed decoder.
+#
+# NOTE ON NAMES: the spec lists repository names (tpt-kinetix, tpt-cadence,
+# ...). The actual crate names are the sub-crates inside those repositories,
+# e.g. `tpt-kinetix-core`, `tpt-kinetix-demux`. See docs/foundation.md.
+# ---------------------------------------------------------------------------
+tpt-kinetix-core = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "9747a2b17c77479377f69ad2f2621e1ed674b518" }
+tpt-kinetix-demux = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "9747a2b17c77479377f69ad2f2621e1ed674b518" }
+tpt-kinetix-h264 = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "9747a2b17c77479377f69ad2f2621e1ed674b518" }
+tpt-av-cadence-core = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "72794ef2a270a538efc4bfa24b6f9de96e1df05e" }
+tpt-av-cadence-wav = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "72794ef2a270a538efc4bfa24b6f9de96e1df05e" }
+tpt-av-cadence-flac = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "72794ef2a270a538efc4bfa24b6f9de96e1df05e" }
+tpt-av-test-reference = { git = "https://github.com/tpt-solutions/tpt-av-test", path = "tpt-av-test-reference" }
+
+# ---------------------------------------------------------------------------
+# Third-party dependencies
+# ---------------------------------------------------------------------------
+anyhow = "1"
+# Integrity hashing at acquisition (spec §11). SHA-256 for interoperability with
+# legal/evidentiary workflows; BLAKE3 for fast local checking and cache keying.
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Test-only: scratch directories for acquisition and case-directory tests.
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+
+[workspace.metadata.docs.rs]
+all-features = true

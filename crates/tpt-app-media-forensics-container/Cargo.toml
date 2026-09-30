@@ -1,0 +1,28 @@
+[package]
+name = "tpt-app-media-forensics-container"
+description = "Container inspection: box layout, stream enumeration, timebase, duration consistency, and malformed-structure detection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+
+[dependencies]
+tpt-app-media-forensics-model = { workspace = true }
+tpt-kinetix-core = { workspace = true }
+tpt-kinetix-demux = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
