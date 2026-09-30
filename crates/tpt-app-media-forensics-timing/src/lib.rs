@@ -9,3 +9,11 @@
 
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
+
+pub mod av_sync;
+pub mod error;
+pub mod pts_dts;
+
+pub use av_sync::{analyse, AudioSamples, SyncReport, VideoSamples};
+pub use error::TimingError;
+pub use pts_dts::{scan_decode, scan_presentation, Anomaly, TimestampReport};

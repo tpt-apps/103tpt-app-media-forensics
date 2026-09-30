@@ -13,3 +13,7 @@
 
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
+
+pub mod gop;
+
+pub use gop::{Gop, GopChange, GopReport};

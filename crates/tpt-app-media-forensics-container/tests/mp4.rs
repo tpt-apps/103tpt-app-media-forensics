@@ -1,8 +1,12 @@
+//! Integration tests for MP4 container inspection.
+//!
+//! Exercised against `tpt-kinetix-demux` through synthetic but structurally
+//! valid files built by [`tpt_app_media_forensics_container::fixture`].
 use tpt_app_media_forensics_container::fixture::{
-    TrackSpec, build_mp4, build_mp4_empty_moov, build_mp4_without_moov,
+    build_mp4, build_mp4_empty_moov, build_mp4_without_moov, TrackSpec,
 };
 use tpt_app_media_forensics_container::mp4::{inspect_bytes, inspect_file};
-use tpt_app_media_forensics_container::probe::{ContainerFormat, detect_file};
+use tpt_app_media_forensics_container::probe::{detect_file, ContainerFormat};
 use tpt_app_media_forensics_model::StreamKind;
 
 /// A 25 fps video track: timescale 25, every sample 1 tick long.
@@ -51,7 +55,8 @@ fn ntsc_frame_rate_keeps_its_exact_rational_form() {
     // 30000/1001 must survive as a fraction, not collapse to 29.97.
     let spec = TrackSpec {
         timescale: 30_000,
-        timing: vec![(1001, 1)],
+        // 1001 samples, each lasting 1001 ticks => exactly 30000/1001 fps.
+        timing: vec![(1001, 1001)],
         ..TrackSpec::video_25fps(640, 480, 1001)
     };
     let inspection = inspect_bytes(build_mp4(&spec)).expect("parses");

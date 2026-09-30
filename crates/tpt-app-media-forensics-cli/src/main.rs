@@ -29,11 +29,13 @@ use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
+use tpt_app_media_forensics_container::TrackFrameInfo;
 use tpt_app_media_forensics_container::{
-    ContainerFormat, detect_file, extension_matches, inspect_file,
+    detect_file, extension_matches, inspect_file, ContainerFormat,
 };
 use tpt_app_media_forensics_core::{acquire, CaseDirectory};
 use tpt_app_media_forensics_model::{Case, MediaType};
+use tpt_app_media_forensics_video::gop;
 
 use crate::output::{render_acquisition, AcquisitionJson};
 
@@ -182,9 +184,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             Ok(())
         }
 
-        Command::Inspect { path } => {
-            inspect(path, cli.json)
-        }
+        Command::Inspect { path } => inspect(path, cli.json),
 
         Command::Analyze { path, case_dir } => {
             // Fail fast if the case directory is not a case, so the analyst is
@@ -227,6 +227,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
+/// Default GOP-length tolerance, in frames.
+///
+/// Placeholder until rule profiles (spec §37) carry per-profile tolerances. The
+/// value is deliberately visible and documented rather than buried in a rule.
+const DEFAULT_GOP_TOLERANCE_FRAMES: u32 = 5;
+
 /// Inspects a media file's container structure.
 ///
 /// Reports what the file *is* (by signature), then what each stream declares
@@ -238,23 +244,32 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 /// Returns an error if the file cannot be read or the container cannot be
 /// parsed. Damaged tracks are reported as anomalies, not errors.
 fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
-    let format =
-        detect_file(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let format = detect_file(path).with_context(|| format!("cannot read {}", path.display()))?;
     let extension_ok = extension_matches(path, format);
+    let mut frame_info: Vec<Option<TrackFrameInfo>> = Vec::new();
 
     let streams = match format {
         ContainerFormat::IsoBmff => {
-            let inspection = inspect_file(path)
-                .with_context(|| format!("cannot inspect {}", path.display()))?;
+            let inspection =
+                inspect_file(path).with_context(|| format!("cannot inspect {}", path.display()))?;
             for anomaly in &inspection.anomalies {
                 eprintln!("anomaly: {anomaly}");
             }
+            frame_info = inspection.frame_info.clone();
             inspection.streams
         }
+        // An unrecognised signature is a finding about the evidence, not a gap
+        // in the tool. Conflating the two would tell an analyst their file is
+        // fine once a format is added, when in fact it is not a container.
+        ContainerFormat::Unknown => {
+            anyhow::bail!(
+                "{} is not a recognised media container (no known signature match)",
+                path.display()
+            );
+        }
         other => {
-            // Detection works for every supported signature; deep parsing is
-            // implemented per-format as each demuxer is integrated. Say which
-            // format was seen rather than reporting an empty inspection.
+            // A known format whose demuxer is not integrated yet. Naming the
+            // format keeps the result honest about what the file actually is.
             eprintln!(
                 "inspect: identified as {}; deep parsing for this format is not \
                  integrated yet",
@@ -285,7 +300,11 @@ fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
         println!("Container     {}", format.tag());
         println!(
             "Extension     {}",
-            if extension_ok { "matches" } else { "DOES NOT MATCH" }
+            if extension_ok {
+                "matches"
+            } else {
+                "DOES NOT MATCH"
+            }
         );
         println!("Streams       {}", streams.len());
         for stream in &streams {
@@ -309,6 +328,36 @@ fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
             }
             println!("        timescale: {}", stream.timing.timebase);
             println!("        samples:   {}", stream.packet_count.unwrap_or(0));
+
+            // GOP structure needs no decoding: it comes from the container's
+            // sync-sample table (spec §15).
+            if stream.kind.tag() == "video" {
+                if let Some(Some(info)) = frame_info.get(stream.index as usize) {
+                    let report = gop::analyse(
+                        &info.keyframes,
+                        &info.frame_times,
+                        DEFAULT_GOP_TOLERANCE_FRAMES,
+                    );
+                    if info.all_frames_are_keyframes {
+                        println!("        GOP:       every frame is a keyframe (no stss box)");
+                    } else {
+                        println!(
+                            "        GOP:       {} keyframes, dominant length {} frames",
+                            report.keyframe_count, report.dominant_length
+                        );
+                        if report.is_uniform() {
+                            println!("        GOP:       uniform structure");
+                        } else {
+                            for change in &report.changes {
+                                println!(
+                                    "        finding:   GOP length {} -> {} frames at {}",
+                                    change.expected_length, change.observed_length, change.at
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         println!("Source was opened read-only; it has not been modified.");
     }

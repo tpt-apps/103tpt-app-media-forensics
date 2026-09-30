@@ -12,8 +12,6 @@ categories.workspace = true
 
 [dependencies]
 tpt-app-media-forensics-model = { workspace = true }
-tpt-app-media-forensics-timing = { workspace = true }
-tpt-app-media-forensics-evidence = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

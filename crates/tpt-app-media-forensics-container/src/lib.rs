@@ -31,6 +31,12 @@ pub mod mp4;
 pub mod probe;
 
 pub use error::ContainerError;
-pub use fixture::{TrackSpec, build_mp4, build_mp4_empty_moov, build_mp4_without_moov};
-pub use mp4::{MAX_INSPECTED_BYTES, Mp4Inspection, inspect_bytes, inspect_file};
-pub use probe::{ContainerFormat, detect, detect_file, extension_matches};
+pub use fixture::{
+    build_mp4, build_mp4_empty_moov, build_mp4_stsd_gop_change, build_mp4_with_keyframes,
+    build_mp4_without_moov, gop_change_keyframes, TrackSpec,
+};
+pub use mp4::{
+    inspect_bytes, inspect_file, track_frame_info, Mp4Inspection, TrackFrameInfo,
+    MAX_EXPANDED_SAMPLES, MAX_INSPECTED_BYTES,
+};
+pub use probe::{detect, detect_file, extension_matches, ContainerFormat};

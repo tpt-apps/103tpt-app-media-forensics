@@ -117,11 +117,15 @@ This project is a commercial layer over the TPT media foundation
 (`tpt-kinetix`, `tpt-cadence`, `tpt-visual`, `tpt-audio`, `tpt-voice`,
 `tpt-av-asset`, `tpt-av-sync`, `tpt-av-test`, `tpt-dsp`).
 
-These crates are **not yet published on crates.io** and most are private TPT
-Solutions repositories. They are declared in `[workspace.dependencies]` but are
-deliberately not yet inherited by member crates, so the workspace builds and
-tests offline. The analyzer crates depend on abstraction traits meanwhile; see
-[`docs/architecture.md`](docs/architecture.md).
+None are published on crates.io. They are consumed the way the rest of the
+ecosystem does — as git dependencies with a **pinned revision**, never a
+branch, because a moving dependency would break the reproducibility guarantee
+in spec §77.
+
+`docs/foundation.md` documents how they are wired, the mapping from the spec's
+repository names to the actual crate names, and three discrepancies between
+`spec.txt` and the crates as they exist (most notably that `tpt-av-sync` is a
+CRDT collaboration engine, not the A/V measurement tool spec §23 assumes).
 
 ## License
 

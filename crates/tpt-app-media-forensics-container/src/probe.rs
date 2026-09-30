@@ -233,20 +233,35 @@ mod tests {
 
     #[test]
     fn mov_and_webm_are_recognised_as_family_members() {
-        assert!(extension_matches(Path::new("a.mov"), ContainerFormat::IsoBmff));
-        assert!(extension_matches(Path::new("a.webm"), ContainerFormat::Matroska));
-        assert!(extension_matches(Path::new("a.3gp"), ContainerFormat::IsoBmff));
+        assert!(extension_matches(
+            Path::new("a.mov"),
+            ContainerFormat::IsoBmff
+        ));
+        assert!(extension_matches(
+            Path::new("a.webm"),
+            ContainerFormat::Matroska
+        ));
+        assert!(extension_matches(
+            Path::new("a.3gp"),
+            ContainerFormat::IsoBmff
+        ));
     }
 
     #[test]
     fn extension_matching_is_case_insensitive() {
-        assert!(extension_matches(Path::new("A.MP4"), ContainerFormat::IsoBmff));
+        assert!(extension_matches(
+            Path::new("A.MP4"),
+            ContainerFormat::IsoBmff
+        ));
     }
 
     #[test]
     fn no_extension_reports_mismatch() {
         // Absence of a claim is not agreement with one.
-        assert!(!extension_matches(Path::new("noextension"), ContainerFormat::IsoBmff));
+        assert!(!extension_matches(
+            Path::new("noextension"),
+            ContainerFormat::IsoBmff
+        ));
     }
 
     #[test]

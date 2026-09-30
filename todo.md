@@ -13,9 +13,9 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [x] Add TPT foundation crates as workspace dependencies (tpt-kinetix,
       tpt-cadence, tpt-visual, tpt-audio, tpt-voice, tpt-av-asset,
       tpt-av-sync, tpt-av-test, tpt-dsp)
-      — **declared but not yet inherited**: not on crates.io, most are private
-      repos, so referencing them would break offline builds. Analyzer crates
-      depend on abstraction traits until they are available.
+      — wired as **pinned-rev git dependencies** (the ecosystem convention;
+      none are on crates.io). See `docs/foundation.md` for the crate-name
+      mapping and three spec/ecosystem discrepancies found during integration.
 - [x] Set up `docs/` skeleton (architecture, evidence-model, analysis-model,
       findings, report-format, rules)
 - [x] Set up `rules/`, `fixtures/`, `tests/` directories
@@ -41,16 +41,22 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       — model types and integrity verification are done; hashing I/O and
       filesystem metadata capture remain
 
-- [ ] Integrate tpt-kinetix (video decoding/inspection)
+- [x] Integrate tpt-kinetix (container demux: `tpt-kinetix-core`, `-demux`)
+- [ ] Integrate tpt-kinetix-h264 for frame decoding (never implement it ourselves;
+      it is bit-exact vs ffmpeg. Tier-2 only — see docs/decoding-tiers.md)
 - [ ] Integrate tpt-cadence (audio codec/timing)
-- [ ] Implement container/stream inspection (§12–13)
+- [x] Implement container/stream inspection (§12–13)
 - [ ] Implement video analysis: structural, temporal, spatial, colour (§14)
-- [ ] Implement GOP analysis (§15)
+- [x] Implement GOP analysis (§15) — packet-layer only; no decoding required
 - [ ] Implement frame analysis & duplicate/near-duplicate detection (§16–17)
 - [ ] Implement scene-change analysis (§18)
 - [ ] Implement audio analysis: codec, channels, loudness, spectral (§19–22)
-- [ ] Integrate tpt-av-sync for A/V synchronisation analysis (§23)
-- [ ] Implement timestamp forensics (PTS/DTS, monotonicity, gaps) (§24)
+- [x] Implement A/V synchronisation analysis (§23) — initial offset, final
+      offset, and drift measured over the span
+      **Note:** spec §23 names `tpt-av-sync` for this, but that crate is a CRDT
+      collaboration engine with no A/V measurement capability (confirmed by
+      source search). Implemented directly in `-timing`; see `docs/foundation.md`
+- [x] Implement timestamp forensics (PTS/DTS, monotonicity, gaps) (§24)
 - [ ] Implement metadata extraction + consistency cross-checks (§25–26)
 - [ ] Implement encoder fingerprinting (best-effort, confidence-labelled) (§27)
 - [ ] Implement compression/bitrate analysis + anomaly detection (§28–29)

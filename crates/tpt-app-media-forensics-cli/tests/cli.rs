@@ -11,6 +11,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use tpt_app_media_forensics_container::fixture::{build_mp4, TrackSpec};
+
 /// Path to the CLI binary under test.
 fn cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tpt-app-media-forensics-cli"))
@@ -215,9 +217,60 @@ fn analyze_rejects_a_directory_that_is_not_a_case() {
 }
 
 #[test]
-fn unimplemented_commands_say_so_rather_than_appearing_to_succeed_silently() {
+fn inspect_reports_container_structure_for_a_real_mp4() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let file = fixture(dir.path(), "evidence.mp4", b"payload");
+    let file = dir.path().join("sample.mp4");
+    std::fs::write(&file, build_mp4(&TrackSpec::video_25fps(1920, 1080, 50)))
+        .expect("writes fixture");
+
+    let output = cli()
+        .args(["inspect", file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "inspect failed: {stderr}");
+    assert!(stdout.contains("isobmff"), "container not identified");
+    assert!(stdout.contains("video"), "stream kind not reported");
+    assert!(stdout.contains("avc1"), "codec not reported");
+    assert!(stdout.contains("1920x1080"), "dimensions not reported");
+    assert!(
+        stdout.contains("frame rate: 25"),
+        "measured rate not reported"
+    );
+    assert!(
+        stdout.contains("read-only"),
+        "read-only guarantee must be stated"
+    );
+}
+
+#[test]
+fn inspect_json_output_is_valid_json() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("sample.mp4");
+    std::fs::write(&file, build_mp4(&TrackSpec::audio_48khz(480))).expect("writes");
+
+    let output = cli()
+        .args(["--json", "inspect", file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "inspect failed: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(value["container"], "isobmff");
+    assert_eq!(value["stream_count"], 1);
+    assert_eq!(value["streams"][0]["kind"], "audio");
+}
+
+#[test]
+fn inspect_reports_an_extension_mismatch() {
+    // A Matroska file named .mp4 is a finding, not an error.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("disguised.mp4");
+    let mut bytes = vec![0x1A, 0x45, 0xDF, 0xA3];
+    bytes.extend_from_slice(&[0u8; 64]);
+    std::fs::write(&file, bytes).expect("writes");
 
     let output = cli()
         .args(["inspect", file.to_str().expect("utf-8 path")])
@@ -226,11 +279,23 @@ fn unimplemented_commands_say_so_rather_than_appearing_to_succeed_silently() {
     let (_, _, stderr) = split(output);
 
     assert!(
-        stderr.contains("not implemented"),
-        "a not-yet-implemented stage must say so, not print an empty result"
+        stderr.contains("extension does not match"),
+        "a renamed container must be reported: {stderr}"
     );
-    assert!(
-        stderr.contains("read-only"),
-        "the read-only guarantee must be stated wherever the file is touched"
-    );
+}
+
+#[test]
+fn inspect_of_a_non_media_file_fails_with_the_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("notes.mp4");
+    std::fs::write(&file, b"this is plainly not a container").expect("writes");
+
+    let output = cli()
+        .args(["inspect", file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "a non-container must not report a clean inspection");
+    assert!(stderr.contains("notes.mp4"), "{stderr}");
 }

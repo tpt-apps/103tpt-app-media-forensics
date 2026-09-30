@@ -574,6 +574,8 @@ dependencies = [
  "tpt-app-media-forensics-core",
  "tpt-app-media-forensics-model",
  "tpt-app-media-forensics-report",
+ "tpt-app-media-forensics-timing",
+ "tpt-app-media-forensics-video",
  "tracing",
  "tracing-subscriber",
 ]
@@ -683,9 +685,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror",
- "tpt-app-media-forensics-evidence",
  "tpt-app-media-forensics-model",
- "tpt-app-media-forensics-timing",
  "tracing",
 ]
 

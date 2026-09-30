@@ -29,20 +29,24 @@ fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Builds an `stsd` payload declaring one visual or audio sample entry.
-fn stsd(handler: &[u8; 4], width: u16, height: u16) -> Vec<u8> {
+/// Builds an `stsd` payload declaring one sample entry.
+///
+/// Each entry is a nested box (`size` + `type` + payload), which is how the
+/// real format encodes it and how the demuxer resolves the codec `fourcc`.
+fn stsd(fourcc: &[u8; 4], width: u16, height: u16) -> Vec<u8> {
     let mut entry = vec![0u8; 6]; // reserved
     entry.extend_from_slice(&u16be(1)); // data_reference_index
-    entry.extend_from_slice(&[0u8; 6]); // pre_defined / reserved
-    entry.extend_from_slice(&u16be(width));
-    entry.extend_from_slice(&u16be(height));
+    entry.extend_from_slice(&u16be(width)); // width
+    entry.extend_from_slice(&u16be(height)); // height
     entry.extend_from_slice(&[0u8; 50]); // remaining visual fields
 
-    let mut payload = vec![0u8; 4];
+    let mut entry_box = u32be((entry.len() + 8) as u32).to_vec();
+    entry_box.extend_from_slice(fourcc);
+    entry_box.extend_from_slice(&entry);
+
+    let mut payload = vec![0u8; 4]; // version + flags
     payload.extend_from_slice(&u32be(1)); // entry_count
-    payload.extend_from_slice(handler);
-    payload.extend_from_slice(&mp4_box(b"esds", &[0u8; 4]));
-    payload.extend_from_slice(&entry);
+    payload.extend_from_slice(&entry_box);
     payload
 }
 
@@ -104,6 +108,23 @@ impl TrackSpec {
     pub fn sample_count(&self) -> u32 {
         self.timing.iter().map(|(count, _)| count).sum()
     }
+
+    /// The sample-entry four-character code a real muxer would write.
+    ///
+    /// Chosen to match the handler so the generated file resolves to a known
+    /// codec: without this the demuxer sees an unrecognised `fourcc` and the
+    /// codec-mapping path is never exercised.
+    fn sample_entry_fourcc(&self) -> [u8; 4] {
+        match &self.handler {
+            b"vide" => *b"avc1",
+            b"soun" => *b"mp4a",
+            other => {
+                let mut code = [b'?'; 4];
+                code.copy_from_slice(&other[..4]);
+                code
+            }
+        }
+    }
 }
 
 /// Builds a single-track MP4 file for the given track.
@@ -114,6 +135,11 @@ impl TrackSpec {
 /// `u32::MAX` by construction because the payload is built in memory.
 #[must_use]
 pub fn build_mp4(track: &TrackSpec) -> Vec<u8> {
+    build_mp4_inner(track, None)
+}
+
+/// Shared MP4 builder, optionally writing an `stss` sync-sample table.
+fn build_mp4_inner(track: &TrackSpec, keyframes: Option<&[u32]>) -> Vec<u8> {
     let sample_count = track.sample_count();
     let total_duration: u64 = track
         .timing
@@ -176,8 +202,15 @@ pub fn build_mp4(track: &TrackSpec) -> Vec<u8> {
     tkhd.extend_from_slice(&u32be(u32::from(track.height) << 16));
 
     let stbl = {
-        let mut boxes = mp4_box(b"stsd", &stsd(&track.handler, track.width, track.height));
+        let boxes = mp4_box(
+            b"stsd",
+            &stsd(&track.sample_entry_fourcc(), track.width, track.height),
+        );
+        let mut boxes = boxes;
         boxes.extend_from_slice(&mp4_box(b"stts", &stts_payload));
+        if let Some(frames) = keyframes {
+            boxes.extend_from_slice(&mp4_box(b"stss", &stss(frames)));
+        }
         boxes.extend_from_slice(&mp4_box(b"stsc", &stsc(sample_count)));
         boxes.extend_from_slice(&mp4_box(b"stsz", &stsz_payload));
         boxes.extend_from_slice(&mp4_box(b"stco", &stco_payload));
@@ -211,7 +244,7 @@ pub fn build_mp4(track: &TrackSpec) -> Vec<u8> {
 
     let mut file = mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2avc1mp41");
     file.extend_from_slice(&moov);
-    file.extend_from_slice(&mp4_box(b"mdat", &vec![0u8; 64]));
+    file.extend_from_slice(&mp4_box(b"mdat", &[0u8; 64]));
     file
 }
 
@@ -221,7 +254,7 @@ pub fn build_mp4(track: &TrackSpec) -> Vec<u8> {
 #[must_use]
 pub fn build_mp4_without_moov() -> Vec<u8> {
     let mut file = mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2");
-    file.extend_from_slice(&mp4_box(b"mdat", &vec![0u8; 128]));
+    file.extend_from_slice(&mp4_box(b"mdat", &[0u8; 128]));
     file
 }
 
@@ -231,6 +264,66 @@ pub fn build_mp4_empty_moov() -> Vec<u8> {
     let mut file = mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2");
     file.extend_from_slice(&mp4_box(b"moov", &[]));
     file
+}
+
+/// Builds an `stss` payload listing `sample_numbers` as sync samples.
+///
+/// Without this box, ISO-BMFF means *every* sample is a sync sample, which is
+/// not what a real encoder writes and would leave GOP analysis untestable.
+fn stss(sample_numbers: &[u32]) -> Vec<u8> {
+    let mut payload = vec![0u8; 4]; // version + flags
+    payload.extend_from_slice(&u32be(sample_numbers.len() as u32));
+    for &n in sample_numbers {
+        payload.extend_from_slice(&u32be(n));
+    }
+    payload
+}
+
+/// Builds a 25 fps MP4 whose keyframe spacing changes partway through.
+///
+/// The first half uses 50-frame GOPs, the second uses 15-frame GOPs, which is
+/// the condition spec §15 describes. Used to prove that GOP analysis surfaces a
+/// length change without decoding any frames.
+#[must_use]
+pub fn build_mp4_stsd_gop_change() -> Vec<u8> {
+    build_mp4_with_keyframes(
+        &TrackSpec::video_25fps(1920, 1080, 500),
+        &gop_change_keyframes(500, 50, 250, 15),
+    )
+}
+
+/// Keyframe indices for two GOP regimes: `first_gop` up to `switch_at`, then
+/// `second_gop` after it.
+#[must_use]
+pub fn gop_change_keyframes(
+    total_frames: u32,
+    first_gop: u32,
+    switch_at: u32,
+    second_gop: u32,
+) -> Vec<u32> {
+    let mut keyframes: Vec<u32> = Vec::new();
+    let mut frame = 0u32;
+    while frame < total_frames {
+        keyframes.push(frame);
+        frame += if frame < switch_at {
+            first_gop
+        } else {
+            second_gop
+        };
+    }
+    keyframes
+}
+
+/// Builds an MP4 with an explicit sync-sample table.
+#[must_use]
+pub fn build_mp4_with_keyframes(track: &TrackSpec, keyframes: &[u32]) -> Vec<u8> {
+    build_mp4_inner(track, Some(keyframes))
+}
+
+/// Builds an MP4 with no `stss` box, meaning every sample is a sync sample.
+#[must_use]
+pub fn build_mp4_without_stss(track: &TrackSpec) -> Vec<u8> {
+    build_mp4_inner(track, None)
 }
 
 #[cfg(test)]
@@ -262,6 +355,9 @@ mod tests {
     #[test]
     fn corpus_fixtures_are_distinct_from_each_other() {
         assert_ne!(build_mp4_without_moov(), build_mp4_empty_moov());
-        assert_ne!(build_mp4_without_moov(), build_mp4(&TrackSpec::audio_48khz(10)));
+        assert_ne!(
+            build_mp4_without_moov(),
+            build_mp4(&TrackSpec::audio_48khz(10))
+        );
     }
 }

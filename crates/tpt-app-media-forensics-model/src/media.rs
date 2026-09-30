@@ -10,19 +10,30 @@ use serde::{Deserialize, Serialize};
 use crate::time::{MediaTime, Rational, Timebase};
 
 /// The kind of elementary stream inside a container.
+///
+/// Serialises as its lowercase tag (`"video"`) rather than the Rust variant
+/// name, because this value appears in the machine-readable CLI output and in
+/// report columns, where it is a stable interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum StreamKind {
     /// Video elementary stream.
+    #[serde(rename = "video")]
     Video,
     /// Audio elementary stream.
+    #[serde(rename = "audio")]
     Audio,
     /// Subtitle or closed-caption stream.
+    #[serde(rename = "subtitle")]
     Subtitle,
     /// Opaque data stream (timecode, CEA-708, etc.).
+    #[serde(rename = "data")]
     Data,
     /// Embedded file, e.g. a font or a cover image.
+    #[serde(rename = "attachment")]
     Attachment,
     /// Stream whose type the container did not declare.
+    #[serde(rename = "unknown")]
     Unknown,
 }
 

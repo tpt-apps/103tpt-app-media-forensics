@@ -21,8 +21,8 @@
 //! reader-based demuxer.
 
 use tpt_app_media_forensics_model::{
-    ChromaSubsampling, CodecInfo, MediaTime, PixelFormat, Rational, StreamAnalysis,
-    StreamTiming, Timebase, VideoFormat,
+    ChromaSubsampling, CodecInfo, MediaTime, PixelFormat, Rational, StreamAnalysis, StreamTiming,
+    Timebase, VideoFormat,
 };
 use tpt_kinetix_core::codec::CodecId;
 use tpt_kinetix_demux::mp4::{Mp4Demuxer, Mp4Track};
@@ -37,11 +37,20 @@ use crate::probe::stream_kind_of;
 /// inspection into a crash rather than a finding.
 pub const MAX_INSPECTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Upper bound on frames expanded from a sample table.
+///
+/// A container declaring hundreds of millions of samples must not be able to
+/// make the engine allocate without limit.
+pub const MAX_EXPANDED_SAMPLES: usize = 8_000_000;
+
 /// The result of inspecting an MP4 container.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mp4Inspection {
     /// The streams recovered from the file, in container order.
     pub streams: Vec<StreamAnalysis>,
+    /// Frame timing and keyframe positions per recovered stream, in the same
+    /// order as `streams`. `None` where a track declared no samples.
+    pub frame_info: Vec<Option<TrackFrameInfo>>,
     /// Observed problems, recorded rather than raised (spec §30).
     pub anomalies: Vec<String>,
     /// Number of `trak` boxes the container declared.
@@ -59,7 +68,12 @@ pub fn inspect_bytes(data: Vec<u8>) -> Result<Mp4Inspection, ContainerError> {
     let tracks = demuxer.tracks();
 
     let mut anomalies = Vec::new();
-    let streams: Vec<StreamAnalysis> = tracks.iter().map(convert_track).collect();
+    let streams: Vec<StreamAnalysis> = tracks
+        .iter()
+        .enumerate()
+        .map(|(index, track)| convert_track(u32::try_from(index).unwrap_or(u32::MAX), track))
+        .collect();
+    let frame_info: Vec<Option<TrackFrameInfo>> = tracks.iter().map(track_frame_info).collect();
 
     if tracks.is_empty() {
         anomalies.push("container declared no usable tracks".to_owned());
@@ -67,6 +81,7 @@ pub fn inspect_bytes(data: Vec<u8>) -> Result<Mp4Inspection, ContainerError> {
 
     Ok(Mp4Inspection {
         streams,
+        frame_info,
         anomalies,
         declared_track_count: tracks.len(),
     })
@@ -96,14 +111,19 @@ pub fn inspect_file(path: &std::path::Path) -> Result<Mp4Inspection, ContainerEr
 }
 
 /// Converts one Kinetix track into the engine's stream model.
-fn convert_track(track: &Mp4Track) -> StreamAnalysis {
+///
+/// `index` is the track's position in container order. It must come from the
+/// caller rather than being assumed: `frame_info` is parallel to `streams`, and
+/// a hardcoded index would mis-associate every track after the first in a
+/// multi-track file.
+fn convert_track(index: u32, track: &Mp4Track) -> StreamAnalysis {
     let kind = stream_kind_of(track.media_type);
     let video = (kind == tpt_app_media_forensics_model::StreamKind::Video)
         .then(|| convert_video(track))
         .flatten();
 
     StreamAnalysis {
-        index: 0,
+        index,
         kind,
         language: None,
         codec: convert_codec(track.codec),
@@ -135,9 +155,27 @@ fn convert_codec(codec: Option<CodecId>) -> CodecInfo {
     }
 }
 
-/// Renders a sample-entry four-character code, preserving padding bytes.
+/// Renders a sample-entry four-character code.
+///
+/// Non-printable bytes are shown as `\xNN` rather than passed through. A
+/// `fourcc` containing control bytes is itself worth reporting, but emitting it
+/// raw produces output that renders as blank space in a terminal and tells the
+/// analyst nothing.
+///
+/// # Panics
+///
+/// Never.
 fn fourcc_string(fourcc: [u8; 4]) -> String {
-    fourcc.iter().map(|&b| char::from(b)).collect()
+    fourcc
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                char::from(b).to_string()
+            } else {
+                format!("\\x{b:02x}")
+            }
+        })
+        .collect()
 }
 
 /// Converts track timing, including the measured frame rate.
@@ -148,14 +186,18 @@ fn fourcc_string(fourcc: [u8; 4]) -> String {
 /// (spec §26).
 fn convert_timing(track: &Mp4Track) -> StreamTiming {
     let timebase = Timebase::from_ticks_per_second(track.timescale.max(1));
-    let duration = track.duration.checked_div(u64::from(track.timescale.max(1)));
+    let duration = track
+        .duration
+        .checked_div(u64::from(track.timescale.max(1)));
 
     StreamTiming {
         timebase,
         start_time: MediaTime::ZERO,
-        duration: duration.map(|secs| MediaTime::from_micros(
-            i64::try_from(secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX),
-        )),
+        duration: duration.map(|secs| {
+            MediaTime::from_micros(
+                i64::try_from(secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX),
+            )
+        }),
         edit_list_offset: None,
     }
 }
@@ -227,4 +269,76 @@ pub fn keyframe_count(track: &Mp4Track, sample_count: usize) -> Option<usize> {
         // No `stss` means all samples are sync samples.
         None => Some(sample_count),
     }
+}
+
+/// Frame-level timing and keyframe positions for one track, as read from the
+/// container's `stts` and `stss` boxes.
+///
+/// This is everything GOP analysis (spec §15) and duplicate detection (spec §17)
+/// need, and none of it requires decoding a single macroblock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackFrameInfo {
+    /// Presentation time of every frame, expanded from the `stts` run-length
+    /// table.
+    pub frame_times: Vec<tpt_app_media_forensics_model::MediaTime>,
+    /// Frame indices of the sync samples.
+    pub keyframes: Vec<u32>,
+    /// True when the track declared no `stss` box, meaning every frame is a
+    /// sync sample.
+    pub all_frames_are_keyframes: bool,
+}
+
+/// Expands a track's `stts` and `stss` into per-frame timing information.
+///
+/// Returns `None` when the track declares no samples.
+///
+/// # Panics
+///
+/// Never. Every index into the run-length table is bounds-checked, because the
+/// table is attacker-controlled (spec §75).
+#[must_use]
+pub fn track_frame_info(track: &Mp4Track) -> Option<TrackFrameInfo> {
+    let sample_count = track.sample_count();
+    if sample_count == 0 {
+        return None;
+    }
+
+    let timebase = Timebase::from_ticks_per_second(track.timescale.max(1));
+
+    // Expand the run-length table into one timestamp per sample. Bounded by the
+    // declared sample count so a hostile `stts` cannot drive an unbounded
+    // allocation.
+    let mut frame_times = Vec::with_capacity(sample_count.min(MAX_EXPANDED_SAMPLES));
+    let mut elapsed_ticks: u64 = 0;
+    'expansion: for entry in &track.stts.entries {
+        for _ in 0..entry.sample_count {
+            if frame_times.len() >= MAX_EXPANDED_SAMPLES {
+                break 'expansion;
+            }
+            frame_times.push(
+                timebase.ticks_to_media_time(i64::try_from(elapsed_ticks).unwrap_or(i64::MAX)),
+            );
+            elapsed_ticks = elapsed_ticks.saturating_add(u64::from(entry.sample_delta));
+        }
+    }
+
+    // A `stts` shorter than `stsz` leaves the tail without timestamps; pad so
+    // frame indices stay valid for the keyframe list.
+    while frame_times.len() < sample_count && frame_times.len() < MAX_EXPANDED_SAMPLES {
+        frame_times
+            .push(timebase.ticks_to_media_time(i64::try_from(elapsed_ticks).unwrap_or(i64::MAX)));
+        elapsed_ticks = elapsed_ticks.saturating_add(1);
+    }
+
+    let all_frames_are_keyframes = track.stss.is_none();
+    let keyframes = match &track.stss {
+        Some(stss) => stss.sample_numbers.clone(),
+        None => (0..u32::try_from(sample_count).unwrap_or(0)).collect(),
+    };
+
+    Some(TrackFrameInfo {
+        frame_times,
+        keyframes,
+        all_frames_are_keyframes,
+    })
 }
