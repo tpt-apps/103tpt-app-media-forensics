@@ -649,6 +649,7 @@ dependencies = [
  "tpt-app-media-forensics-metadata",
  "tpt-app-media-forensics-model",
  "tpt-app-media-forensics-report",
+ "tpt-app-media-forensics-rules",
  "tpt-app-media-forensics-timing",
  "tpt-app-media-forensics-video",
  "tpt-av-cadence-core",
@@ -687,9 +688,12 @@ dependencies = [
  "tpt-app-media-forensics-evidence",
  "tpt-app-media-forensics-metadata",
  "tpt-app-media-forensics-model",
+ "tpt-app-media-forensics-report",
  "tpt-app-media-forensics-rules",
  "tpt-app-media-forensics-timing",
  "tpt-app-media-forensics-video",
+ "tpt-av-cadence-core",
+ "tpt-av-cadence-wav",
  "tracing",
 ]
 

@@ -21,6 +21,7 @@ tpt-av-cadence-core = { workspace = true }
 tpt-av-cadence-wav = { workspace = true }
 tpt-app-media-forensics-core = { workspace = true }
 tpt-app-media-forensics-report = { workspace = true }
+tpt-app-media-forensics-rules = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

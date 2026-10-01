@@ -35,6 +35,7 @@ use tpt_app_media_forensics_container::{
 use tpt_app_media_forensics_core::{acquire, CaseDirectory};
 use tpt_app_media_forensics_metadata::{find_conflicts, MetadataEntry, Scope};
 use tpt_app_media_forensics_model::{Case, MediaType};
+use tpt_app_media_forensics_rules::builtin_rules;
 use tpt_app_media_forensics_video::duplicate::{find_repeated_runs, SampleDigest};
 use tpt_app_media_forensics_video::gop;
 
@@ -200,20 +201,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Metadata { path } => metadata_report(path, cli.json),
         Command::Inspect { path } => inspect(path, cli.json),
 
-        Command::Analyze { path, case_dir } => {
-            // Fail fast if the case directory is not a case, so the analyst is
-            // told now rather than after a long run.
-            CaseDirectory::open(case_dir)
-                .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
-            let record = acquire(path)?;
-            eprintln!("analyze: acquired {}", record.source_path);
-            eprintln!(
-                "analyze: the analysis engine is not implemented yet \
-                 (Phase 1, spec \u{a7}97)"
-            );
-            Ok(())
-        }
-
+        Command::Analyze { path, case_dir } => analyse(path, case_dir, cli.json),
         Command::Report { case_dir, out } => {
             CaseDirectory::open(case_dir)
                 .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
@@ -739,4 +727,132 @@ fn escape_atom(kind: &[u8]) -> String {
             }
         })
         .collect()
+}
+
+/// Analyses a media file and writes the result into a case (spec §97).
+///
+/// Runs the same engine the desktop app uses, so a finding means the same
+/// thing however it was reached (spec §51). The source is opened read-only.
+fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::{AnalysisEngine, CaseDirectory};
+    use tpt_app_media_forensics_report::{write_bundle, AssetSummary, Methodology, Report};
+
+    let directory = CaseDirectory::open(case_dir)
+        .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
+
+    let engine = AnalysisEngine::new();
+    let outcome = engine.analyse(path, &directory)?;
+
+    let profile = &outcome.profile;
+    let fingerprint = engine.analysis_fingerprint(&outcome.cache_key);
+
+    let methodology = Methodology {
+        application_version: env!("CARGO_PKG_VERSION").to_owned(),
+        analysis_version: outcome.cache_key.analysis_version.to_string(),
+        profile: profile.identifier(),
+        profile_fingerprint: outcome.cache_key.profile.as_hex().to_owned(),
+        enabled_rules: builtin_rules().iter().map(|r| r.id().to_owned()).collect(),
+        rule_set_fingerprint: outcome.cache_key.rules.as_hex().to_owned(),
+        input_hashes: outcome
+            .asset
+            .sha256()
+            .map(|h| vec![(outcome.asset.name.clone(), h.to_owned())])
+            .unwrap_or_default(),
+        analysis_timestamp_unix: tpt_app_media_forensics_core::pipeline::analysis_timestamp(),
+        applicable_standards: vec!["ITU-R BS.1770-4 (loudness)".to_owned()],
+        analysis_fingerprint: fingerprint.clone(),
+    };
+
+    let report = Report {
+        schema_version: 1,
+        case_name: directory_manifest_name(&directory),
+        case_id: directory.root().display().to_string(),
+        case_description: None,
+        assets: vec![AssetSummary {
+            name: outcome.asset.name.clone(),
+            source_path: outcome.asset.acquisition.source_path.clone(),
+            sha256: outcome.asset.sha256().map(ToOwned::to_owned),
+            blake3: outcome.asset.blake3().map(ToOwned::to_owned),
+            size_bytes: outcome.asset.size_bytes(),
+            stream_count: outcome.asset.acquisition.size_bytes as usize,
+        }],
+        findings: outcome.findings.clone(),
+        evidence: Vec::new(),
+        limitations: outcome.limitations.clone(),
+        methodology,
+        validation: None,
+    };
+
+    let bundle_dir = directory.root().join("reports");
+    let manifest = write_bundle(&report, &bundle_dir)?;
+
+    if json {
+        let value = serde_json::json!({
+            "source_path": path.display().to_string(),
+            "sha256": outcome.asset.sha256(),
+            "blake3": outcome.asset.blake3(),
+            "cache_hit": outcome.cache_hit,
+            "analysis_fingerprint": fingerprint,
+            "finding_count": outcome.findings.len(),
+            "findings": outcome.findings,
+            "limitations": outcome.limitations,
+            "bundle_files": manifest.files,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("Source        {}", path.display());
+        println!(
+            "SHA-256       {}",
+            outcome.asset.sha256().unwrap_or("(not computed)")
+        );
+        println!(
+            "BLAKE3        {}",
+            outcome.asset.blake3().unwrap_or("(not computed)")
+        );
+        println!(
+            "Result        {}",
+            if outcome.cache_hit {
+                "served from the analysis cache"
+            } else {
+                "analysed"
+            }
+        );
+        println!("Findings      {}", outcome.findings.len());
+        for finding in &outcome.findings {
+            println!(
+                "  [{}] {}  {}",
+                finding.severity.tag(),
+                finding.rule_id,
+                finding.observation.summary
+            );
+        }
+        if !outcome.limitations.is_empty() {
+            println!("Limitations");
+            for limitation in &outcome.limitations {
+                println!("  - {limitation}");
+            }
+        }
+        println!("Fingerprint   {fingerprint}");
+        println!("Bundle        {}", bundle_dir.display());
+        for entry in &manifest.files {
+            println!("  {}  sha256 {}", entry.name, entry.sha256);
+        }
+        println!("Source was opened read-only; it has not been modified.");
+    }
+
+    Ok(())
+}
+
+/// Reads the case name from its manifest, falling back to the directory name.
+fn directory_manifest_name(directory: &CaseDirectory) -> String {
+    directory
+        .read_manifest()
+        .map(|m| m.name)
+        .unwrap_or_else(|_| {
+            directory
+                .root()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "case".to_owned())
+        })
 }

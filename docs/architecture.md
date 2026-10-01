@@ -123,6 +123,21 @@ source file (read-only)
 [report]      PDF / HTML / JSON / CSV + reproducibility data
 ```
 
+This is `-core::pipeline::AnalysisEngine`. Three details in that ordering are
+load-bearing rather than incidental:
+
+- **The cache is consulted before any analysis work**, not after. The key
+  covers asset content, analysis version, profile, and rule set (spec 54), so
+  a cache hit is only possible when the analysis would have been identical.
+- **A stage that cannot run does not abort the examination.** A file whose audio
+  track will not decode still produces a full container report; the gap is
+  appended to `AnalysisOutcome::limitations` (spec 60). An examiner needs to
+  know what was *not* looked at as much as what was.
+- **The analysis fingerprint is computed once.** `AnalysisEngine::analysis_fingerprint`
+  and the report methodology both call the same function, so a report and its
+  cache validity cannot disagree about what was run.
+```
+
 ## Reproducibility
 
 Every report records, and every cache key incorporates:

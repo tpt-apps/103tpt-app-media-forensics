@@ -18,7 +18,10 @@ tpt-app-media-forensics-audio = { workspace = true }
 tpt-app-media-forensics-timing = { workspace = true }
 tpt-app-media-forensics-metadata = { workspace = true }
 tpt-app-media-forensics-evidence = { workspace = true }
+tpt-app-media-forensics-report = { workspace = true }
 tpt-app-media-forensics-rules = { workspace = true }
+tpt-av-cadence-core = { workspace = true }
+tpt-av-cadence-wav = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

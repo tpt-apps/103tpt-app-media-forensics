@@ -35,3 +35,7 @@ pub use store::Store;
 pub mod cache;
 
 pub use cache::{AnalysisCache, CacheEntry};
+
+pub mod pipeline;
+
+pub use pipeline::{AnalysisEngine, AnalysisOutcome};
