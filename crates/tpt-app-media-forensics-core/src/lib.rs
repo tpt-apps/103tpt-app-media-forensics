@@ -27,3 +27,7 @@ pub mod error;
 pub use acquisition::{acquire, acquire_asset};
 pub use case_dir::{CaseDirectory, CaseManifest};
 pub use error::CoreError;
+
+pub mod store;
+
+pub use store::Store;

@@ -127,6 +127,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Metadata atom names render as `u+a9cmt` rather than the raw copyright byte,
   which was illegible in a terminal
 
+#### Phase 1 — SQLite persistence (spec §52)
+- `-core::store`: case database holding cases, assets, analyses, streams,
+  findings, evidence, rule results, reports, and analyst notes
+- Versioned schema via `PRAGMA user_version`; migrations are ordered and
+  never rewritten. A case written by a newer build is refused rather than
+  silently misread
+- Foreign keys are enforced per connection (`PRAGMA foreign_keys = ON`),
+  which SQLite does not do by default. Without it a finding could reference
+  an analysis that does not exist and the database would accept it, producing
+  a report that cites evidence from nowhere
+- Findings and evidence are insert-only. A reviewer's verdict lives in
+  `finding_reviews`, keyed to the finding, so accepting or rejecting a finding
+  never edits the observation it judges (spec §66)
+- Observed values are stored verbatim. A digest the case "helpfully"
+  upper-cased would no longer match what the file reports
+- `UNIQUE (case_id, sha256)` makes a duplicate import of the same file into
+  one case impossible, while permitting the same file across two cases where
+  comparison is legitimate
+- Write-ahead logging and `synchronous = FULL`: the record must survive a
+  crash mid-write
+- `rusqlite` with the `bundled` feature, so no system SQLite is required
+
 ### Fixed
 
 - Every stream was reported with index 0, which would mis-associate frame data

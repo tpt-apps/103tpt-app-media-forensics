@@ -33,8 +33,9 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 
 ## Phase 1 — MVP (spec §84, §96, §97)
 - [x] Define Case model (§9) and Asset model (§10)
-- [ ] Implement SQLite persistence (§52) for cases/assets/analyses/streams/
-      findings/evidence/rules/reports/notes
+- [x] Implement SQLite persistence (§52) for cases/assets/analyses/streams/
+      findings/evidence/rules/reports/notes — versioned schema, enforced
+      foreign keys, append-only findings/evidence, transactional writes
 - [x] Implement case directory layout (§53) and manifest format (§58)
 - [ ] Implement asset acquisition record (§11): path, size, timestamps,
       SHA-256, BLAKE3, filesystem info — read-only source guarantee

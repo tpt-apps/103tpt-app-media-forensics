@@ -61,6 +61,21 @@ pub enum CoreError {
         /// What was wrong.
         reason: String,
     },
+
+    /// A case database operation failed.
+    ///
+    /// Kept distinct from an I/O error: a constraint violation (a finding
+    /// referencing a missing analysis, a duplicate asset hash) is a different
+    /// kind of problem from a disk failure, and the two must not be conflated
+    /// when diagnosing a case.
+    #[error("case database error during {operation}: {source}")]
+    Database {
+        /// What the database was being asked to do.
+        operation: &'static str,
+        /// The underlying error.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 impl CoreError {
@@ -76,5 +91,11 @@ impl CoreError {
             path: path.into(),
             source,
         }
+    }
+
+    /// Wraps a database error with the operation that produced it.
+    #[must_use]
+    pub fn database(operation: &'static str, source: rusqlite::Error) -> Self {
+        Self::Database { operation, source }
     }
 }
