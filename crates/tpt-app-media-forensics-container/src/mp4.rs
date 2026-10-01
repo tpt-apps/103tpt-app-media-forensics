@@ -1,4 +1,4 @@
-//! MP4 / ISO-BMFF inspection (spec §12, §13, §24).
+//! MP4 / ISO-BMFF inspection (spec 12, 13, 24).
 //!
 //! Wraps `tpt-kinetix-demux`, mapping Kinetix track descriptions into this
 //! engine's [`StreamAnalysis`] model.
@@ -6,20 +6,19 @@
 //! # Graceful continuation
 //!
 //! `parse_mp4` skips malformed tracks and returns whatever parsed cleanly. That
-//! is exactly the behaviour spec §30 requires: a file with one broken track
+//! is exactly the behaviour spec 30 requires: a file with one broken track
 //! should still yield a description of the others, and the breakage is itself
 //! a finding. The count of tracks recovered versus tracks attempted is
 //! therefore reported alongside the streams.
 //!
-//! # Whole-file loading
+//! # Partial loading
 //!
-//! `Mp4Demuxer::new` takes the complete file as a `Vec<u8>`. This is a known
-//! departure from the streaming requirement in spec §55 and is guarded by
-//! [`MAX_INSPECTED_BYTES`]: a file beyond that limit is refused with an
-//! explicit error rather than being allowed to exhaust memory. Streaming
-//! parsing is tracked in the todo and revisited when Kinetix exposes a
-//! reader-based demuxer.
-
+//! [`Mp4Demuxer::new`] takes a complete `Vec<u8>`, so Kinetix is itself a
+//! whole-file demuxer. That no longer limits inspection: [`read_moov`] loads
+//! only the `moov` box, which is where every structural check reads from, and
+//! leaves the media data on disk. A file of any size is therefore analysable,
+//! bounded instead by [`MAX_MOOV_BYTES`]. Sample-level work does need the
+//! encoded bytes and keeps its own bound, [`MAX_SAMPLED_BYTES`].
 use tpt_app_media_forensics_model::{
     ChromaSubsampling, CodecInfo, MediaTime, PixelFormat, Rational, StreamAnalysis, StreamTiming,
     Timebase, VideoFormat,
@@ -421,4 +420,195 @@ pub fn read_samples(data: Vec<u8>) -> Result<Vec<SampleRecord>, ContainerError> 
 /// Formats a digest as lowercase hex.
 fn digest_hex(digest: &[u8]) -> String {
     tpt_app_media_forensics_model::asset::to_hex(digest)
+}
+
+// ---------------------------------------------------------------------------
+// Partial reads
+//
+// Inspection only ever needs the `moov` box: that is where the sample tables,
+// codec descriptions, and timing live. `mdat` holds the encoded media, which on
+// a long recording is almost the whole file and which no structural check reads.
+// Loading a 40 GB asset to look at a 2 KB `moov` is what makes whole-file
+// inspection unusable at professional timescales.
+// ---------------------------------------------------------------------------
+
+/// Largest `moov` box this reader will extract.
+///
+/// Far above any real `moov`: the box holds tables, not media. The bound exists
+/// so a file declaring a multi-gigabyte `moov` cannot exhaust memory.
+pub const MAX_MOOV_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Reads only the `moov` box from a file, leaving the media data on disk.
+///
+/// Returns the box with its original header, so the buffer handed to
+/// [`inspect_bytes`] is a valid top-level box sequence.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, if no `moov` box is present, or
+/// if the declared `moov` exceeds [`MAX_MOOV_BYTES`].
+pub fn read_moov(path: &std::path::Path) -> Result<Vec<u8>, ContainerError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| ContainerError::io("open container", path.display().to_string(), e))?;
+
+    let total = file
+        .metadata()
+        .map_err(|e| ContainerError::io("stat container", path.display().to_string(), e))?
+        .len();
+
+    let mut offset = 0u64;
+    let mut header = [0u8; 16];
+
+    while offset < total {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| ContainerError::io("seek container", path.display().to_string(), e))?;
+
+        // A box header is at least 8 bytes: size and type.
+        let read = read_up_to(&mut file, &mut header[..8])
+            .map_err(|e| ContainerError::io("read box header", path.display().to_string(), e))?;
+        if read < 8 {
+            break;
+        }
+
+        let declared = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let box_type = [header[4], header[5], header[6], header[7]];
+
+        // `size == 1` means a 64-bit length follows the type field.
+        let (size, header_len) = if declared == 1 {
+            let read = read_up_to(&mut file, &mut header[8..16]).map_err(|e| {
+                ContainerError::io("read box header", path.display().to_string(), e)
+            })?;
+            if read < 8 {
+                break;
+            }
+            let wide = u64::from_be_bytes([
+                header[8], header[9], header[10], header[11], header[12], header[13], header[14],
+                header[15],
+            ]);
+            (wide, 16u64)
+        } else if declared == 0 {
+            // A size of zero means the box runs to the end of the file.
+            (total - offset, 8u64)
+        } else {
+            (u64::from(declared), 8u64)
+        };
+
+        if &box_type == b"moov" {
+            // The bound is checked before the file-extent check below, so a
+            // `moov` that declares more than the limit is reported as exceeding
+            // it rather than as a malformed file. The two conditions are
+            // different findings: one is a hostile or broken file, the other is
+            // a limitation of this build.
+            if size > MAX_MOOV_BYTES {
+                return Err(ContainerError::TooLarge {
+                    path: path.display().to_string(),
+                    size_bytes: size,
+                    limit_bytes: MAX_MOOV_BYTES,
+                });
+            }
+        }
+
+        // A box that claims to start past the end of the file is malformed;
+        // stopping here keeps a corrupt length from producing a huge seek.
+        if size < header_len || offset + size > total {
+            break;
+        }
+
+        if &box_type == b"moov" {
+            let mut payload = vec![0u8; usize::try_from(size).unwrap_or(usize::MAX)];
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| ContainerError::io("seek container", path.display().to_string(), e))?;
+            file.read_exact(&mut payload)
+                .map_err(|e| ContainerError::io("read moov", path.display().to_string(), e))?;
+            return Ok(payload);
+        }
+
+        offset += size;
+    }
+
+    Err(ContainerError::Parse(format!(
+        "{}: no moov box found in {total} bytes",
+        path.display()
+    )))
+}
+
+/// Reads up to `buf.len()` bytes, returning how many were read.
+///
+/// `read_exact` is avoided deliberately: a truncated final box should end the
+/// walk, not raise an I/O error, because a damaged file is evidence rather than
+/// a failure (spec §30).
+fn read_up_to(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read as _;
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
+/// Inspects a file by reading only its `moov` box.
+///
+/// Unlike [`inspect_file`], this places no limit on the file's size: only the
+/// `moov` box is loaded, and that is bounded separately by [`MAX_MOOV_BYTES`].
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or carries no usable `moov`.
+pub fn inspect_path(path: &std::path::Path) -> Result<Mp4Inspection, ContainerError> {
+    inspect_bytes(read_moov(path)?)
+}
+
+/// Largest file this build will load for sample-level analysis.
+///
+/// Inspection is unaffected: it reads only `moov`. This bound applies to
+/// duplicate detection, which needs every sample's encoded bytes, and is set
+/// where a memory-constrained workstation still fails cleanly rather than
+/// being killed mid-examination.
+pub const MAX_SAMPLED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Reads every sample in a file, loading the media data.
+///
+/// Refuses files above [`MAX_SAMPLED_BYTES`] rather than attempting the read.
+///
+/// # Errors
+///
+/// Returns an error if the file is too large, cannot be read, or carries no
+/// usable `moov` box.
+pub fn read_samples_file(path: &std::path::Path) -> Result<Vec<SampleRecord>, ContainerError> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| ContainerError::io("stat container", path.display().to_string(), e))?
+        .len();
+    if size > MAX_SAMPLED_BYTES {
+        return Err(ContainerError::TooLarge {
+            path: path.display().to_string(),
+            size_bytes: size,
+            limit_bytes: MAX_SAMPLED_BYTES,
+        });
+    }
+    let data = std::fs::read(path)
+        .map_err(|e| ContainerError::io("read container", path.display().to_string(), e))?;
+    read_samples(data)
+}
+
+/// Reads the first `limit` bytes of a file, for format detection.
+///
+/// Detection needs only a signature, so this avoids reading a whole asset to
+/// answer a question its first sixteen bytes settle.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read.
+pub fn read_header(path: &std::path::Path, limit: usize) -> Result<Vec<u8>, ContainerError> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| ContainerError::io("open source", path.display().to_string(), e))?;
+    let mut buf = vec![0u8; limit];
+    let filled = read_up_to(&mut file, &mut buf)
+        .map_err(|e| ContainerError::io("read source header", path.display().to_string(), e))?;
+    buf.truncate(filled);
+    Ok(buf)
 }

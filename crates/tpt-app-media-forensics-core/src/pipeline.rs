@@ -26,7 +26,7 @@ use std::path::Path;
 
 use tpt_app_media_forensics_audio::{level_stats, Measurement};
 use tpt_app_media_forensics_container::probe::{detect_file, extension_matches};
-use tpt_app_media_forensics_container::{detect, read_samples, ContainerFormat};
+use tpt_app_media_forensics_container::{detect, read_samples_file, ContainerFormat};
 use tpt_app_media_forensics_metadata::{MetadataEntry, MetadataTree, Scope};
 use tpt_app_media_forensics_model::{
     AcquisitionRecord, AnalysisId, AnalysisVersion, CacheKey, Case, Finding, MediaAsset, MediaTime,
@@ -137,11 +137,24 @@ impl AnalysisEngine {
         }
 
         // 4. Container inspection.
-        let bytes = std::fs::read(source)
-            .map_err(|e| CoreError::io("read source", source.display().to_string(), e))?;
-        let format = detect(&bytes);
+        //
+        // Only the header is read here. Every structural check needs the `moov`
+        // box - the sample tables, codec descriptions, and timing - and never
+        // touches `mdat`, which on a long recording is nearly the whole file.
+        // Reading the whole asset to inspect a file this tool will be handed
+        // 40 GB masters of is what makes an examination impractical, so the
+        // media data stays on disk unless sample reading is genuinely needed.
+        let header =
+            tpt_app_media_forensics_container::read_header(source, 64 * 1024).map_err(|e| {
+                CoreError::io(
+                    "read source header",
+                    source.display().to_string(),
+                    std::io::Error::other(e),
+                )
+            })?;
+        let format = detect(&header);
         let inspection = if format == ContainerFormat::IsoBmff {
-            match tpt_app_media_forensics_container::inspect_bytes(bytes.clone()) {
+            match tpt_app_media_forensics_container::inspect_path(source) {
                 Ok(inspection) => Some(inspection),
                 Err(error) => {
                     limitations.push(format!("container structure could not be read: {error}"));
@@ -179,20 +192,47 @@ impl AnalysisEngine {
                     self.profile.gop_tolerance_frames,
                 ));
             }
-            if let Ok(samples) = read_samples(bytes.clone()) {
-                let digests: Vec<tpt_app_media_forensics_video::duplicate::SampleDigest> = samples
-                    .iter()
-                    .map(|s| tpt_app_media_forensics_video::duplicate::SampleDigest {
-                        digest: s.digest.clone(),
-                        time: s.time,
-                        is_key_frame: s.is_key_frame,
-                    })
-                    .collect();
-                bundle.repeated_runs = find_repeated_runs(&digests, self.profile.min_duplicate_run);
+            // Duplicate detection needs every sample's bytes, so it genuinely
+            // requires the media data. On a file too large to hold, it is
+            // skipped and the gap is stated rather than silently omitted.
+            let size = std::fs::metadata(source)
+                .map(|m| m.len())
+                .unwrap_or_default();
+            if size <= tpt_app_media_forensics_container::MAX_SAMPLED_BYTES {
+                match read_samples_file(source) {
+                    Ok(samples) => {
+                        let digests: Vec<tpt_app_media_forensics_video::duplicate::SampleDigest> =
+                            samples
+                                .iter()
+                                .map(|s| tpt_app_media_forensics_video::duplicate::SampleDigest {
+                                    digest: s.digest.clone(),
+                                    time: s.time,
+                                    is_key_frame: s.is_key_frame,
+                                })
+                                .collect();
+                        bundle.repeated_runs =
+                            find_repeated_runs(&digests, self.profile.min_duplicate_run);
+                    }
+                    Err(error) => limitations.push(format!(
+                        "sample reading failed, so duplicate detection was skipped: {error}"
+                    )),
+                }
+            } else {
+                limitations.push(format!(
+                    "file is {size} bytes, above the {} byte limit for sample-level duplicate detection; \
+                     structural analysis still covers it",
+                    tpt_app_media_forensics_container::MAX_SAMPLED_BYTES
+                ));
             }
         }
 
-        bundle.metadata = extract_metadata(&bytes);
+        // Metadata lives in moov, which was already read for inspection, so this
+        // costs nothing extra and never touches the media data.
+        bundle.metadata = bundle.container.as_ref().and_then(|_| {
+            tpt_app_media_forensics_container::read_moov(source)
+                .ok()
+                .and_then(|bytes| extract_metadata(&bytes))
+        });
         if bundle.metadata.as_ref().is_none_or(MetadataTree::is_empty) {
             limitations.push("no readable metadata atoms were found".to_owned());
         }

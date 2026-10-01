@@ -3,6 +3,30 @@
 All notable changes to this project are docum
 #### Phase 1 - report generation and case persistence (spec 59-63, 66)
 #### Phase 1 - batch analysis (spec 48-49)
+#### Phase 1 - partial reads: inspection no longer loads whole files (spec 12)
+- `-container::read_moov` walks the top-level box headers and loads only the
+  `moov` box, leaving the media data on disk
+  - Inspection needs the sample tables, codec descriptions, and timing, which
+    all live in `moov`. `mdat` holds the encoded media, which on a long
+    recording is nearly the whole file and which no structural check reads
+  - Measured on a 600 MB file: 1 KB read, 0.0002% of the file, 168 microseconds
+  - Handles the three size encodings the format allows: 32-bit, 64-bit extended
+    (`size == 1`), and zero meaning "to end of file"
+- `inspect_path` places no limit on file size, only on the `moov` box
+  (`MAX_MOOV_BYTES`, 256 MiB). The previous 2 GiB whole-file ceiling no longer
+  bounds what can be inspected, so a long master is now analysable
+- The pipeline reads a bounded 64 KiB header for format detection rather than
+  the whole file, and previously cloned the file buffer twice
+- Sample-level duplicate detection genuinely needs every sample's encoded
+  bytes, so it keeps its own bound (`MAX_SAMPLED_BYTES`). On a file above it,
+  duplicate detection is skipped and the gap is recorded in the report's
+  limitations - structural analysis still covers the file
+- The `moov` size bound is checked before the file-extent check, so an
+  oversized `moov` reports that it exceeds the limit rather than being
+  misreported as a malformed file. The two are different findings
+- 15 tests over partial reads: large-`mdat` files, missing `moov`, truncated
+  final boxes, sizes past end-of-file, zero-size boxes, a `moov` that is not the
+  second box, oversized `moov`, determinism, and bounded header reads
 #### Phase 1 - the complete built-in rule set (spec 35-37)
 - Nine rules added, completing the planned twenty. Each reads fields the
   analysis already produces, so none of them adds cost at analysis time
