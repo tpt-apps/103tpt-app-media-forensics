@@ -202,13 +202,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Inspect { path } => inspect(path, cli.json),
 
         Command::Analyze { path, case_dir } => analyse(path, case_dir, cli.json),
-        Command::Report { case_dir, out } => {
-            CaseDirectory::open(case_dir)
-                .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
-            eprintln!("report: writing {} ", out.display());
-            eprintln!("report: rendering is not implemented yet (Phase 1, spec \u{a7}59-63)");
-            Ok(())
-        }
+        Command::Report { case_dir, out } => generate_report(case_dir, out),
 
         Command::Batch {
             directory,
@@ -855,4 +849,86 @@ fn directory_manifest_name(directory: &CaseDirectory) -> String {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "case".to_owned())
         })
+}
+
+/// Renders a report from a previously analysed case.
+///
+/// The format is inferred from the output extension, so `report --out r.pdf`
+/// produces a PDF and `--out r.html` produces HTML. This reads what the engine
+/// recorded; it never re-analyses, because a report built from stored findings
+/// states what was actually observed at the time.
+fn generate_report(case_dir: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::pipeline::load_report;
+    use tpt_app_media_forensics_report::{
+        asset_hashes_to_csv, findings_to_csv, measurements_to_csv, to_html, to_json, to_pdf,
+        write_bundle,
+    };
+
+    let directory = CaseDirectory::open(case_dir)
+        .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
+    let loaded = load_report(&directory)?;
+    let report = &loaded.report;
+
+    let bytes = match out
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("json") => write_bytes(out, to_json(report)?.into_bytes())?,
+        Some("html") | Some("htm") => write_bytes(out, to_html(report).into_bytes())?,
+        Some("csv") => write_bytes(out, findings_to_csv(report).into_bytes())?,
+        Some("pdf") => write_bytes(out, to_pdf(report)?)?,
+        Some("bundle") => {
+            // A directory bundle: every deliverable plus a verifying manifest.
+            let manifest = write_bundle(report, out)?;
+            println!("Bundle        {}", out.display());
+            for entry in &manifest.files {
+                println!("  {}  sha256 {}", entry.name, entry.sha256);
+            }
+            println!(
+                "Measurements  {}",
+                measurements_to_csv(report)
+                    .lines()
+                    .count()
+                    .saturating_sub(1)
+            );
+            println!(
+                "Asset hashes  {}",
+                asset_hashes_to_csv(report)
+                    .lines()
+                    .count()
+                    .saturating_sub(1)
+            );
+            return Ok(());
+        }
+        other => anyhow::bail!(
+            "cannot infer a report format from {}; use .json, .html, .csv, .pdf, or .bundle",
+            other.unwrap_or("(no extension)")
+        ),
+    };
+
+    use sha2::Digest as _;
+    let hash = tpt_app_media_forensics_model::asset::to_hex(&sha2::Sha256::digest(&bytes));
+    println!("Report        {}", out.display());
+    println!(
+        "Format        {}",
+        out.extension().and_then(|e| e.to_str()).unwrap_or("?")
+    );
+    println!("Findings      {}", report.finding_count());
+    println!("Bytes         {}", bytes.len());
+    println!("SHA-256       {hash}");
+    println!("Fingerprint   {}", report.methodology.analysis_fingerprint);
+    if !report.limitations.is_empty() {
+        println!("Limitations");
+        for limitation in &report.limitations {
+            println!("  - {limitation}");
+        }
+    }
+    Ok(())
+}
+/// Writes bytes to `path`, returning them for hashing.
+fn write_bytes(path: &std::path::Path, bytes: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    std::fs::write(path, &bytes)?;
+    Ok(bytes)
 }

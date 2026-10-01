@@ -49,12 +49,17 @@ pub struct BundleManifest {
 pub fn write_bundle(report: &Report, directory: &Path) -> Result<BundleManifest, ReportError> {
     std::fs::create_dir_all(directory).map_err(|e| io("create bundle directory", e))?;
 
-    let outputs: [(&str, String); 5] = [
-        ("case-data.json", to_json(report)?),
-        ("case-report.html", to_html(report)),
-        ("findings.csv", findings_to_csv(report)),
-        ("measurements.csv", measurements_to_csv(report)),
-        ("asset-hashes.csv", asset_hashes_to_csv(report)),
+    // spec §62: the bundle carries every deliverable a recipient needs. PDF is
+    // included alongside HTML rather than instead of it, because the canonical
+    // machine-readable form is the JSON and the PDF is the presentable one.
+    let pdf = crate::pdf::to_pdf(report)?;
+    let outputs: Vec<(&str, Vec<u8>)> = vec![
+        ("case-data.json", to_json(report)?.into_bytes()),
+        ("case-report.html", to_html(report).into_bytes()),
+        ("case-report.pdf", pdf),
+        ("findings.csv", findings_to_csv(report).into_bytes()),
+        ("measurements.csv", measurements_to_csv(report).into_bytes()),
+        ("asset-hashes.csv", asset_hashes_to_csv(report).into_bytes()),
     ];
 
     let mut files = Vec::with_capacity(outputs.len() + 1);
@@ -81,13 +86,13 @@ pub fn write_bundle(report: &Report, directory: &Path) -> Result<BundleManifest,
 }
 
 /// Writes one file and returns its manifest entry.
-fn write_file(directory: &Path, name: &str, contents: &str) -> Result<BundleEntry, ReportError> {
+fn write_file(directory: &Path, name: &str, contents: &[u8]) -> Result<BundleEntry, ReportError> {
     let path = bundle_path(directory, name);
-    std::fs::write(&path, contents.as_bytes()).map_err(|e| io("write bundle file", e))?;
+    std::fs::write(&path, contents).map_err(|e| io("write bundle file", e))?;
     Ok(BundleEntry {
         name: name.to_owned(),
         size_bytes: contents.len() as u64,
-        sha256: sha256_hex(contents.as_bytes()),
+        sha256: sha256_hex(contents),
     })
 }
 

@@ -20,6 +20,8 @@ pub mod schema;
 
 use rusqlite::Connection;
 
+use tpt_app_media_forensics_model::time::MediaTime;
+
 use crate::error::CoreError;
 
 /// A case database.
@@ -267,8 +269,8 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "INSERT INTO finding_reviews (finding_id, status, note) \
-             VALUES ('f1','ACCEPTED','expected')",
+            "INSERT INTO finding_reviews (finding_id, analysis_id, status, note) \
+             VALUES ('f1','an1','ACCEPTED','expected')",
             [],
         )
         .unwrap();
@@ -276,13 +278,56 @@ mod tests {
         let (summary, status): (String, String) = c
             .query_row(
                 "SELECT f.summary, r.status FROM findings f \
-                 JOIN finding_reviews r ON r.finding_id = f.id WHERE f.id = 'f1'",
+                 JOIN finding_reviews r ON r.finding_id = f.id \
+                 AND r.analysis_id = f.analysis_id WHERE f.id = 'f1'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(summary, "original", "the observation must be untouched");
         assert_eq!(status, "ACCEPTED");
+    }
+
+    #[test]
+    fn the_same_finding_can_be_recorded_by_two_analyses() {
+        // A finding id is derived from the observation, so re-analysing the same
+        // file under a different profile produces the same id. It must be stored
+        // as a separate row rather than colliding (spec §66: re-analysing
+        // produces new findings, it never edits old ones).
+        let store = Store::open_in_memory().expect("opens");
+        let c = store.connection();
+        c.execute("INSERT INTO cases (id, name) VALUES ('c1', 'A')", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO assets (id, case_id, name, media_type, source_path, size_bytes, sha256) \
+             VALUES ('a1','c1','x.mp4','container','x.mp4',1,'aa')",
+            [],
+        )
+        .unwrap();
+        for analysis in ["an1", "an2"] {
+            c.execute(
+                "INSERT INTO analyses (id, case_id, asset_id, cache_key, software_version, \
+                 analysis_version, status) VALUES (?1,'c1','a1','k','1.0.0',1,'COMPLETE')",
+                [analysis],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO findings (id, analysis_id, asset_id, rule_id, severity, confidence, \
+                 summary, measurements) VALUES ('f1', ?1, 'a1','R','WARNING','High','s','[]')",
+                [analysis],
+            )
+            .unwrap();
+        }
+
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM findings WHERE id = 'f1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "the same observation under two analyses is two rows"
+        );
     }
 }
 
@@ -400,5 +445,222 @@ impl Store {
         }
         self.connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+    }
+}
+
+/// A stored analysis run, as read back from the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAnalysis {
+    /// Analysis identifier.
+    pub id: String,
+    /// Case the analysis belongs to.
+    pub case_id: String,
+    /// Asset that was analysed.
+    pub asset_id: String,
+    /// Cache key that produced this run (spec §54).
+    pub cache_key: String,
+    /// Findings produced.
+    pub finding_count: i64,
+    /// Rules that ran.
+    pub rule_count: i64,
+    /// Profile identifier used for the run.
+    pub profile: String,
+    /// Profile threshold fingerprint.
+    pub profile_fingerprint: String,
+    /// Rule-set fingerprint.
+    pub rule_set_fingerprint: String,
+    /// When the run started, in Unix seconds.
+    pub started_at: i64,
+}
+
+impl Store {
+    /// Records an analysis run.
+    ///
+    /// Returns an error if the write fails, including when a finding is inserted
+    /// against an analysis that does not exist.
+    pub fn insert_analysis(&self, analysis: &StoredAnalysis) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "INSERT INTO analyses (id, case_id, asset_id, cache_key, software_version, \
+         analysis_version, status, finding_count, rule_count, profile, \
+         profile_fingerprint, rule_set_fingerprint, started_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'COMPLETE', ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                analysis.id,
+                analysis.case_id,
+                analysis.asset_id,
+                analysis.cache_key,
+                env!("CARGO_PKG_VERSION"),
+                i64::from(tpt_app_media_forensics_model::AnalysisVersion::CURRENT.value()),
+                analysis.finding_count,
+                analysis.rule_count,
+                analysis.profile,
+                analysis.profile_fingerprint,
+                analysis.rule_set_fingerprint,
+                analysis.started_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records every rule that ran, so a case shows what was considered even when
+    /// a rule raised nothing.
+    pub fn insert_rule_results(
+        &self,
+        analysis_id: &str,
+        rule_ids: &[String],
+    ) -> rusqlite::Result<()> {
+        for rule_id in rule_ids {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO rule_results (analysis_id, rule_id) VALUES (?1, ?2)",
+                rusqlite::params![analysis_id, rule_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Appends a finding to an analysis.
+    ///
+    /// The complete finding is stored as canonical JSON in `payload` alongside the
+    /// typed columns, so `report` re-renders the engine's output exactly rather
+    /// than a reconstruction from lossy columns. Append-only: an existing finding
+    /// is never updated (spec §66).
+    pub fn insert_finding(
+        &self,
+        analysis_id: &str,
+        finding: &tpt_app_media_forensics_model::Finding,
+    ) -> rusqlite::Result<()> {
+        let payload = serde_json::to_string(finding)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        self.connection.execute(
+            "INSERT INTO findings (id, analysis_id, asset_id, rule_id, severity, confidence, \
+         summary, measurements, timeline_start_micros, timeline_end_micros, payload) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                finding.id.to_string(),
+                analysis_id,
+                finding.asset_id.to_string(),
+                finding.rule_id,
+                finding.severity.tag(),
+                finding.confidence.tag(),
+                finding.observation.summary,
+                serde_json::to_string(&finding.observation.measurements)
+                    .unwrap_or_else(|_| "[]".to_owned()),
+                finding.timeline_start.map_or(0, MediaTime::as_micros),
+                finding.timeline_end.map_or(0, MediaTime::as_micros),
+                payload,
+            ],
+        )?;
+
+        // The reviewer disposition lives in its own table (spec §66): a review must
+        // never overwrite the observation, so it is recorded as a separate row.
+        if finding.status != tpt_app_media_forensics_model::FindingStatus::New {
+            self.connection.execute(
+                "INSERT INTO finding_reviews (finding_id, status, note) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    finding.id.to_string(),
+                    finding.status.tag(),
+                    finding.review_note,
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Reads every finding in a case, most severe first.
+    ///
+    /// Ordering is `severity, rule_id, id` so the sequence is stable across runs and
+    /// matches the order the engine already sorted them into (spec §77).
+    pub fn findings_in_case(
+        &self,
+        case_id: &str,
+    ) -> rusqlite::Result<Vec<tpt_app_media_forensics_model::Finding>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT f.payload FROM findings f \
+     JOIN analyses a ON a.id = f.analysis_id \
+     WHERE a.case_id = ?1 \
+     ORDER BY CASE f.severity \
+         WHEN 'CRITICAL' THEN 0 WHEN 'SIGNIFICANT' THEN 1 \
+         WHEN 'WARNING' THEN 2 ELSE 3 END, f.rule_id, f.id",
+        )?;
+
+        let rows = stmt.query_map([case_id], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let payload = row?;
+            // A payload that will not parse is skipped rather than failing the whole
+            // read: one corrupt row must not make a case unreportable.
+            if let Ok(finding) = serde_json::from_str(&payload) {
+                out.push(finding);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Records a generated report and returns its identifier.
+    pub fn insert_report(
+        &self,
+        case_id: &str,
+        analysis_id: Option<&str>,
+        format: &str,
+        relative_path: &str,
+        sha256: &str,
+    ) -> rusqlite::Result<String> {
+        let id = tpt_app_media_forensics_model::ReportId::new_derived(&[
+            case_id.as_bytes(),
+            format.as_bytes(),
+            relative_path.as_bytes(),
+        ]);
+        self.connection.execute(
+            "INSERT INTO reports (id, case_id, analysis_id, format, relative_path, sha256) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     ON CONFLICT(id) DO UPDATE SET sha256 = excluded.sha256",
+            rusqlite::params![
+                id.to_string(),
+                case_id,
+                analysis_id,
+                format,
+                relative_path,
+                sha256
+            ],
+        )?;
+        Ok(id.to_string())
+    }
+
+    /// Returns the most recent analysis in a case, if any.
+    pub fn latest_analysis(&self, case_id: &str) -> rusqlite::Result<Option<StoredAnalysis>> {
+        let mut stmt = self.connection.prepare(
+    "SELECT id, case_id, asset_id, cache_key, finding_count, rule_count, profile, profile_fingerprint, rule_set_fingerprint, started_at FROM analyses \
+     WHERE case_id = ?1 ORDER BY id LIMIT 1",
+)?;
+        let mut rows = stmt.query([case_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(StoredAnalysis {
+            id: row.get(0)?,
+            case_id: row.get(1)?,
+            asset_id: row.get(2)?,
+            cache_key: row.get(3)?,
+            finding_count: row.get(4)?,
+            rule_count: row.get(5)?,
+            profile: row.get(6)?,
+            profile_fingerprint: row.get(7)?,
+            rule_set_fingerprint: row.get(8)?,
+            started_at: row.get(9)?,
+        }))
+    }
+
+    /// Returns the case identifier recorded for a case directory.
+    pub fn only_case_id(&self) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id FROM cases ORDER BY id LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
     }
 }

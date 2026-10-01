@@ -1,6 +1,39 @@
 # Changelog
 
-All notable changes to this project are documented here.
+All notable changes to this project are docum
+#### Phase 1 - report generation and case persistence (spec 59-63, 66)
+- `-report::pdf`: PDF rendering written directly, with no new dependency
+  - Emits PDF 1.4 with the base-14 Helvetica font, so nothing is embedded and
+    the output stays byte-deterministic (spec 77) - a PDF library with its own
+    metadata or timestamp defaults would break the evidence manifest hash
+  - Text is drawn as positioned `Tj` operators: no shaping, no kerning, and no
+    non-Latin-1 glyphs. A character outside Latin-1 becomes `?` rather than
+    being dropped, because silently omitting text would misrepresent a finding
+  - The disclaimer is appended inside `to_pdf` itself, so no invocation can
+    produce a PDF without it (spec 59)
+  - 14 tests covering xref byte offsets, `startxref`, stream lengths,
+    pagination, string balancing under hostile metadata, and determinism
+- CLI `report` renders JSON, HTML, CSV, PDF, and a self-verifying bundle,
+  inferred from the output extension. It reads stored findings and never
+  re-analyses, so a report states what was observed at the time.
+- The evidence bundle now includes `case-report.pdf` alongside the JSON, HTML,
+  and CSV deliverables (spec 62)
+- Case persistence: schema v2
+  - `findings.payload` stores each finding as canonical JSON. The typed columns
+    cannot reconstruct a `Finding` - stream scope, evidence references, and
+    reviewer state have no column - so the payload is what `report` reads back
+  - `analyses` records the profile, profile fingerprint, rule-set fingerprint,
+    and start time, which is what lets a rebuilt report state the same
+    analysis fingerprint the original run did (spec 63)
+  - **Findings are keyed by `(analysis_id, id)`, not `id` alone.** A `FindingId`
+    is derived from the observation's content, so re-analysing the same file
+    under a different profile produces the same id. Keying on id alone made a
+    second analysis fail on a primary-key collision, which contradicts
+    spec 66: re-analysing records new observations, it never edits old ones.
+  - `finding_reviews` carries `analysis_id` so a review always resolves to one
+    specific run's finding
+- 5 CLI tests for `report`: each format, findings carried through, determinism
+  across two renders, refusal of an unknown format, and the bundle manifestented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).

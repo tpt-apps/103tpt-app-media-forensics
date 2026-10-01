@@ -299,3 +299,197 @@ fn inspect_of_a_non_media_file_fails_with_the_path() {
     assert!(!ok, "a non-container must not report a clean inspection");
     assert!(stderr.contains("notes.mp4"), "{stderr}");
 }
+
+/// Builds a real MP4, acquires it, and analyses it into a case directory.
+fn analysed_case(dir: &Path) -> std::path::PathBuf {
+    let bytes = tpt_app_media_forensics_container::fixture::build_mp4_stsd_gop_change();
+    let file = dir.join("sample.mp4");
+    std::fs::write(&file, bytes).expect("writes fixture");
+
+    let parent = dir.join("out");
+    let out = cli()
+        .args([
+            "acquire",
+            file.to_str().expect("utf-8"),
+            "--name",
+            "Reported Case",
+            "--parent",
+            parent.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("acquires");
+    assert!(out.status.success(), "acquire failed");
+
+    let case_dir = parent.join("case.tptcase");
+    let out = cli()
+        .args([
+            "analyze",
+            file.to_str().expect("utf-8"),
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("analyses");
+    assert!(out.status.success(), "analyze failed");
+    case_dir
+}
+
+#[test]
+fn report_writes_each_supported_format() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+
+    for (extension, check) in [
+        ("json", "{"),
+        ("html", "<!DOCTYPE html>"),
+        ("csv", "finding_id,"),
+        ("pdf", "%PDF-1.4"),
+    ] {
+        let out = dir.path().join(format!("report.{extension}"));
+        let output = cli()
+            .args([
+                "report",
+                "--case-dir",
+                case_dir.to_str().expect("utf-8"),
+                "--out",
+                out.to_str().expect("utf-8"),
+            ])
+            .output()
+            .expect("runs CLI");
+        let (ok, stdout, stderr) = split(output);
+        assert!(ok, "report .{extension} failed: {stderr}");
+
+        let bytes = std::fs::read(&out).expect("report written");
+        assert!(!bytes.is_empty(), "report .{extension} is empty");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(check),
+            "report .{extension} does not contain `{check}`"
+        );
+        assert!(
+            stdout.contains("SHA-256"),
+            "report .{extension} does not state its own digest"
+        );
+    }
+}
+
+#[test]
+fn report_carries_the_findings_the_analysis_found() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+    let out = dir.path().join("report.json");
+
+    let output = cli()
+        .args([
+            "report",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+            "--out",
+            out.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(output.status.success(), "report failed");
+
+    let text = std::fs::read_to_string(&out).expect("report readable");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    assert!(
+        value["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["rule_id"] == "VIDEO.GOP_LENGTH_CHANGE"),
+        "the report should carry the GOP finding: {text}"
+    );
+    assert!(
+        text.contains("must not be interpreted as proof"),
+        "the disclaimer is mandatory on every report"
+    );
+    assert!(
+        value["methodology"]["analysis_fingerprint"].is_string(),
+        "the report must state its analysis fingerprint"
+    );
+}
+
+#[test]
+fn report_is_deterministic_for_the_same_case() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+
+    let mut digests = Vec::new();
+    for run in 0..2 {
+        let out = dir.path().join(format!("report{run}.pdf"));
+        let output = cli()
+            .args([
+                "report",
+                "--case-dir",
+                case_dir.to_str().expect("utf-8"),
+                "--out",
+                out.to_str().expect("utf-8"),
+            ])
+            .output()
+            .expect("runs CLI");
+        assert!(output.status.success(), "report failed");
+        digests.push(std::fs::read(&out).expect("report written"));
+    }
+
+    assert_eq!(
+        digests[0], digests[1],
+        "two renders of one case must be byte-identical"
+    );
+}
+
+#[test]
+fn report_refuses_an_unknown_format() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+    let out = dir.path().join("report.docx");
+
+    let output = cli()
+        .args([
+            "report",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+            "--out",
+            out.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "an unsupported format must fail");
+    assert!(
+        stderr.contains(".json, .html, .csv, .pdf"),
+        "the error should name the supported formats: {stderr}"
+    );
+    assert!(!out.exists(), "nothing should be written on failure");
+}
+
+#[test]
+fn report_writes_a_self_verifying_bundle() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+    // The format comes from the extension, so a `.bundle` path is a directory.
+    let out = dir.path().join("bundle.bundle");
+
+    let output = cli()
+        .args([
+            "report",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+            "--out",
+            out.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(output.status.success(), "bundle failed");
+    assert!(out.join("case-data.json").is_file());
+    assert!(
+        out.join("case-report.pdf").is_file(),
+        "the bundle should carry the PDF"
+    );
+    assert!(
+        out.join("bundle-manifest.json").is_file(),
+        "the bundle needs a verifying manifest"
+    );
+}

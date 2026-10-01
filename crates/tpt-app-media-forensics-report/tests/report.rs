@@ -281,7 +281,7 @@ fn the_bundle_writes_every_deliverable_and_a_manifest() {
         );
     }
 
-    assert_eq!(manifest.files.len(), 5, "the manifest cannot list itself");
+    // Six deliverables, and the manifest is excluded from its own listing: it`n    // cannot contain its own hash.`n    assert_eq!(manifest.files.len(), 6, "the manifest cannot list itself");
     for entry in &manifest.files {
         assert_eq!(entry.sha256.len(), 64, "each entry carries a SHA-256");
     }

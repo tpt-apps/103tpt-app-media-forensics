@@ -23,6 +23,7 @@ pub mod bundle;
 pub mod error;
 pub mod html;
 pub mod model;
+pub mod pdf;
 pub mod render;
 
 pub use bundle::{write_bundle, BundleEntry, BundleManifest};
@@ -31,4 +32,5 @@ pub use html::to_html;
 pub use model::{
     standard_limitations, AssetSummary, Methodology, Report, ValidationResult, DISCLAIMER,
 };
+pub use pdf::to_pdf;
 pub use render::{asset_hashes_to_csv, escape_html, findings_to_csv, measurements_to_csv, to_json};

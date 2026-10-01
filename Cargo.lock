@@ -641,6 +641,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tpt-app-media-forensics-audio",

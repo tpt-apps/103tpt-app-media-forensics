@@ -22,10 +22,30 @@
 //! what the file says.
 
 /// Current schema version. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Migrations, applied in order. Index + 1 is the version it produces.
-const MIGRATIONS: &[&str] = &[BASE_SCHEMA];
+const MIGRATIONS: &[&str] = &[BASE_SCHEMA, FINDING_PAYLOADS];
+
+/// Adds a `payload` column to `findings` and `relative_dir` to `reports`.
+///
+/// The typed columns on `findings` exist so a case can be queried by severity
+/// or rule without parsing anything, but they cannot reconstruct a `Finding`:
+/// stream scope, evidence references, and reviewer state have no column of
+/// their own. Rather than denormalise those into more columns, the complete
+/// finding is stored as its canonical JSON, so a report re-renders exactly what
+/// the engine produced.
+///
+/// This stays consistent with findings being append-only: the payload is
+/// written once and never updated.
+const FINDING_PAYLOADS: &str = r#"
+ALTER TABLE findings ADD COLUMN payload TEXT;
+ALTER TABLE reports ADD COLUMN relative_dir TEXT;
+CREATE INDEX idx_finding_reviews_finding ON finding_reviews (finding_id, analysis_id);
+ALTER TABLE analyses ADD COLUMN profile TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE analyses ADD COLUMN profile_fingerprint TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE analyses ADD COLUMN rule_set_fingerprint TEXT NOT NULL DEFAULT 'unknown';
+"#;
 
 /// The initial schema.
 const BASE_SCHEMA: &str = r#"
@@ -80,7 +100,7 @@ CREATE TABLE streams (
 );
 
 CREATE TABLE findings (
-    id                     TEXT PRIMARY KEY NOT NULL,
+    id                     TEXT NOT NULL,
     analysis_id            TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
     asset_id               TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
     rule_id                TEXT NOT NULL,
@@ -90,12 +110,18 @@ CREATE TABLE findings (
     measurements           TEXT NOT NULL DEFAULT '[]',
     timeline_start_micros  INTEGER,
     timeline_end_micros    INTEGER,
-    created_at             INTEGER NOT NULL DEFAULT 0
+    created_at             INTEGER NOT NULL DEFAULT 0,
+    -- A finding identifier is derived from its content, so the same rule
+    -- firing on the same file across two runs yields the same id. The primary
+    -- key is therefore (analysis_id, id): re-analysing records a new
+    -- observation rather than colliding with the previous run.
+    PRIMARY KEY (analysis_id, id)
 );
 
 CREATE TABLE finding_reviews (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    finding_id  TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    finding_id  TEXT NOT NULL,
+    analysis_id TEXT NOT NULL,
     status      TEXT NOT NULL,
     note        TEXT,
     reviewed_at INTEGER NOT NULL DEFAULT 0

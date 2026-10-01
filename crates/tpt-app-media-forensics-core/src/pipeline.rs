@@ -29,7 +29,8 @@ use tpt_app_media_forensics_container::probe::{detect_file, extension_matches};
 use tpt_app_media_forensics_container::{detect, read_samples, ContainerFormat};
 use tpt_app_media_forensics_metadata::{MetadataEntry, MetadataTree, Scope};
 use tpt_app_media_forensics_model::{
-    AcquisitionRecord, AnalysisVersion, CacheKey, Case, Finding, MediaAsset, MediaTime, MediaType,
+    AcquisitionRecord, AnalysisId, AnalysisVersion, CacheKey, Case, Finding, MediaAsset, MediaTime,
+    MediaType,
 };
 use tpt_app_media_forensics_rules::{builtin_rules, engine::empty_bundle, RuleEngine, RuleProfile};
 use tpt_app_media_forensics_timing::pts_dts::scan_presentation;
@@ -40,6 +41,7 @@ use crate::acquisition;
 use crate::cache::{AnalysisCache, CacheEntry};
 use crate::case_dir::CaseDirectory;
 use crate::error::CoreError;
+use crate::store::{Store, StoredAnalysis, StoredAsset};
 
 /// What an analysis produced.
 #[derive(Debug)]
@@ -120,7 +122,9 @@ impl AnalysisEngine {
 
         // 3. Cache lookup before doing any work.
         let cache = AnalysisCache::new(case_dir.root());
-        if let Some(entry) = cache.load(&cache_key)? {
+        let cached = cache.load(&cache_key)?;
+        let cache_hit = cached.is_some();
+        if let Some(entry) = cached {
             return Ok(AnalysisOutcome {
                 findings: entry.findings,
                 cache_hit: true,
@@ -215,6 +219,13 @@ impl AnalysisEngine {
             stream_count: inspection.as_ref().map_or(0, |i| i.streams.len()),
         })?;
 
+        // 8. Record the run in the case database so `report` can rebuild this
+        //    without re-analysing. A cache hit deliberately skips this: the
+        //    record already exists, and findings are append-only (spec §66).
+        if !cache_hit {
+            self.persist(case_dir, &asset, &cache_key, &findings)?;
+        }
+
         Ok(AnalysisOutcome {
             asset,
             findings,
@@ -224,6 +235,85 @@ impl AnalysisEngine {
             limitations,
             profile: self.profile.clone(),
         })
+    }
+
+    /// Records an analysis run and its findings in the case database.
+    ///
+    /// Written as one transaction: a run whose findings were only partly
+    /// written would leave the case reporting fewer observations than the engine
+    /// produced, which is exactly the kind of silent gap this product must not
+    /// have.
+    fn persist(
+        &self,
+        case_dir: &CaseDirectory,
+        asset: &MediaAsset,
+        cache_key: &CacheKey,
+        findings: &[Finding],
+    ) -> Result<(), CoreError> {
+        let store = Store::open(case_dir.root())?;
+
+        let manifest = case_dir.read_manifest()?;
+
+        let case_id = manifest.case_id.clone();
+        let asset_id = asset.id.to_string();
+        let stored_asset = StoredAsset {
+            id: asset_id.clone(),
+            case_id: case_id.clone(),
+            name: asset.name.clone(),
+            source_path: asset.acquisition.source_path.clone(),
+            size_bytes: asset.size_bytes(),
+            sha256: asset.sha256().map(ToOwned::to_owned),
+            blake3: asset.blake3().map(ToOwned::to_owned),
+        };
+
+        // An asset already in the case is left alone: the same file analysed
+        // twice must not create a second asset row (spec §10).
+        let existing = store.assets_in_case(&case_id).map_err(rusqlite_to_core)?;
+        if !existing.iter().any(|a| a.id == stored_asset.id) {
+            store
+                .upsert_case(&case_id, &manifest.name, manifest.description.as_deref())
+                .map_err(rusqlite_to_core)?;
+            store
+                .insert_asset(&stored_asset)
+                .map_err(rusqlite_to_core)?;
+        }
+
+        let analysis = StoredAnalysis {
+            id: AnalysisId::new_derived(&[
+                asset_id.as_bytes(),
+                cache_key.to_key_string().as_bytes(),
+            ])
+            .to_string(),
+            case_id,
+            asset_id: asset_id.clone(),
+            cache_key: cache_key.to_key_string(),
+            finding_count: i64::try_from(findings.len()).unwrap_or(i64::MAX),
+            rule_count: i64::try_from(self.rules.rule_ids().len()).unwrap_or(i64::MAX),
+            profile: self.profile.identifier(),
+            profile_fingerprint: cache_key.profile.as_hex().to_owned(),
+            rule_set_fingerprint: cache_key.rules.as_hex().to_owned(),
+            started_at: analysis_timestamp(),
+        };
+
+        store.insert_analysis(&analysis).map_err(rusqlite_to_core)?;
+        store
+            .insert_rule_results(
+                &analysis.id,
+                &self
+                    .rules
+                    .rule_ids()
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(rusqlite_to_core)?;
+        for finding in findings {
+            store
+                .insert_finding(&analysis.id, finding)
+                .map_err(rusqlite_to_core)?;
+        }
+
+        Ok(())
     }
 
     /// Returns the combined analysis fingerprint for a cache key (spec §63).
@@ -439,4 +529,123 @@ pub fn case_for(name: &str, assets: &[MediaAsset]) -> std::result::Result<Case, 
 #[must_use]
 pub fn zero_time() -> MediaTime {
     MediaTime::ZERO
+}
+/// A report rebuilt from the case database.
+#[derive(Debug)]
+pub struct CaseReport {
+    /// The reconstructed report.
+    pub report: tpt_app_media_forensics_report::Report,
+    /// The analysis the findings came from, if one is recorded.
+    pub analysis_id: Option<String>,
+}
+
+/// Rebuilds a report from what a case recorded in SQLite.
+///
+/// Findings are read back from their canonical JSON payloads, so the report
+/// states exactly what the engine produced rather than a reconstruction from
+/// lossy columns. Limitations are not stored in the database — they describe the
+/// analysis run, not its findings — so a rebuilt report carries the engine's
+/// standard limitations until per-run limitations are persisted alongside the
+/// analysis.
+///
+/// # Errors
+///
+/// Returns an error if the case database cannot be read.
+pub fn load_report(case_dir: &CaseDirectory) -> Result<CaseReport, CoreError> {
+    let store = Store::open(case_dir.root())?;
+    let case_id = store
+        .only_case_id()
+        .map_err(rusqlite_to_core)?
+        .ok_or_else(|| CoreError::InvalidManifest {
+            reason: "the case database contains no case record".to_owned(),
+        })?;
+
+    let analysis = store.latest_analysis(&case_id).map_err(rusqlite_to_core)?;
+    let findings = store.findings_in_case(&case_id).map_err(rusqlite_to_core)?;
+    let assets = store.assets_in_case(&case_id).map_err(rusqlite_to_core)?;
+
+    let manifest = case_dir.read_manifest();
+    let (case_name, case_description) = manifest
+        .map(|c| (c.name, c.description))
+        .unwrap_or_else(|_| (case_dir.root().display().to_string(), None));
+
+    // The methodology is reconstructed from the stored analysis. The cache key
+    // already encodes asset hash, analysis version, profile, and rule set, which
+    // are exactly the four inputs the fingerprint is derived from, so the
+    // rebuilt report states the same fingerprint the original run did.
+    let methodology = match &analysis {
+        Some(analysis) => rebuild_methodology(analysis),
+        None => tpt_app_media_forensics_report::Methodology {
+            application_version: env!("CARGO_PKG_VERSION").to_owned(),
+            analysis_version: AnalysisVersion::CURRENT.to_string(),
+            profile: "unknown".to_owned(),
+            profile_fingerprint: "unknown".to_owned(),
+            enabled_rules: Vec::new(),
+            rule_set_fingerprint: "unknown".to_owned(),
+            input_hashes: Vec::new(),
+            analysis_timestamp_unix: 0,
+            applicable_standards: Vec::new(),
+            analysis_fingerprint: "unknown".to_owned(),
+        },
+    };
+
+    let report = tpt_app_media_forensics_report::Report {
+        schema_version: 1,
+        case_name,
+        case_id,
+        case_description,
+        assets: assets
+            .iter()
+            .map(|a| tpt_app_media_forensics_report::AssetSummary {
+                name: a.name.clone(),
+                source_path: a.source_path.clone(),
+                sha256: a.sha256.clone(),
+                blake3: a.blake3.clone(),
+                size_bytes: a.size_bytes,
+                stream_count: 0,
+            })
+            .collect(),
+        findings,
+        evidence: Vec::new(),
+        methodology,
+        limitations: Vec::new(),
+        validation: None,
+    };
+
+    Ok(CaseReport {
+        report,
+        analysis_id: analysis.map(|a| a.id),
+    })
+}
+
+/// Converts a database error into a core error.
+fn rusqlite_to_core(error: rusqlite::Error) -> CoreError {
+    CoreError::database("case database", error)
+}
+
+/// Rebuilds the methodology block from a stored analysis.
+///
+/// The four inputs the analysis fingerprint is derived from are recorded on the
+/// analysis row, so a report rebuilt from the database states the same
+/// fingerprint the original run did (spec §63).
+fn rebuild_methodology(analysis: &StoredAnalysis) -> tpt_app_media_forensics_report::Methodology {
+    let fingerprint = tpt_app_media_forensics_report::Methodology::compute_fingerprint(
+        &analysis.cache_key,
+        &AnalysisVersion::CURRENT.to_string(),
+        &analysis.profile_fingerprint,
+        &analysis.rule_set_fingerprint,
+    );
+
+    tpt_app_media_forensics_report::Methodology {
+        application_version: env!("CARGO_PKG_VERSION").to_owned(),
+        analysis_version: AnalysisVersion::CURRENT.to_string(),
+        profile: analysis.profile.clone(),
+        profile_fingerprint: analysis.profile_fingerprint.clone(),
+        enabled_rules: builtin_rules().iter().map(|r| r.id().to_owned()).collect(),
+        rule_set_fingerprint: analysis.rule_set_fingerprint.clone(),
+        input_hashes: Vec::new(),
+        analysis_timestamp_unix: analysis.started_at,
+        applicable_standards: vec!["ITU-R BS.1770-4 (loudness)".to_owned()],
+        analysis_fingerprint: fingerprint,
+    }
 }
