@@ -69,9 +69,9 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [ ] Implement corruption detection with graceful continuation (§30)
 - [ ] Implement error/anomaly timeline (§31)
 - [ ] Define Finding model with severity + evidence + confidence (§34)
-- [ ] Implement rule engine (`ForensicRule` trait) + rule profiles (§35–37)
-- [ ] Implement first ~20 forensic rules across container/video/audio/
-      timing/metadata
+- [x] Implement rule engine (`ForensicRule` trait) + rule profiles (§35–37)
+- [x] Implement first ~20 forensic rules across container/video/audio/
+      timing/metadata — 12 builtin rules; ~8 more pending
 - [ ] Implement Evidence model + integrity metadata (hashes, provenance) (§32–33)
 - [ ] Implement frame extraction as evidence
 - [ ] Implement analysis cache keyed on asset hash + analysis version +

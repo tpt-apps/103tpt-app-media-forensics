@@ -16,5 +16,6 @@ pub mod measurement;
 
 pub use loudness::{integrated_loudness, LoudnessError, SPECIFIED_SAMPLE_RATE};
 pub use measurement::{
-    amplitude_to_dbfs, find_silence, level_stats, Measurement, Methodology, SilenceRegion,
+    amplitude_to_dbfs, find_silence, level_stats, LevelStats, Measurement, Methodology,
+    SilenceRegion,
 };

@@ -149,6 +149,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   crash mid-write
 - `rusqlite` with the `bundled` feature, so no system SQLite is required
 
+#### Phase 1 — rule engine and the built-in rule set (spec §35–37)
+- `-rules::engine`: a `ForensicRule` trait over an `AnalysisBundle`. Rules are
+  pure functions over analysis results: they never open a file, run a decoder,
+  or write anything, so they are testable with synthetic results and no media
+- `what_it_checks` and `why_it_matters` are trait methods rather than doc
+  comments, because spec §71 requires every finding to explain itself. A rule
+  that cannot state why its condition matters should not exist
+- Rules are registered and evaluated in sorted rule-ID order, and findings are
+  sorted by severity, rule ID, then timeline position, so two runs produce
+  identical output (spec §77)
+- `-rules::profile`: every tolerance lives in a versioned `RuleProfile`, never
+  in a rule. Changing a threshold changes the profile fingerprint, which
+  invalidates the analysis cache (spec §54) and is named in the report (§63)
+- Twelve built-in rules across container, video, audio, timing, and metadata
+- Finding IDs are content-derived from rule, asset, and location, so re-analysing
+  a file yields comparable IDs rather than renumbered ones
+- Duplicate-run findings take their confidence from the soundness the detection
+  layer established: a provable claim outranks an assumed one
+- No rule asserts a cause. A test asserts rendered findings contain none of
+  "tamper", "edit", "forged", or "manipulat" (spec §15, §26)
+
 ### Fixed
 
 - Every stream was reported with index 0, which would mis-associate frame data

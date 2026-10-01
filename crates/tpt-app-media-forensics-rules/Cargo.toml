@@ -18,6 +18,7 @@ tpt-app-media-forensics-audio = { workspace = true }
 tpt-app-media-forensics-timing = { workspace = true }
 tpt-app-media-forensics-metadata = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
