@@ -506,21 +506,497 @@ impl ForensicRule for AudioSilence {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Container, stream, and duration rules
+//
+// These read fields the container already exposes, so they cost nothing at
+// analysis time and work on files the demuxer could only partially recover.
+// ---------------------------------------------------------------------------
+
+/// Reports a container whose declared track count disagrees with what it holds.
+pub struct DeclaredTrackMismatch;
+
+impl ForensicRule for DeclaredTrackMismatch {
+    fn id(&self) -> &'static str {
+        "CONTAINER.DECLARED_TRACK_MISMATCH"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether the number of `trak` boxes matches the number of streams recovered."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A track the container declares but does not deliver means part of the \
+         content described by the file is missing or unreadable."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(inspection) = &bundle.container else {
+            return Vec::new();
+        };
+        if inspection.declared_track_count == inspection.streams.len() {
+            return Vec::new();
+        }
+        vec![finding(
+            self.id(),
+            bundle,
+            Severity::Significant,
+            // The count is read directly from the box structure, so this is a
+            // structural fact rather than an inference.
+            Confidence::High,
+            format!(
+                "Container declares {} track(s) but {} stream(s) were recovered",
+                inspection.declared_track_count,
+                inspection.streams.len()
+            ),
+            vec![
+                format!("declared `trak` boxes: {}", inspection.declared_track_count),
+                format!("recovered streams: {}", inspection.streams.len()),
+            ],
+            None,
+        )]
+    }
+}
+
+/// Reports a stream whose declared duration is missing.
+pub struct StreamDurationMissing;
+
+impl ForensicRule for StreamDurationMissing {
+    fn id(&self) -> &'static str {
+        "CONTAINER.STREAM_DURATION_MISSING"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether any stream omits its declared duration."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A stream with no declared duration cannot be compared against the \
+         container duration, so length and synchronisation checks for that \
+         stream rest on whatever the samples themselves show."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(inspection) = &bundle.container else {
+            return Vec::new();
+        };
+        inspection
+            .streams
+            .iter()
+            .filter(|stream| stream.timing.duration.is_none())
+            .map(|stream| {
+                finding(
+                    self.id(),
+                    bundle,
+                    Severity::Info,
+                    // The absence is certain; what it implies for a given
+                    // workflow is not, so this stays informational.
+                    Confidence::High,
+                    format!(
+                        "Stream {} ({}) declares no duration",
+                        stream.index,
+                        stream.kind.tag()
+                    ),
+                    vec![
+                        format!("timebase: {}", stream.timing.timebase),
+                        format!("declared start: {}", stream.timing.start_time.to_timecode()),
+                    ],
+                    None,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Reports a stream whose declared start time is non-zero.
+pub struct StreamStartOffset;
+
+impl ForensicRule for StreamStartOffset {
+    fn id(&self) -> &'static str {
+        "CONTAINER.STREAM_START_OFFSET"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether any stream declares a non-zero start time or edit-list offset."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A non-zero start shifts a stream relative to the others, which changes \
+         what 'the beginning' means for synchronisation and is often introduced \
+         by trimming or by a conform."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, profile: &RuleProfile) -> Vec<Finding> {
+        let Some(inspection) = &bundle.container else {
+            return Vec::new();
+        };
+        let tolerance = profile.pts_tolerance;
+
+        inspection
+            .streams
+            .iter()
+            .filter_map(|stream| {
+                let start = stream.timing.start_time;
+                let edit = stream.timing.edit_list_offset;
+                let significant = start > tolerance
+                    || edit.is_some_and(|offset| offset.as_micros().abs() > tolerance.as_micros());
+                significant.then_some((stream, start, edit))
+            })
+            .map(|(stream, start, edit)| {
+                finding(
+                    self.id(),
+                    bundle,
+                    Severity::Info,
+                    Confidence::High,
+                    format!(
+                        "Stream {} ({}) starts at {}",
+                        stream.index,
+                        stream.kind.tag(),
+                        start.to_timecode()
+                    ),
+                    vec![
+                        format!("declared start: {}", start.to_timecode()),
+                        format!(
+                            "edit-list offset: {}",
+                            edit.map_or_else(|| "none".to_owned(), |o| o.to_timecode())
+                        ),
+                    ],
+                    Some(start),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Reports container-level parse anomalies.
+pub struct ContainerAnomalyList;
+
+impl ForensicRule for ContainerAnomalyList {
+    fn id(&self) -> &'static str {
+        "CONTAINER.PARSE_ANOMALY"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether the container parser recorded any anomaly while reading the file."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "The parser records what it had to tolerate. Those are the places where \
+         the file's structure departed from the specification and where any \
+         downstream measurement is least certain."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(inspection) = &bundle.container else {
+            return Vec::new();
+        };
+        inspection
+            .anomalies
+            .iter()
+            .map(|anomaly| {
+                finding(
+                    self.id(),
+                    bundle,
+                    Severity::Warning,
+                    // An anomaly is a statement about what the parser saw, not
+                    // about what the file means.
+                    Confidence::High,
+                    format!("Container parser recorded an anomaly: {anomaly}"),
+                    vec![format!("anomaly: {anomaly}")],
+                    None,
+                )
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Video rules
+// ---------------------------------------------------------------------------
+
+/// Reports a keyframe run long enough to suggest only one keyframe overall.
+pub struct SingleKeyframe;
+
+impl ForensicRule for SingleKeyframe {
+    fn id(&self) -> &'static str {
+        "VIDEO.SINGLE_KEYFRAME"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether the video track declares a single sync sample."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "With one keyframe, seeking is approximate throughout the file and a \
+         cut made in an editing tool has no nearby anchor to align to."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(report) = &bundle.gop else {
+            return Vec::new();
+        };
+        if report.keyframe_count != 1 {
+            return Vec::new();
+        }
+        vec![finding(
+            self.id(),
+            bundle,
+            Severity::Warning,
+            Confidence::High,
+            "Video track declares a single keyframe".to_owned(),
+            vec![
+                format!("keyframe count: {}", report.keyframe_count),
+                format!("frame count: {}", report.frame_count),
+            ],
+            None,
+        )]
+    }
+}
+
+/// Reports a track where every frame is a sync sample.
+pub struct AllFramesKeyframes;
+
+impl ForensicRule for AllFramesKeyframes {
+    fn id(&self) -> &'static str {
+        "VIDEO.ALL_FRAMES_KEYFRAMES"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether the track declares no sync-sample box, making every frame a keyframe."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "Every frame being a sync sample is unusual for encoded video and is a \
+         property of how the file was produced rather than of its content."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(inspection) = &bundle.container else {
+            return Vec::new();
+        };
+        // `frame_info` is parallel to `streams`, so the two are zipped rather
+        // than matched: a pointer comparison would be fragile, and the ordering
+        // is part of `Mp4Inspection`'s contract.
+        inspection
+            .frame_info
+            .iter()
+            .zip(&inspection.streams)
+            .filter_map(|(info, stream)| {
+                let info = info.as_ref()?;
+                (stream.kind == tpt_app_media_forensics_model::StreamKind::Video
+                    && info.all_frames_are_keyframes)
+                    .then_some((stream.index, info.frame_times.len()))
+            })
+            .map(|(index, frames)| {
+                finding(
+                    self.id(),
+                    bundle,
+                    Severity::Info,
+                    // The declaration is explicit; whether it was intended is
+                    // not something this rule can observe.
+                    Confidence::High,
+                    format!(
+                        "Video track {index} declares no `stss` box; all {frames} frames are sync samples"
+                    ),
+                    vec![format!("stream: {index}"), format!("frames: {frames}")],
+                    None,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Reports a frame rate change within a track.
+pub struct FrameRateChange;
+
+impl ForensicRule for FrameRateChange {
+    fn id(&self) -> &'static str {
+        "VIDEO.FRAME_RATE_CHANGE"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether frame durations change partway through the track by more than the tolerance."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A frame rate that changes mid-file arises from joining material with \
+         different timing, which is common in edited output and uncommon in a \
+         single continuous recording."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, profile: &RuleProfile) -> Vec<Finding> {
+        let Some(inspection) = &bundle.container else {
+            return Vec::new();
+        };
+
+        let mut findings = Vec::new();
+        for (index, info) in inspection.frame_info.iter().enumerate() {
+            let Some(info) = info else { continue };
+            if info.frame_times.len() < 3 {
+                continue;
+            }
+            let Some(stream) = inspection.streams.get(index) else {
+                continue;
+            };
+
+            // Compare each frame duration against the dominant one.
+            let deltas: Vec<i64> = info
+                .frame_times
+                .windows(2)
+                .map(|w| w[1].signed_diff(w[0]).as_micros())
+                .collect();
+            let Some(dominant) = mode(&deltas) else {
+                continue;
+            };
+
+            for (position, delta) in deltas.iter().enumerate() {
+                let difference = (delta - dominant).abs();
+                if difference <= profile.pts_tolerance.as_micros() {
+                    continue;
+                }
+                findings.push(finding(
+                    self.id(),
+                    bundle,
+                    Severity::Info,
+                    // A single differing duration could be a timestamp rounding
+                    // artefact, so the observation carries less weight than a
+                    // structural mismatch.
+                    Confidence::Medium,
+                    format!("Frame duration changes from {}us to {}us", dominant, delta),
+                    vec![
+                        format!("dominant frame duration: {dominant}us"),
+                        format!("observed at frame {}", position + 1),
+                        format!("stream: {}", stream.index),
+                    ],
+                    Some(info.frame_times[position]),
+                ));
+            }
+        }
+        findings
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audio rules
+// ---------------------------------------------------------------------------
+
+/// Reports audio too quiet to be heard as intended.
+pub struct InaudibleAudio;
+
+impl ForensicRule for InaudibleAudio {
+    fn id(&self) -> &'static str {
+        "AUDIO.INAUDIBLE"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether measured loudness falls below the profile's inaudible threshold."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "Audio that measures below audibility is a delivery problem regardless \
+         of what the file was meant to contain."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, profile: &RuleProfile) -> Vec<Finding> {
+        let Some(loudness) = &bundle.loudness else {
+            return Vec::new();
+        };
+        let lufs = loudness.value;
+        if lufs > profile.inaudible_lufs {
+            return Vec::new();
+        }
+        vec![finding(
+            self.id(),
+            bundle,
+            Severity::Warning,
+            // Integrated loudness is a direct measurement to a published
+            // standard, so it carries full weight.
+            Confidence::High,
+            format!(
+                "Integrated loudness measures {lufs} LUFS, at or below the inaudible threshold"
+            ),
+            vec![
+                format!("measured: {lufs} LUFS"),
+                format!("threshold: {} LUFS", profile.inaudible_lufs),
+                format!("methodology: {:?}", loudness.methodology),
+            ],
+            None,
+        )]
+    }
+}
+
+/// Reports metadata that carries no creation-time field at all.
+pub struct MissingCreationMetadata;
+
+impl ForensicRule for MissingCreationMetadata {
+    fn id(&self) -> &'static str {
+        "METADATA.MISSING_CREATION_TIME"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether the file carries no creation-time metadata at all."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "The absence of a creation time is an observation about the file's \
+         recorded provenance. It does not establish when the media was made, and \
+         a file with no metadata at all is reported separately."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(tree) = &bundle.metadata else {
+            return Vec::new();
+        };
+
+        // A file with no metadata at all is a different observation; this rule
+        // asks the narrower question of whether metadata exists but carries no
+        // creation time.
+        if tree.is_empty() {
+            return Vec::new();
+        }
+
+        const CREATION_KEYS: [&str; 4] = [
+            "creation_time",
+            "date",
+            "creationdate",
+            "com.apple.quicktime.creationdate",
+        ];
+        if CREATION_KEYS.iter().any(|key| !tree.find(key).is_empty()) {
+            return Vec::new();
+        }
+
+        vec![finding(
+            self.id(),
+            bundle,
+            Severity::Info,
+            // That the field is missing is certain; why it is missing is not
+            // observable here.
+            Confidence::High,
+            "File carries metadata but no creation-time field".to_owned(),
+            vec![
+                format!("metadata entries present: {}", tree.len()),
+                format!("creation keys searched: {}", CREATION_KEYS.join(", ")),
+            ],
+            None,
+        )]
+    }
+}
+
+/// Returns the most common value, or `None` when there is no clear mode.
+fn mode(values: &[i64]) -> Option<i64> {
+    let mut best: Option<(i64, usize)> = None;
+    let mut i = 0;
+    while i < values.len() {
+        let value = values[i];
+        let count = values.iter().filter(|v| **v == value).count();
+        if best.is_none_or(|(_, c)| count > c) {
+            best = Some((value, count));
+        }
+        // Skip the whole run so each distinct value is counted once.
+        i += count;
+    }
+    // A mode held by fewer than half the samples is not a dominant value.
+    best.filter(|(_, count)| count.saturating_mul(2) >= values.len())
+        .map(|(value, _)| value)
+}
+
 /// Returns every built-in rule.
 #[must_use]
 pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
     vec![
+        Box::new(AllFramesKeyframes),
         Box::new(AvSyncDrift),
         Box::new(AudioClipping),
         Box::new(AudioDcOffset),
         Box::new(AudioSilence),
         Box::new(ContainerAnomaly),
+        Box::new(ContainerAnomalyList),
+        Box::new(DeclaredTrackMismatch),
         Box::new(DeclaredVsMeasuredMismatch),
         Box::new(DuplicateFrameRun),
+        Box::new(FrameRateChange),
         Box::new(GopLengthChange),
+        Box::new(InaudibleAudio),
         Box::new(MetadataConflict),
+        Box::new(MissingCreationMetadata),
         Box::new(NoUsableStreams),
         Box::new(NonMonotonicPts),
+        Box::new(SingleKeyframe),
+        Box::new(StreamDurationMissing),
+        Box::new(StreamStartOffset),
         Box::new(TimestampGap),
     ]
 }

@@ -3,6 +3,34 @@
 All notable changes to this project are docum
 #### Phase 1 - report generation and case persistence (spec 59-63, 66)
 #### Phase 1 - batch analysis (spec 48-49)
+#### Phase 1 - the complete built-in rule set (spec 35-37)
+- Nine rules added, completing the planned twenty. Each reads fields the
+  analysis already produces, so none of them adds cost at analysis time
+  - `CONTAINER.PARSE_ANOMALY` surfaces what the parser had to tolerate. Those
+    are the places the file's structure departed from the specification, and
+    where any downstream measurement is least certain
+  - `CONTAINER.DECLARED_TRACK_MISMATCH` compares the declared `trak` count with
+    the streams actually recovered
+  - `CONTAINER.STREAM_DURATION_MISSING` and `CONTAINER.STREAM_START_OFFSET`
+    report absent durations and non-zero starts, both of which change what
+    "the beginning" means for a stream
+  - `VIDEO.ALL_FRAMES_KEYFRAMES` reports a track that declares no `stss` box
+  - `VIDEO.SINGLE_KEYFRAME` reports a track with a single sync sample, where
+    seeking is approximate throughout
+  - `VIDEO.FRAME_RATE_CHANGE` reports frame durations departing from the
+    track's dominant duration
+  - `AUDIO.INAUDIBLE` reports loudness at or below the profile threshold
+  - `METADATA.MISSING_CREATION_TIME` reports metadata with no creation-time
+    field. It deliberately stays silent when there is no metadata at all, which
+    is a separate observation already reported elsewhere
+- Severity and confidence are set per rule by how much the condition actually
+  establishes. A structural fact read straight from the box structure is High;
+  a single differing frame duration is Medium, because a timestamp rounding
+  artefact would look the same
+- 21 rule tests. Every rule is checked twice, once against a fixture that
+  should trip it and once against a fixture that should not: a rule that only
+  ever fires is as useless as one that never does, and the negative case is
+  what catches a comparison that is too permissive
 - `-core::batch`: analyses every media file beneath a directory into one case,
   which is the shape of real intake work, where a handover arrives as a folder
   - One failure does not stop the batch. Each file is analysed independently and
