@@ -68,7 +68,7 @@ impl fmt::Display for EntityKind {
 ///
 /// Implements [`Ord`] so that sorting by ID is stable and reproducible when
 /// rendering findings and evidence lists.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityId {
     kind: EntityKind,
     value: IdValue,
@@ -169,6 +169,41 @@ impl EntityId {
 impl fmt::Display for EntityId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.kind.tag(), self.to_canonical_string())
+    }
+}
+
+impl Serialize for EntityId {
+    /// Serialises as the canonical `kind:uuid` string.
+    ///
+    /// Not as a number: the backing value is a `u128`, which JSON cannot
+    /// represent, and a bare number would be unreadable in a manifest.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for EntityId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let (kind, canonical) = text
+            .split_once(':')
+            .ok_or_else(|| serde::de::Error::custom("identifier must be `kind:value`"))?;
+        let kind = match kind {
+            "case" => EntityKind::Case,
+            "asset" => EntityKind::Asset,
+            "analysis" => EntityKind::Analysis,
+            "finding" => EntityKind::Finding,
+            "evidence" => EntityKind::Evidence,
+            "report" => EntityKind::Report,
+            "stream" => EntityKind::Stream,
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown entity kind: {other}"
+                )))
+            }
+        };
+        EntityId::from_canonical_str(kind, canonical)
+            .ok_or_else(|| serde::de::Error::custom("malformed identifier"))
     }
 }
 
@@ -381,5 +416,38 @@ mod tests {
         reversed.reverse();
         reversed.sort();
         assert_eq!(ids, reversed, "sorting must be deterministic (spec §77)");
+    }
+}
+
+#[test]
+fn identifiers_round_trip_through_json() {
+    // The backing value is a u128, which JSON cannot represent, so
+    // identifiers serialise as `kind:uuid` strings instead.
+    let ids: Vec<EntityId> = vec![
+        CaseId::new_derived(&["a"]).raw(),
+        AssetId::new_derived(&["b"]).raw(),
+        FindingId::new_derived(&["c"]).raw(),
+        EvidenceId::new_derived(&["d"]).raw(),
+        AnalysisId::new_derived(&["e"]).raw(),
+        ReportId::new_derived(&["f"]).raw(),
+        StreamId::new_derived(&["g"]).raw(),
+    ];
+    for id in ids {
+        let json = serde_json::to_string(&id).expect("serialises");
+        assert!(json.starts_with('"'), "{json} should be a string");
+        let back: EntityId = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back, id);
+        assert_eq!(back.kind(), id.kind());
+    }
+}
+
+#[test]
+fn malformed_identifier_strings_are_rejected() {
+    for bad in ["", "nokind", "case:zzz", "unknown:x"] {
+        let quoted = format!("\"{bad}\"");
+        assert!(
+            serde_json::from_str::<EntityId>(&quoted).is_err(),
+            "{bad} should not parse"
+        );
     }
 }

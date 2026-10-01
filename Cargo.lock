@@ -728,8 +728,10 @@ name = "tpt-app-media-forensics-report"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
- "tpt-app-media-forensics-core",
  "tpt-app-media-forensics-model",
  "tracing",
 ]

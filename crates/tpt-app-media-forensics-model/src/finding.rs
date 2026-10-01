@@ -19,15 +19,22 @@ use crate::time::MediaTime;
 /// sorting ascending puts the most serious findings first — the order used by
 /// dashboard sections and report tables. The declaration order alone would give
 /// the opposite, so the ordering is written out explicitly rather than derived.
+///
+/// Serialises using the same uppercase tags that appear in report headings, so
+/// a value written to JSON matches what a reader sees in the PDF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Severity {
     /// Structural failure or evidence of tampering beyond reasonable dispute.
+    #[serde(rename = "CRITICAL")]
     Critical,
     /// A significant technical deviation that a reviewer must assess.
+    #[serde(rename = "SIGNIFICANT")]
     Significant,
     /// An anomaly worth recording that does not by itself indicate a problem.
+    #[serde(rename = "WARNING")]
     Warning,
     /// An informational observation with no implied defect.
+    #[serde(rename = "INFO")]
     Info,
 }
 
