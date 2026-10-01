@@ -11,3 +11,10 @@
 
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
+pub mod loudness;
+pub mod measurement;
+
+pub use loudness::{integrated_loudness, LoudnessError, SPECIFIED_SAMPLE_RATE};
+pub use measurement::{
+    amplitude_to_dbfs, find_silence, level_stats, Measurement, Methodology, SilenceRegion,
+};

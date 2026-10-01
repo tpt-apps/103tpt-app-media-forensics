@@ -17,3 +17,7 @@
 pub mod gop;
 
 pub use gop::{Gop, GopChange, GopReport};
+
+pub mod duplicate;
+
+pub use duplicate::{RepeatedRun, SampleDigest, Soundness};

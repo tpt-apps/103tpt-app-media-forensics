@@ -29,12 +29,12 @@ use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use tpt_app_media_forensics_container::TrackFrameInfo;
 use tpt_app_media_forensics_container::{
-    detect_file, extension_matches, inspect_file, ContainerFormat,
+    detect_file, extension_matches, inspect_file, read_samples, ContainerFormat, TrackFrameInfo,
 };
 use tpt_app_media_forensics_core::{acquire, CaseDirectory};
 use tpt_app_media_forensics_model::{Case, MediaType};
+use tpt_app_media_forensics_video::duplicate::{find_repeated_runs, SampleDigest};
 use tpt_app_media_forensics_video::gop;
 
 use crate::output::{render_acquisition, AcquisitionJson};
@@ -74,6 +74,11 @@ enum Command {
         /// Directory to create the case in. A `case.tptcase` folder is added.
         #[arg(long)]
         parent: std::path::PathBuf,
+    },
+    /// Analyse a raw audio file: levels, silence, DC offset, and loudness.
+    Audio {
+        /// Path to the audio file. Opened read-only.
+        path: std::path::PathBuf,
     },
 
     /// Print container and stream structure for a media file.
@@ -184,6 +189,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             Ok(())
         }
 
+        Command::Audio { path } => audio_report(path, cli.json),
         Command::Inspect { path } => inspect(path, cli.json),
 
         Command::Analyze { path, case_dir } => {
@@ -233,6 +239,13 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 /// value is deliberately visible and documented rather than buried in a rule.
 const DEFAULT_GOP_TOLERANCE_FRAMES: u32 = 5;
 
+/// Shortest repeated run worth reporting; a single repeat is indistinguishable
+/// from ordinary static-scene encoding.
+const DEFAULT_MIN_DUPLICATE_RUN: u32 = 2;
+
+/// Cap on duplicate runs printed to the console.
+const MAX_REPORTED_RUNS: usize = 20;
+
 /// Inspects a media file's container structure.
 ///
 /// Reports what the file *is* (by signature), then what each stream declares
@@ -247,6 +260,7 @@ fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
     let format = detect_file(path).with_context(|| format!("cannot read {}", path.display()))?;
     let extension_ok = extension_matches(path, format);
     let mut frame_info: Vec<Option<TrackFrameInfo>> = Vec::new();
+    let mut repeated_runs = String::new();
 
     let streams = match format {
         ContainerFormat::IsoBmff => {
@@ -256,6 +270,7 @@ fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
                 eprintln!("anomaly: {anomaly}");
             }
             frame_info = inspection.frame_info.clone();
+            repeated_runs = report_duplicate_runs(path);
             inspection.streams
         }
         // An unrecognised signature is a finding about the evidence, not a gap
@@ -307,6 +322,9 @@ fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
             }
         );
         println!("Streams       {}", streams.len());
+        if !repeated_runs.is_empty() {
+            println!("{}", repeated_runs.trim_end());
+        }
         for stream in &streams {
             let codec = stream.codec.long_name.as_deref().unwrap_or("unrecognised");
             println!(
@@ -382,3 +400,158 @@ fn emit<T: serde::Serialize>(json: bool, value: &T, text: &str) {
         print!("{text}");
     }
 }
+
+/// Reports repeated-sample runs detected at the packet layer (spec §17).
+///
+/// Reads every access unit and compares compressed digests. No decoding, so
+/// this works even when the video stream itself cannot be decoded.
+///
+/// Returns rendered text rather than printing, so the caller controls where it
+/// appears in the report.
+fn report_duplicate_runs(path: &std::path::Path) -> String {
+    let Ok(samples) = read_samples(std::fs::read(path).unwrap_or_default()) else {
+        return String::new();
+    };
+
+    let records: Vec<SampleDigest> = samples
+        .iter()
+        .map(|s| SampleDigest {
+            digest: s.digest.clone(),
+            time: s.time,
+            is_key_frame: s.is_key_frame,
+        })
+        .collect();
+
+    let runs = find_repeated_runs(&records, DEFAULT_MIN_DUPLICATE_RUN);
+    if runs.is_empty() {
+        return String::new();
+    }
+
+    let mut out = format!(
+        "Repeated runs   {} (compressed-sample comparison, no decoding)\n",
+        runs.len()
+    );
+    for run in runs.iter().take(MAX_REPORTED_RUNS) {
+        out.push_str(&format!(
+            "    {} - {}  {} frames\n        {}\n",
+            run.start_time,
+            run.end_time,
+            run.length,
+            run.soundness.explanation()
+        ));
+    }
+    if runs.len() > MAX_REPORTED_RUNS {
+        out.push_str(&format!(
+            "    ... {} more runs not shown\n",
+            runs.len() - MAX_REPORTED_RUNS
+        ));
+    }
+    out
+}
+/// Analyses a raw audio file (spec §19-§22).
+///
+/// Decodes to PCM via `tpt-av-cadence`, then reports levels, silence regions,
+/// DC offset, and integrated loudness. Every figure is printed with the
+/// methodology that produced it, and a measurement that cannot be taken
+/// correctly is reported as unavailable rather than approximated (spec §21).
+fn audio_report(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_audio::{
+        amplitude_to_dbfs, find_silence, integrated_loudness, level_stats, Measurement, Methodology,
+    };
+    let file = std::fs::File::open(path)?;
+    use tpt_av_cadence_core::FormatReader as _;
+    let source = Box::new(std::io::BufReader::new(file));
+    let mut reader = tpt_av_cadence_wav::WavReader::open(source)
+        .with_context(|| format!("cannot parse WAV: {}", path.display()))?;
+
+    let sample_rate = reader.info().sample_rate;
+    let channels = reader.info().channels;
+
+    // Decode into a bounded buffer; refuse to silently truncate a long file.
+    let mut pcm: Vec<f32> = Vec::new();
+    let mut block = vec![0.0f32; 8192];
+    while let Ok(read) = reader.decoder().decode(&mut block) {
+        if read == 0 {
+            break;
+        }
+        pcm.truncate(pcm.len() + read);
+        pcm.extend_from_slice(&block[..read]);
+        if pcm.len() > MAX_AUDIO_SAMPLES {
+            pcm.truncate(MAX_AUDIO_SAMPLES);
+            eprintln!(
+                "audio: truncated to {} samples; loudness covers a prefix only",
+                MAX_AUDIO_SAMPLES
+            );
+            break;
+        }
+    }
+
+    let stats = level_stats(&pcm);
+    let silence = find_silence(&pcm, SILENCE_THRESHOLD, MIN_SILENCE_FRAMES);
+    let loudness = integrated_loudness(&pcm, channels, sample_rate);
+
+    // Peak and RMS are reported as levels *and* as normalised amplitudes: the
+    // two are different quantities, and printing an amplitude with a "dBFS"
+    // unit would misstate the measurement.
+    let peak_amplitude = Measurement::new(stats.peak, Methodology::SampleAmplitude);
+    let peak_level = amplitude_to_dbfs(stats.peak).map(|v| Measurement::new(v, Methodology::Dbfs));
+    let rms_level = amplitude_to_dbfs(stats.rms).map(|v| Measurement::new(v, Methodology::Dbfs));
+    let dc = Measurement::new(stats.mean, Methodology::SampleMean);
+
+    if json {
+        let value = serde_json::json!({
+            "source_path": path.display().to_string(),
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "frames": stats.sample_count,
+            "peak_amplitude": peak_amplitude,
+            "peak_dbfs": peak_level,
+            "rms_dbfs": rms_level,
+            "dc_offset": dc,
+            "silence_regions": silence.len(),
+            "integrated_loudness": loudness.as_ref().ok().map(ToString::to_string),
+            "loudness_unavailable_reason": loudness.as_ref().err().map(ToString::to_string),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("Source        {}", path.display());
+        println!("Sample rate   {sample_rate} Hz");
+        println!("Channels      {channels}");
+        println!("Frames        {}", stats.sample_count);
+        println!("Peak          {}", peak_amplitude.describe());
+        match &peak_level {
+            Some(level) => println!("Peak level    {}", level.describe()),
+            None => println!("Peak level    digital silence; no decibel value exists"),
+        }
+        match &rms_level {
+            Some(level) => println!("RMS level     {}", level.describe()),
+            None => println!("RMS level     digital silence; no decibel value exists"),
+        }
+        println!("DC offset     {}", dc.describe());
+        println!(
+            "Silence       {} region(s) below {} over {} frames",
+            silence.len(),
+            SILENCE_THRESHOLD,
+            MIN_SILENCE_FRAMES
+        );
+        match &loudness {
+            Ok(measured) => println!("Loudness      {}", measured.describe()),
+            Err(reason) => println!(
+                "Loudness      NOT MEASURED: {reason}\n\
+                               No figure is reported rather than one computed with a method the\n\
+                               standard does not define for this sample rate."
+            ),
+        }
+        println!("Source was opened read-only; it has not been modified.");
+    }
+    Ok(())
+}
+
+/// Largest number of samples decoded for one analysis pass.
+const MAX_AUDIO_SAMPLES: usize = 200_000_000;
+
+/// Peak amplitude below which a sample counts as silent.
+const SILENCE_THRESHOLD: f64 = 0.001;
+
+/// Shortest run that counts as a silence region.
+const MIN_SILENCE_FRAMES: u64 = 1_000;

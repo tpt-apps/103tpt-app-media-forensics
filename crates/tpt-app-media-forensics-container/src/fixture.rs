@@ -242,9 +242,16 @@ fn build_mp4_inner(track: &TrackSpec, keyframes: Option<&[u32]>) -> Vec<u8> {
         mp4_box(b"moov", &inner)
     };
 
+    // The media data must actually hold every declared sample, or a demuxer
+    // walks off the end of `mdat` and reports fewer packets than the sample
+    // tables declare — which would make a fixture-dependent test look like an
+    // engine bug.
+    let sample_payload_bytes: usize = 100;
+    let media_len = (sample_count as usize).saturating_mul(sample_payload_bytes);
+
     let mut file = mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2avc1mp41");
     file.extend_from_slice(&moov);
-    file.extend_from_slice(&mp4_box(b"mdat", &[0u8; 64]));
+    file.extend_from_slice(&mp4_box(b"mdat", &vec![0u8; media_len]));
     file
 }
 
@@ -270,11 +277,12 @@ pub fn build_mp4_empty_moov() -> Vec<u8> {
 ///
 /// Without this box, ISO-BMFF means *every* sample is a sync sample, which is
 /// not what a real encoder writes and would leave GOP analysis untestable.
-fn stss(sample_numbers: &[u32]) -> Vec<u8> {
+fn stss(frame_indices: &[u32]) -> Vec<u8> {
     let mut payload = vec![0u8; 4]; // version + flags
-    payload.extend_from_slice(&u32be(sample_numbers.len() as u32));
-    for &n in sample_numbers {
-        payload.extend_from_slice(&u32be(n));
+    payload.extend_from_slice(&u32be(frame_indices.len() as u32));
+    for &frame in frame_indices {
+        // `stss` stores 1-based sample numbers; callers pass 0-based indices.
+        payload.extend_from_slice(&u32be(frame.saturating_add(1)));
     }
     payload
 }

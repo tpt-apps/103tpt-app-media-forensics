@@ -553,10 +553,10 @@ name = "tpt-app-media-forensics-audio"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "tempfile",
  "thiserror",
- "tpt-app-media-forensics-evidence",
  "tpt-app-media-forensics-model",
- "tpt-app-media-forensics-timing",
+ "tpt-av-cadence-core",
  "tracing",
 ]
 
@@ -570,12 +570,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tpt-app-media-forensics-audio",
  "tpt-app-media-forensics-container",
  "tpt-app-media-forensics-core",
  "tpt-app-media-forensics-model",
  "tpt-app-media-forensics-report",
  "tpt-app-media-forensics-timing",
  "tpt-app-media-forensics-video",
+ "tpt-av-cadence-core",
+ "tpt-av-cadence-wav",
  "tracing",
  "tracing-subscriber",
 ]
@@ -585,6 +588,7 @@ name = "tpt-app-media-forensics-container"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "tpt-app-media-forensics-model",
@@ -687,6 +691,26 @@ dependencies = [
  "thiserror",
  "tpt-app-media-forensics-model",
  "tracing",
+]
+
+[[package]]
+name = "tpt-av-cadence-core"
+version = "0.1.0"
+source = "git+https://github.com/tpt-solutions/tpt-cadence?rev=72794ef2a270a538efc4bfa24b6f9de96e1df05e#72794ef2a270a538efc4bfa24b6f9de96e1df05e"
+dependencies = [
+ "byteorder",
+ "log",
+ "thiserror",
+]
+
+[[package]]
+name = "tpt-av-cadence-wav"
+version = "0.1.0"
+source = "git+https://github.com/tpt-solutions/tpt-cadence?rev=72794ef2a270a538efc4bfa24b6f9de96e1df05e#72794ef2a270a538efc4bfa24b6f9de96e1df05e"
+dependencies = [
+ "byteorder",
+ "log",
+ "tpt-av-cadence-core",
 ]
 
 [[package]]

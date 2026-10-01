@@ -1,0 +1,19 @@
+# Normalise line endings in the repository.
+#
+# Without this, git warns on every touch and rewrites files between CRLF and
+# LF depending on the editor, producing whole-file diffs that bury the actual
+# change.
+* text=auto eol=lf
+
+# Binary media fixtures must never be line-ending translated: doing so would
+# corrupt them and invalidate their hashes (spec §76).
+*.mp4 binary
+*.mov binary
+*.mkv binary
+*.wav binary
+*.png binary
+*.jpg binary
+*.tptcase binary
+
+# Lockfiles are generated but must stay stable for reproducibility (spec §77).
+Cargo.lock text eol=lf

@@ -331,8 +331,16 @@ pub fn track_frame_info(track: &Mp4Track) -> Option<TrackFrameInfo> {
     }
 
     let all_frames_are_keyframes = track.stss.is_none();
+    // `stss` stores 1-based sample numbers; frame indices here are 0-based.
+    // Reading them unconverted would place every keyframe one frame late and
+    // shift every GOP boundary with it.
     let keyframes = match &track.stss {
-        Some(stss) => stss.sample_numbers.clone(),
+        Some(stss) => stss
+            .sample_numbers
+            .iter()
+            .map(|&n| n.saturating_sub(1))
+            .filter(|&index| (index as usize) < sample_count)
+            .collect(),
         None => (0..u32::try_from(sample_count).unwrap_or(0)).collect(),
     };
 
@@ -341,4 +349,76 @@ pub fn track_frame_info(track: &Mp4Track) -> Option<TrackFrameInfo> {
         keyframes,
         all_frames_are_keyframes,
     })
+}
+
+/// One access unit, reduced to what packet-layer analysis needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleRecord {
+    /// Index of this sample within its stream.
+    pub frame_index: u32,
+    /// Content digest of the compressed sample.
+    ///
+    /// Hashing the *compressed* bytes, not decoded pixels: it is exact, cheap,
+    /// and requires no decoder. What it proves depends on whether the sample is
+    /// a keyframe — see the `Soundness` documentation on duplicate detection.
+    pub digest: String,
+    /// Presentation time.
+    pub time: tpt_app_media_forensics_model::MediaTime,
+    /// Whether the sample is a random-access point.
+    pub is_key_frame: bool,
+    /// Size of the compressed sample in bytes.
+    pub size: usize,
+}
+
+/// Reads every sample in the container, grouped by stream index.
+///
+/// # Errors
+///
+/// Returns an error only when the demuxer cannot be opened. A stream that
+/// fails mid-read yields the packets recovered so far plus a recorded reason,
+/// because a truncated file is evidence rather than a failure (spec §30).
+pub fn read_samples(data: Vec<u8>) -> Result<Vec<SampleRecord>, ContainerError> {
+    use sha2::Digest as _;
+    use tpt_app_media_forensics_model::Timebase;
+    use tpt_kinetix_demux::{Demuxer as _, Mp4Demuxer};
+
+    let mut demuxer = Mp4Demuxer::new(data).map_err(|e| ContainerError::Parse(e.to_string()))?;
+    let tracks = demuxer.tracks().to_vec();
+
+    let mut per_stream_index = vec![0u32; tracks.len()];
+    let mut out = Vec::new();
+
+    loop {
+        let packet = match demuxer.read_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(_) => break, // Truncated or damaged: keep what was recovered.
+        };
+
+        let Some(track) = tracks.get(packet.stream_index as usize) else {
+            continue;
+        };
+
+        let frame_index = per_stream_index[packet.stream_index as usize];
+        per_stream_index[packet.stream_index as usize] = frame_index.saturating_add(1);
+
+        let timebase = Timebase::from_ticks_per_second(track.timescale.max(1));
+        let time = timebase.ticks_to_media_time(packet.pts.value);
+
+        let digest = sha2::Sha256::digest(&packet.data);
+        out.push(SampleRecord {
+            frame_index,
+            digest: digest_hex(&digest),
+            time,
+            is_key_frame: packet.is_key_frame,
+            size: packet.size(),
+        });
+    }
+
+    Ok(out)
+}
+
+/// Formats a digest as lowercase hex.
+fn digest_hex(digest: &[u8]) -> String {
+    tpt_app_media_forensics_model::asset::to_hex(digest)
 }

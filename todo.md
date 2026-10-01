@@ -44,13 +44,16 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [x] Integrate tpt-kinetix (container demux: `tpt-kinetix-core`, `-demux`)
 - [ ] Integrate tpt-kinetix-h264 for frame decoding (never implement it ourselves;
       it is bit-exact vs ffmpeg. Tier-2 only — see docs/decoding-tiers.md)
-- [ ] Integrate tpt-cadence (audio codec/timing)
+- [x] Integrate tpt-cadence (	pt-av-cadence-core, -wav)
 - [x] Implement container/stream inspection (§12–13)
 - [ ] Implement video analysis: structural, temporal, spatial, colour (§14)
 - [x] Implement GOP analysis (§15) — packet-layer only; no decoding required
-- [ ] Implement frame analysis & duplicate/near-duplicate detection (§16–17)
+- [x] Implement frame analysis & duplicate detection (§16–17) — exact duplication
+      at the packet layer, no decoding
+- [ ] Implement near-duplicate detection (needs decoded pixels, Tier 2)
 - [ ] Implement scene-change analysis (§18)
-- [ ] Implement audio analysis: codec, channels, loudness, spectral (§19–22)
+- [x] Implement audio analysis: levels, silence, DC offset, loudness (§19–22 partial)
+- [ ] Implement spectral analysis (FFT) and loudness-range measurement
 - [x] Implement A/V synchronisation analysis (§23) — initial offset, final
       offset, and drift measured over the span
       **Note:** spec §23 names `tpt-av-sync` for this, but that crate is a CRDT
