@@ -62,6 +62,19 @@ pub enum CoreError {
         reason: String,
     },
 
+    /// A value could not be encoded or decoded for storage.
+    ///
+    /// Kept distinct from I/O and database errors: a serialisation failure is a
+    /// bug in the model, and reading it as a disk problem would send an
+    /// investigator looking in the wrong place.
+    #[error("cannot {operation}: {reason}")]
+    Serialise {
+        /// What was being encoded or decoded.
+        operation: &'static str,
+        /// What went wrong.
+        reason: String,
+    },
+
     /// A case database operation failed.
     ///
     /// Kept distinct from an I/O error: a constraint violation (a finding

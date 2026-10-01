@@ -697,7 +697,10 @@ dependencies = [
 name = "tpt-app-media-forensics-evidence"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tpt-app-media-forensics-model",
  "tracing",

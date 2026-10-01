@@ -6,3 +6,6 @@
 
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
+pub mod store;
+
+pub use store::{EvidenceError, EvidenceStore};

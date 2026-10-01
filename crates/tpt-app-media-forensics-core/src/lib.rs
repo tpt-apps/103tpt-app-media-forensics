@@ -31,3 +31,7 @@ pub use error::CoreError;
 pub mod store;
 
 pub use store::Store;
+
+pub mod cache;
+
+pub use cache::{AnalysisCache, CacheEntry};

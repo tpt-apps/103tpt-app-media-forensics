@@ -72,9 +72,9 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [x] Implement rule engine (`ForensicRule` trait) + rule profiles (§35–37)
 - [x] Implement first ~20 forensic rules across container/video/audio/
       timing/metadata — 12 builtin rules; ~8 more pending
-- [ ] Implement Evidence model + integrity metadata (hashes, provenance) (§32–33)
+- [x] Implement Evidence model + integrity metadata (hashes, provenance) (§32–33)
 - [ ] Implement frame extraction as evidence
-- [ ] Implement analysis cache keyed on asset hash + analysis version +
+- [x] Implement analysis cache keyed on asset hash + analysis version +
       profile hash + rule-set hash (§54)
 - [ ] Implement large-file/streaming analysis with bounded memory,
       background workers, cancellation, progress reporting (§55–56)
