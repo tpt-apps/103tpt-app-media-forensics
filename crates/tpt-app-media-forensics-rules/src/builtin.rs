@@ -973,6 +973,127 @@ fn mode(values: &[i64]) -> Option<i64> {
         .map(|(value, _)| value)
 }
 
+// ---------------------------------------------------------------------------
+// Tier-2 rules
+//
+// These read decoded frames. Neither runs unless Tier-2 decoding succeeded, so a
+// file the decoder could not read produces no pixel-level finding at all rather
+// than a finding derived from absent measurements.
+// ---------------------------------------------------------------------------
+
+/// Reports consecutive frames differing by more than the profile's threshold.
+pub struct SceneChange;
+
+impl ForensicRule for SceneChange {
+    fn id(&self) -> &'static str {
+        "VIDEO.SCENE_CHANGE"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether consecutive decoded frames differ in mean luma by more than the \
+         profile's threshold."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A large change between consecutive frames is consistent with a scene \
+         change. It is also consistent with a dissolve, a flash, or a change of \
+         lighting, so this reports the measured difference and not a cause."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, profile: &RuleProfile) -> Vec<Finding> {
+        let Some(report) = &bundle.scene else {
+            return Vec::new();
+        };
+
+        report
+            .changes_above(profile.scene_change_threshold)
+            .into_iter()
+            .map(|change| {
+                finding(
+                    self.id(),
+                    bundle,
+                    Severity::Info,
+                    // A mean luma difference is a single measurement with no
+                    // corroborating indicator, so it cannot carry more weight
+                    // than that however large it is.
+                    Confidence::Medium,
+                    format!(
+                        "Mean luma difference of {:.1} between frames {} and {}",
+                        change.mean_absolute,
+                        change.index.saturating_sub(1),
+                        change.index
+                    ),
+                    vec![
+                        format!("mean absolute luma difference: {:.2}", change.mean_absolute),
+                        format!(
+                            "samples changed over threshold: {:.1}%",
+                            change.changed_fraction * 100.0
+                        ),
+                        format!("profile threshold: {}", profile.scene_change_threshold),
+                        format!("frames compared: {}", report.frames_examined),
+                    ],
+                    None,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Reports frames whose decoded pictures match despite differing encoded bytes.
+pub struct NearDuplicateFrames;
+
+impl ForensicRule for NearDuplicateFrames {
+    fn id(&self) -> &'static str {
+        "VIDEO.NEAR_DUPLICATE_FRAME"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether two decoded frames within the profile's window have the same \
+         perceptual hash."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A repeated picture re-encoded produces different bytes but the same \
+         image, which packet-level duplicate detection cannot see. A perceptual \
+         hash can also collide on two genuinely different shots of one scene, so \
+         this is evidence of similarity rather than of reuse."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, profile: &RuleProfile) -> Vec<Finding> {
+        let Some(report) = &bundle.near_duplicates else {
+            return Vec::new();
+        };
+
+        // Identical hashes are the strongest form this measurement produces, and
+        // even then it is `Low`: two different shots of the same scene can hash
+        // alike, and only a reviewer with the pictures can separate the cases.
+        report
+            .pairs
+            .iter()
+            .take(MAX_REPORTED_NEAR_DUPLICATES)
+            .map(|pair| {
+                finding(
+                    self.id(),
+                    bundle,
+                    Severity::Info,
+                    Confidence::Low,
+                    format!(
+                        "Decoded frames {} and {} have the same perceptual hash",
+                        pair.earlier, pair.later
+                    ),
+                    vec![
+                        format!("hash distance: {} bits of 64", pair.distance),
+                        format!(
+                            "comparison window: +/- {} frames",
+                            profile.near_duplicate_window
+                        ),
+                        format!("frames examined: {}", report.frames_examined),
+                    ],
+                    None,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Cap on near-duplicate pairs reported, so a pathological file cannot produce
+/// thousands of findings that no reviewer will read.
+const MAX_REPORTED_NEAR_DUPLICATES: usize = 20;
+
 /// Returns every built-in rule.
 #[must_use]
 pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
@@ -992,7 +1113,9 @@ pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
         Box::new(InaudibleAudio),
         Box::new(MetadataConflict),
         Box::new(MissingCreationMetadata),
+        Box::new(NearDuplicateFrames),
         Box::new(NoUsableStreams),
+        Box::new(SceneChange),
         Box::new(NonMonotonicPts),
         Box::new(SingleKeyframe),
         Box::new(StreamDurationMissing),

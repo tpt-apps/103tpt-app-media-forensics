@@ -43,6 +43,8 @@ pub fn empty_bundle(asset_id: AssetId) -> AnalysisBundle {
         audio_levels: None,
         silence: Vec::new(),
         loudness: None,
+        scene: None,
+        near_duplicates: None,
     }
 }
 
@@ -73,6 +75,10 @@ pub struct AnalysisBundle {
     pub silence: Vec<tpt_app_media_forensics_audio::SilenceRegion>,
     /// Integrated loudness, when it could be measured correctly.
     pub loudness: Option<tpt_app_media_forensics_audio::Measurement>,
+    /// Consecutive-frame differences, when Tier-2 decoding ran.
+    pub scene: Option<tpt_app_media_forensics_video::scene::SceneReport>,
+    /// Near-duplicate pairs, when Tier-2 decoding ran.
+    pub near_duplicates: Option<tpt_app_media_forensics_video::near_duplicate::NearDuplicateReport>,
 }
 
 /// A single forensic rule.

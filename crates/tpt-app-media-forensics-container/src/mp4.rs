@@ -353,6 +353,13 @@ pub fn track_frame_info(track: &Mp4Track) -> Option<TrackFrameInfo> {
 /// One access unit, reduced to what packet-layer analysis needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SampleRecord {
+    /// Index of the stream this sample belongs to.
+    pub stream_index: u32,
+    /// The encoded bytes, retained so Tier-2 can decode this sample.
+    ///
+    /// `read_samples` is only called for files inside the sampling bound, so
+    /// holding the payload does not change when it applies.
+    pub data: Vec<u8>,
     /// Index of this sample within its stream.
     pub frame_index: u32,
     /// Content digest of the compressed sample.
@@ -403,14 +410,16 @@ pub fn read_samples(data: Vec<u8>) -> Result<Vec<SampleRecord>, ContainerError> 
 
         let timebase = Timebase::from_ticks_per_second(track.timescale.max(1));
         let time = timebase.ticks_to_media_time(packet.pts.value);
-
+        let size = packet.size();
         let digest = sha2::Sha256::digest(&packet.data);
         out.push(SampleRecord {
+            stream_index: packet.stream_index,
+            data: packet.data,
             frame_index,
             digest: digest_hex(&digest),
             time,
             is_key_frame: packet.is_key_frame,
-            size: packet.size(),
+            size,
         });
     }
 

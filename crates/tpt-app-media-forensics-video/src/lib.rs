@@ -14,6 +14,18 @@
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod decode;
+
+pub use decode::{is_h264, DecodeError, DecodeLimits, DecodeSession, DecodedFrame};
+
+pub mod near_duplicate;
+
+pub use near_duplicate::{NearDuplicate, NearDuplicateReport, PerceptualHash};
+
+pub mod scene;
+
+pub use scene::{FrameDifference, SceneReport};
+
 pub mod gop;
 
 pub use gop::{Gop, GopChange, GopReport};

@@ -3,6 +3,40 @@
 All notable changes to this project are docum
 #### Phase 1 - report generation and case persistence (spec 59-63, 66)
 #### Phase 1 - batch analysis (spec 48-49)
+#### Phase 1 - Tier-2 pixel analysis (spec 16-18)
+- `tpt-kinetix-h264` integrated as the decoder. It is not reimplemented: it is
+  already bit-exact against ffmpeg, and re-deriving it would be worse and slower
+- `-video::decode`: the decoder adapter. The analysis that produces findings
+  never sees a decoder, so both analysers are unit-testable on synthetic frames
+  - Pixel-exactness gates everything. `DecodeSession` refuses to open unless the
+    decoder reports `pixel_exact`, because Tier-2 measurements computed on
+    approximate frames would describe the decoder rather than the media. Withheld
+    is the correct outcome; a plausible wrong number is not
+  - Decoding is bounded by `DecodeLimits`, and hitting a bound is reported
+    rather than returning a partial result that reads as complete
+- `-video::scene`: scene-change analysis from mean absolute luma difference
+  between consecutive decoded frames. The threshold is a profile value, not a
+  constant, because what counts as a cut depends on the content
+- `-video::near_duplicate`: perceptual hashing on decoded frames, which finds
+  the case packet-layer detection cannot: the same picture re-encoded, so the
+  bytes differ and the image does not. Block means are compared against the
+  image's own mean, so the hash measures structure rather than brightness
+- Two rules: `VIDEO.SCENE_CHANGE` and `VIDEO.NEAR_DUPLICATE_FRAME`. Both carry
+  `Medium` and `Low` confidence respectively and never above: a perceptual hash
+  collides on two different shots of one scene, so only a reviewer with the
+  pictures can separate that from reuse
+- **A decoder abort is contained rather than propagated.** Some Kinetix parse
+  paths attach an `anyhow::Context` to an error, which captures a backtrace, and
+  the capture path aborts the process. A malformed PPS in a deliberately damaged
+  file therefore ended the whole examination - the opposite of what spec 75
+  requires of hostile input. The unwind is now caught, the frame is lost, the
+  session continues, and the reason is recorded in the case's limitations
+- Known cosmetic limitation: on Windows the decoder's own `PPS_PARSE_ERR`
+  diagnostics still reach stderr. Redirecting the standard error handle needs
+  `unsafe`, which this crate forbids, and a stray debug line is not worth an
+  `unsafe` block. The examination completes with a success exit status either
+  way, and the measurement outcome is recorded in the report
+- 12 Tier-2 tests over synthetic frames, plus 5 decoder-adapter tests
 #### Phase 1 - partial reads: inspection no longer loads whole files (spec 12)
 - `-container::read_moov` walks the top-level box headers and loads only the
   `moov` box, leaving the media data on disk

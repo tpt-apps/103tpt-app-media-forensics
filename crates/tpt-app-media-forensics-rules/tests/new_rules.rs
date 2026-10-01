@@ -62,7 +62,7 @@ fn keyed_bytes() -> Vec<u8> {
 #[test]
 fn the_full_rule_set_is_registered() {
     let ids = builtin_rules().iter().map(|r| r.id()).collect::<Vec<_>>();
-    assert_eq!(ids.len(), 21, "expected the complete rule set, got {ids:?}");
+    assert_eq!(ids.len(), 23, "expected the complete rule set, got {ids:?}");
     assert_eq!(
         ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
         ids.len(),

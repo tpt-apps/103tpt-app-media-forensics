@@ -60,6 +60,21 @@ pub struct RuleProfile {
     /// sharing a tolerance field with a level measurement invites comparing
     /// unlike units.
     pub av_drift_tolerance_ms: f64,
+
+    /// Mean absolute luma difference between consecutive frames above which two
+    /// frames are treated as a scene change.
+    ///
+    /// A profile value rather than a constant: what counts as a cut depends on
+    /// the content, and a delivery specification should be able to set it
+    /// without a rebuild.
+    pub scene_change_threshold: f64,
+
+    /// Frames either side of a pair compared for near-duplication.
+    ///
+    /// Bounding this is what makes the measurement tractable. An all-pairs scan
+    /// is quadratic, and over a long file that is not a computation an analyst
+    /// will wait for.
+    pub near_duplicate_window: usize,
 }
 
 impl Default for RuleProfile {
@@ -81,6 +96,8 @@ impl Default for RuleProfile {
             inaudible_lufs: -70.0,
             loudness_drift_tolerance_lu: 2.0,
             av_drift_tolerance_ms: 20.0,
+            scene_change_threshold: 60.0,
+            near_duplicate_window: 8,
         }
     }
 }

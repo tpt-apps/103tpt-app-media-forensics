@@ -32,7 +32,9 @@ use tpt_app_media_forensics_model::{
     AcquisitionRecord, AnalysisId, AnalysisVersion, CacheKey, Case, Finding, MediaAsset, MediaTime,
     MediaType,
 };
-use tpt_app_media_forensics_rules::{builtin_rules, engine::empty_bundle, RuleEngine, RuleProfile};
+use tpt_app_media_forensics_rules::{
+    builtin_rules, engine::empty_bundle, engine::AnalysisBundle, RuleEngine, RuleProfile,
+};
 use tpt_app_media_forensics_timing::pts_dts::scan_presentation;
 use tpt_app_media_forensics_video::duplicate::find_repeated_runs;
 use tpt_app_media_forensics_video::gop;
@@ -228,6 +230,13 @@ impl AnalysisEngine {
 
         // Metadata lives in moov, which was already read for inspection, so this
         // costs nothing extra and never touches the media data.
+        // 5b. Tier-2: pixel-level analysis (spec §16-§18).
+        //
+        // Runs only when the samples were already read and the decoder is
+        // pixel-exact. Every reason Tier-2 cannot run becomes a limitation, so a
+        // report never implies a measurement was made when it was not.
+        self.run_tier_two(source, &inspection, &mut bundle, &mut limitations);
+
         bundle.metadata = bundle.container.as_ref().and_then(|_| {
             tpt_app_media_forensics_container::read_moov(source)
                 .ok()
@@ -276,11 +285,98 @@ impl AnalysisEngine {
             profile: self.profile.clone(),
         })
     }
+    /// Runs pixel-level analysis, recording why it was skipped if it was.
+    ///
+    /// Tier-2 needs the encoded samples, which are only in memory when the file
+    /// was within the sampling bound, and it needs a pixel-exact decoder. Both
+    /// conditions are reported rather than passed over in silence: a report that
+    /// omits a measurement without saying so would read as though none was due.
+    fn run_tier_two(
+        &self,
+        source: &Path,
+        inspection: &Option<tpt_app_media_forensics_container::Mp4Inspection>,
+        bundle: &mut AnalysisBundle,
+        limitations: &mut Vec<String>,
+    ) {
+        use tpt_app_media_forensics_video::{
+            is_h264, near_duplicate, scene, DecodeLimits, DecodeSession,
+        };
+
+        let Some(inspection) = inspection else {
+            limitations.push(
+                "Tier-2 pixel analysis was not run: no container structure was recovered"
+                    .to_owned(),
+            );
+            return;
+        };
+        let Some(stream) = inspection
+            .streams
+            .iter()
+            .find(|s| s.kind == tpt_app_media_forensics_model::StreamKind::Video)
+        else {
+            return;
+        };
+
+        if !is_h264(&stream.codec.name) {
+            limitations.push(format!(
+                "Tier-2 pixel analysis was not run: codec `{}` has no integrated decoder",
+                stream.codec.name
+            ));
+            return;
+        }
+
+        let samples = match tpt_app_media_forensics_container::read_samples_file(source) {
+            Ok(samples) => samples,
+            Err(error) => {
+                limitations.push(format!("Tier-2 pixel analysis was not run: {error}"));
+                return;
+            }
+        };
+
+        let packets: Vec<(Vec<u8>, bool)> = samples
+            .iter()
+            .filter(|s| s.stream_index == stream.index)
+            .map(|s| (s.data.clone(), s.is_key_frame))
+            .collect();
+        if packets.is_empty() {
+            return;
+        }
+
+        let mut session = match DecodeSession::open(&stream.codec.name, DecodeLimits::default()) {
+            Ok(session) => session,
+            Err(error) => {
+                limitations.push(format!("Tier-2 pixel analysis was withheld: {error}"));
+                return;
+            }
+        };
+
+        let (frames, stopped) = session.decode_prefix(&packets);
+        if let Some(error) = stopped {
+            limitations.push(format!(
+                "Tier-2 pixel analysis covered {} frames before stopping: {error}",
+                frames.len()
+            ));
+        }
+
+        if frames.len() < 2 {
+            limitations.push(format!(
+                "Tier-2 pixel analysis decoded {} frame(s); at least two are needed to compare them",
+                frames.len()
+            ));
+            return;
+        }
+
+        bundle.scene = Some(scene::analyse(&frames));
+        bundle.near_duplicates = Some(near_duplicate::analyse(
+            &frames,
+            self.profile.near_duplicate_window,
+        ));
+    }
 
     /// Records an analysis run and its findings in the case database.
     ///
-    /// Written as one transaction: a run whose findings were only partly
-    /// written would leave the case reporting fewer observations than the engine
+    /// Written as one transaction: a run whose findings were only partly written
+    /// would leave the case reporting fewer observations than the engine
     /// produced, which is exactly the kind of silent gap this product must not
     /// have.
     fn persist(
