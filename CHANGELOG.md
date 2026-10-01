@@ -2,6 +2,25 @@
 
 All notable changes to this project are docum
 #### Phase 1 - report generation and case persistence (spec 59-63, 66)
+#### Phase 1 - batch analysis (spec 48-49)
+- `-core::batch`: analyses every media file beneath a directory into one case,
+  which is the shape of real intake work, where a handover arrives as a folder
+  - One failure does not stop the batch. Each file is analysed independently and
+    a failure is recorded against that file with its path, so a single corrupt
+    item cannot hide the results for the other thousand (spec 75)
+  - The case directory is excluded from the scan, or a batch would read its own
+    evidence and outputs on the next run
+  - Files are visited in sorted path order, so two runs over an unchanged tree
+    produce the same sequence of results (spec 77)
+  - Files are selected by extension as a cheap filter, then confirmed by
+    signature before analysis. An extension is a claim; the leading bytes are
+    evidence (spec 12)
+- CLI `batch` runs it, reports each file individually, writes the case-wide
+  bundle, and exits 2 if any file could not be analysed so a scripted caller
+  fails loudly rather than reading a short count as success
+- 10 core tests and 5 CLI tests covering nested traversal, case-directory
+  exclusion, cache reuse across a repeat batch, deterministic ordering,
+  path-labelled failures, empty directories, and source immutability
 - `-report::pdf`: PDF rendering written directly, with no new dependency
   - Emits PDF 1.4 with the base-14 Helvetica font, so nothing is embedded and
     the output stays byte-deterministic (spec 77) - a PDF library with its own

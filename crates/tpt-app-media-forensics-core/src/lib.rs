@@ -36,6 +36,7 @@ pub mod cache;
 
 pub use cache::{AnalysisCache, CacheEntry};
 
+pub mod batch;
 pub mod pipeline;
 
 pub use pipeline::{AnalysisEngine, AnalysisOutcome};

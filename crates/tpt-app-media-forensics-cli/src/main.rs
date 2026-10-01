@@ -207,19 +207,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Batch {
             directory,
             case_dir,
-        } => {
-            CaseDirectory::open(case_dir)
-                .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
-            if !directory.is_dir() {
-                anyhow::bail!("{} is not a directory", directory.display());
-            }
-            eprintln!("batch: scanning {}", directory.display());
-            eprintln!(
-                "batch: the analysis engine is not implemented yet \
-                 (Phase 1, spec \u{a7}48-49)"
-            );
-            Ok(())
-        }
+        } => run_batch(directory, case_dir, cli.json),
     }
 }
 
@@ -931,4 +919,117 @@ fn generate_report(case_dir: &std::path::Path, out: &std::path::Path) -> anyhow:
 fn write_bytes(path: &std::path::Path, bytes: Vec<u8>) -> std::io::Result<Vec<u8>> {
     std::fs::write(path, &bytes)?;
     Ok(bytes)
+}
+
+/// Analyses every media file beneath a directory into one case.
+///
+/// Each file is reported individually, so a corrupt item is visible as a
+/// labelled failure rather than silently dropping out of a total. The exit code
+/// reflects whether any file could not be analysed, so a batch over a folder with
+/// one bad file still fails loudly for a scripted caller.
+fn run_batch(
+    directory: &std::path::Path,
+    case_dir: &std::path::Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::batch::{self, FileOutcome};
+    use tpt_app_media_forensics_core::{AnalysisEngine, CaseDirectory};
+    use tpt_app_media_forensics_report::write_bundle;
+
+    if !directory.is_dir() {
+        anyhow::bail!("{} is not a directory", directory.display());
+    }
+    let case = CaseDirectory::open(case_dir)
+        .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
+
+    let outcome = batch::run(&AnalysisEngine::new(), directory, &case)?;
+    let (analysed, failed, skipped) = outcome.counts();
+
+    // Register the run as one report over every file in the case.
+    let loaded = tpt_app_media_forensics_core::pipeline::load_report(&case)?;
+    let bundle = write_bundle(&loaded.report, &case.reports_dir())?;
+
+    if json {
+        let files: Vec<serde_json::Value> = outcome
+            .results
+            .iter()
+            .map(|(path, outcome)| {
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "status": match outcome {
+                        FileOutcome::Analysed(_) => "analysed",
+                        FileOutcome::Failed { .. } => "failed",
+                        FileOutcome::Skipped { .. } => "skipped",
+                    },
+                    "reason": match outcome {
+                        FileOutcome::Analysed(_) => serde_json::Value::Null,
+                        FileOutcome::Failed { reason } | FileOutcome::Skipped { reason } => {
+                            serde_json::Value::String(reason.clone())
+                        }
+                    },
+                    "finding_count": outcome.findings().len(),
+                    "cache_hit": matches!(
+                        outcome,
+                        FileOutcome::Analysed(o) if o.cache_hit
+                    ),
+                })
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "directory": directory.display().to_string(),
+                "case_dir": case.root().display().to_string(),
+                "analysed": analysed,
+                "failed": failed,
+                "skipped": skipped,
+                "finding_count": loaded.report.finding_count(),
+                "analysis_fingerprint": loaded.report.methodology.analysis_fingerprint,
+                "bundle_files": bundle.files,
+                "files": files,
+            }))?
+        );
+    } else {
+        println!("Directory      {}", directory.display());
+        println!("Case           {}", case.root().display());
+        println!();
+        for (path, outcome) in &outcome.results {
+            match outcome {
+                FileOutcome::Analysed(o) => {
+                    println!(
+                        "  {}  {} findings{}",
+                        path.display(),
+                        o.findings.len(),
+                        if o.cache_hit { "  (cached)" } else { "" }
+                    );
+                }
+                FileOutcome::Failed { reason } => println!("  {reason}"),
+                FileOutcome::Skipped { reason } => {
+                    println!("  {}  skipped: {reason}", path.display());
+                }
+            }
+        }
+        println!();
+        println!("Analysed {analysed}   Failed {failed}   Skipped {skipped}");
+        println!("Findings {}", loaded.report.finding_count());
+        println!(
+            "Fingerprint {}",
+            loaded.report.methodology.analysis_fingerprint
+        );
+        println!("Bundle        {}", case.reports_dir().display());
+        for entry in &bundle.files {
+            println!("  {}  sha256 {}", entry.name, entry.sha256);
+        }
+        if failed > 0 {
+            println!();
+            println!("{failed} file(s) could not be analysed; see the case database.");
+        }
+    }
+
+    // A batch that could not read some of its input has not fully succeeded.
+    if failed > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
 }

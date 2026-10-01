@@ -493,3 +493,257 @@ fn report_writes_a_self_verifying_bundle() {
         "the bundle needs a verifying manifest"
     );
 }
+
+/// Stages a small intake tree and returns the directory.
+fn intake_tree(dir: &Path) -> std::path::PathBuf {
+    let intake = dir.join("intake");
+    std::fs::create_dir_all(intake.join("sub")).expect("creates intake");
+
+    std::fs::write(
+        intake.join("clean.mp4"),
+        tpt_app_media_forensics_container::fixture::build_mp4(
+            &tpt_app_media_forensics_container::fixture::TrackSpec::video_25fps(320, 240, 30),
+        ),
+    )
+    .expect("writes clean");
+    std::fs::write(
+        intake.join("damaged.mp4"),
+        tpt_app_media_forensics_container::fixture::build_mp4_stsd_gop_change(),
+    )
+    .expect("writes damaged");
+    std::fs::write(
+        intake.join("sub/nested.mp4"),
+        tpt_app_media_forensics_container::fixture::build_mp4(
+            &tpt_app_media_forensics_container::fixture::TrackSpec::video_25fps(320, 240, 30),
+        ),
+    )
+    .expect("writes nested");
+    std::fs::write(intake.join("notes.txt"), b"not media").expect("writes text");
+    intake
+}
+
+#[test]
+fn batch_analyses_a_whole_directory_including_subdirectories() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let intake = intake_tree(dir.path());
+    let case_dir = dir.path().join("case.tptcase");
+
+    // A case must exist before a batch can write into it.
+    let seed = intake.join("clean.mp4");
+    let output = cli()
+        .args([
+            "acquire",
+            seed.to_str().expect("utf-8"),
+            "--name",
+            "Batch Case",
+            "--parent",
+            dir.path().to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("acquires");
+    assert!(output.status.success());
+
+    let output = cli()
+        .args([
+            "batch",
+            intake.to_str().expect("utf-8"),
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "batch failed: {stderr}");
+    assert!(stdout.contains("Analysed 3"), "stdout was:\n{stdout}");
+    assert!(
+        stdout.contains("nested.mp4"),
+        "nested files must be analysed"
+    );
+    assert!(
+        !stdout.contains("notes.txt"),
+        "non-media must not be analysed"
+    );
+    assert!(
+        stdout.contains("Fingerprint"),
+        "a batch must state its analysis fingerprint"
+    );
+}
+
+#[test]
+fn batch_json_lists_every_file_analysed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let intake = intake_tree(dir.path());
+    let case_dir = dir.path().join("case.tptcase");
+
+    let output = cli()
+        .args([
+            "acquire",
+            intake.join("clean.mp4").to_str().expect("utf-8"),
+            "--name",
+            "Batch Case",
+            "--parent",
+            dir.path().to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("acquires");
+    assert!(output.status.success());
+
+    let output = cli()
+        .args([
+            "batch",
+            intake.to_str().expect("utf-8"),
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+            "--json",
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(output.status.success());
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    assert_eq!(value["analysed"], 3);
+    assert_eq!(value["failed"], 0);
+
+    let files = value["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 3, "only real media is analysed");
+    for file in files {
+        assert_eq!(file["status"], "analysed");
+    }
+    assert!(
+        !text.contains("notes.txt"),
+        "non-media must not appear in the batch"
+    );
+}
+
+#[test]
+fn a_second_batch_hits_the_cache_for_every_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let intake = intake_tree(dir.path());
+    let case_dir = dir.path().join("case.tptcase");
+
+    let output = cli()
+        .args([
+            "acquire",
+            intake.join("clean.mp4").to_str().expect("utf-8"),
+            "--name",
+            "Batch Case",
+            "--parent",
+            dir.path().to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("acquires");
+    assert!(output.status.success());
+
+    for _ in 0..2 {
+        let output = cli()
+            .args([
+                "batch",
+                intake.to_str().expect("utf-8"),
+                "--case-dir",
+                case_dir.to_str().expect("utf-8"),
+            ])
+            .output()
+            .expect("runs CLI");
+        assert!(output.status.success());
+    }
+
+    let output = cli()
+        .args([
+            "batch",
+            intake.to_str().expect("utf-8"),
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+            "--json",
+        ])
+        .output()
+        .expect("runs CLI");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let cached = value["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .filter(|f| f["cache_hit"] == serde_json::Value::Bool(true))
+        .count();
+    assert_eq!(cached, 3, "every file is cached on a repeat run");
+}
+
+#[test]
+fn batch_rejects_a_path_that_is_not_a_directory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = fixture(dir.path(), "one.mp4", b"payload");
+    let case_dir = dir.path().join("case.tptcase");
+
+    let output = cli()
+        .args([
+            "acquire",
+            file.to_str().expect("utf-8"),
+            "--name",
+            "C",
+            "--parent",
+            dir.path().to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("acquires");
+    assert!(output.status.success());
+
+    let output = cli()
+        .args([
+            "batch",
+            file.to_str().expect("utf-8"),
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "a file is not a directory");
+    assert!(stderr.contains("not a directory"), "stderr was: {stderr}");
+}
+
+#[test]
+fn batch_writes_a_bundle_over_every_file_in_the_case() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let intake = intake_tree(dir.path());
+    let case_dir = dir.path().join("case.tptcase");
+
+    let output = cli()
+        .args([
+            "acquire",
+            intake.join("clean.mp4").to_str().expect("utf-8"),
+            "--name",
+            "Batch Case",
+            "--parent",
+            dir.path().to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("acquires");
+    assert!(output.status.success());
+
+    let output = cli()
+        .args([
+            "batch",
+            intake.to_str().expect("utf-8"),
+            "--case-dir",
+            case_dir.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(output.status.success());
+
+    for file in [
+        "case-data.json",
+        "case-report.html",
+        "case-report.pdf",
+        "findings.csv",
+        "bundle-manifest.json",
+    ] {
+        assert!(
+            case_dir.join("reports").join(file).is_file(),
+            "{file} is missing from the batch bundle"
+        );
+    }
+}
