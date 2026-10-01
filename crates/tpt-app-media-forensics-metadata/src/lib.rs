@@ -12,3 +12,8 @@
 
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
+pub mod consistency;
+pub mod tree;
+
+pub use consistency::{find_conflicts, Conflict, ConflictKind, Observation};
+pub use tree::{MetadataEntry, MetadataTree, Scope};

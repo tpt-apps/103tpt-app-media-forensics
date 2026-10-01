@@ -33,7 +33,7 @@ pub mod probe;
 pub use error::ContainerError;
 pub use fixture::{
     build_mp4, build_mp4_empty_moov, build_mp4_stsd_gop_change, build_mp4_with_keyframes,
-    build_mp4_without_moov, gop_change_keyframes, TrackSpec,
+    build_mp4_with_metadata, build_mp4_without_moov, gop_change_keyframes, TrackSpec,
 };
 pub use mp4::{
     inspect_bytes, inspect_file, read_samples, track_frame_info, Mp4Inspection, SampleRecord,

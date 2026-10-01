@@ -114,6 +114,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   plausible-looking number from the wrong filter
 - New CLI `audio` command decoding WAV via `tpt-av-cadence`
 
+#### Phase 1 — metadata extraction and consistency (spec §25, §26)
+- `-metadata::tree`: every entry retains the scope and container element it
+  came from, because a conflict is only visible when both competing values
+  survive. Entries are sorted deterministically (spec §77)
+- `-metadata::consistency`: reports keys whose values disagree *between
+  scopes*, naming each value and its source, and asserting nothing about why
+  they disagree (spec §26)
+- Two tracks disagreeing within one scope is not a conflict: they are not
+  competing versions of one fact
+- New CLI `metadata` command
+- Metadata atom names render as `u+a9cmt` rather than the raw copyright byte,
+  which was illegible in a terminal
+
 ### Fixed
 
 - Every stream was reported with index 0, which would mis-associate frame data

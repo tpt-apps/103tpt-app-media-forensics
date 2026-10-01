@@ -573,6 +573,7 @@ dependencies = [
  "tpt-app-media-forensics-audio",
  "tpt-app-media-forensics-container",
  "tpt-app-media-forensics-core",
+ "tpt-app-media-forensics-metadata",
  "tpt-app-media-forensics-model",
  "tpt-app-media-forensics-report",
  "tpt-app-media-forensics-timing",
@@ -633,6 +634,7 @@ name = "tpt-app-media-forensics-metadata"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
  "tpt-app-media-forensics-model",
  "tracing",

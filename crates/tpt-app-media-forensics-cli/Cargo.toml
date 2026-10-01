@@ -14,6 +14,7 @@ categories.workspace = true
 tpt-app-media-forensics-model = { workspace = true }
 tpt-app-media-forensics-container = { workspace = true }
 tpt-app-media-forensics-timing = { workspace = true }
+tpt-app-media-forensics-metadata = { workspace = true }
 tpt-app-media-forensics-audio = { workspace = true }
 tpt-app-media-forensics-video = { workspace = true }
 tpt-av-cadence-core = { workspace = true }

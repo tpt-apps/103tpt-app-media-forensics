@@ -60,7 +60,9 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       collaboration engine with no A/V measurement capability (confirmed by
       source search). Implemented directly in `-timing`; see `docs/foundation.md`
 - [x] Implement timestamp forensics (PTS/DTS, monotonicity, gaps) (§24)
-- [ ] Implement metadata extraction + consistency cross-checks (§25–26)
+- [x] Implement metadata extraction + consistency cross-checks (§25–26)
+      — text atoms with scope/source provenance; conflicts are flagged
+      without asserting a cause
 - [ ] Implement encoder fingerprinting (best-effort, confidence-labelled) (§27)
 - [ ] Implement compression/bitrate analysis + anomaly detection (§28–29)
 - [ ] Implement corruption detection with graceful continuation (§30)
@@ -133,7 +135,8 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [ ] Property tests for timestamps, frame ordering, container parsing
 - [ ] Fuzzing for container/codec/metadata/packet/timestamp parsers
 - [ ] Golden tests against known fixtures (metadata, structure, findings)
-- [ ] Build corrupt-media test corpus (§76): truncated, bad-header,
+- [~] Build corrupt-media test corpus (§76): synthetic generator in place;
+      fixtures generated on demand. Pending: truncated, bad-header,
       invalid-timestamps, missing-index, bad-audio-packet, duplicate-frame,
       duration-mismatch, metadata-conflict
 - [ ] Determinism checks (stable rule ordering, no unseeded randomness) (§77)

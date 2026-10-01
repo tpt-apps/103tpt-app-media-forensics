@@ -334,6 +334,130 @@ pub fn build_mp4_without_stss(track: &TrackSpec) -> Vec<u8> {
     build_mp4_inner(track, None)
 }
 
+/// Builds a full-box atom carrying a null-terminated string (e.g. `©nam`).
+fn text_atom(kind: &[u8; 4], value: &str) -> Vec<u8> {
+    let mut body = vec![0u8; 8]; // version + flags, then locale
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    mp4_box(kind, &body)
+}
+
+/// Builds an MP4 carrying metadata atoms, including a deliberate cross-scope
+/// conflict: `©cmt` appears with two different values, one at container scope
+/// and one at track scope.
+///
+/// Used to prove that metadata extraction and consistency checking work
+/// end-to-end on a real container (spec §25, §26).
+#[must_use]
+pub fn build_mp4_with_metadata(track: &TrackSpec) -> Vec<u8> {
+    let base = build_mp4(track);
+
+    // Splice the atoms into the `moov` box: find its header and insert after
+    // the existing children.
+    let Some(moov_start) = find_box(&base, b"moov") else {
+        return base;
+    };
+
+    // Container-scope atoms, spliced directly into `moov`.
+    let mut injected = Vec::new();
+    injected.extend_from_slice(&text_atom(b"\xa9nam", "Synthetic Fixture"));
+    injected.extend_from_slice(&text_atom(b"\xa9cmt", "container scope value"));
+
+    let mut out = Vec::with_capacity(base.len() + injected.len() + 64);
+    out.extend_from_slice(&base[..moov_start + 8]);
+    out.extend_from_slice(&injected);
+    out.extend_from_slice(&base[moov_start + 8..]);
+    // Every splice must be accounted for in the size chain, or the box walker
+    // stops before reaching what was just added.
+    grow_box(&mut out, moov_start, injected.len());
+
+    // A track-scope atom carrying the *same key* with a different value. It
+    // must go inside `trak`, or the two values would share a scope and would
+    // not be a cross-scope conflict at all.
+    // 	rak is nested inside moov, so it must be searched for within that
+    // payload rather than at the top level.
+    let moov_size = moov_len(&out, moov_start);
+    let Some(trak_start) = find_box_in(&out, moov_start + 8, moov_start + moov_size, b"trak")
+    else {
+        return out;
+    };
+    let track_atom = text_atom(b"\xa9cmt", "track scope value");
+    let added = track_atom.len();
+
+    // Splicing bytes into a box changes the sizes of that box and of every
+    // ancestor. Without fixing the chain up, the box walker rejects the file
+    // and the injected atom is never reached.
+    out.splice(trak_start + 8..trak_start + 8, track_atom);
+    grow_box(&mut out, trak_start, added);
+    grow_box(&mut out, moov_start, added);
+
+    out
+}
+
+/// Increases a box's declared size by `amount`.
+fn grow_box(bytes: &mut [u8], offset: usize, amount: usize) {
+    let current = u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ]);
+    let grown = current.saturating_add(u32::try_from(amount).unwrap_or(u32::MAX));
+    bytes[offset..offset + 4].copy_from_slice(&grown.to_be_bytes());
+}
+
+/// Returns the length of the box starting at `offset`.
+fn moov_len(bytes: &[u8], offset: usize) -> usize {
+    u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ]) as usize
+}
+
+/// Finds a box of the given type within `[start, end)`, returning its offset.
+fn find_box_in(bytes: &[u8], start: usize, end: usize, kind: &[u8; 4]) -> Option<usize> {
+    let mut offset = start;
+    while offset + 8 <= end.min(bytes.len()) {
+        let size = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        if size < 8 || offset + size > bytes.len() {
+            return None;
+        }
+        if &bytes[offset + 4..offset + 8] == kind {
+            return Some(offset);
+        }
+        offset += size;
+    }
+    None
+}
+
+/// Returns the offset of a top-level box of the given type.
+fn find_box(bytes: &[u8], kind: &[u8; 4]) -> Option<usize> {
+    let mut offset = 0usize;
+    while offset + 8 <= bytes.len() {
+        let size = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        if size < 8 || offset + size > bytes.len() {
+            return None;
+        }
+        if &bytes[offset + 4..offset + 8] == kind {
+            return Some(offset);
+        }
+        offset += size;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

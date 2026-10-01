@@ -33,6 +33,7 @@ use tpt_app_media_forensics_container::{
     detect_file, extension_matches, inspect_file, read_samples, ContainerFormat, TrackFrameInfo,
 };
 use tpt_app_media_forensics_core::{acquire, CaseDirectory};
+use tpt_app_media_forensics_metadata::{find_conflicts, MetadataEntry, Scope};
 use tpt_app_media_forensics_model::{Case, MediaType};
 use tpt_app_media_forensics_video::duplicate::{find_repeated_runs, SampleDigest};
 use tpt_app_media_forensics_video::gop;
@@ -78,6 +79,12 @@ enum Command {
     /// Analyse a raw audio file: levels, silence, DC offset, and loudness.
     Audio {
         /// Path to the audio file. Opened read-only.
+        path: std::path::PathBuf,
+    },
+
+    /// Extract metadata and cross-check it for consistency.
+    Metadata {
+        /// Path to the media file. Opened read-only.
         path: std::path::PathBuf,
     },
 
@@ -190,6 +197,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         }
 
         Command::Audio { path } => audio_report(path, cli.json),
+        Command::Metadata { path } => metadata_report(path, cli.json),
         Command::Inspect { path } => inspect(path, cli.json),
 
         Command::Analyze { path, case_dir } => {
@@ -555,3 +563,180 @@ const SILENCE_THRESHOLD: f64 = 0.001;
 
 /// Shortest run that counts as a silence region.
 const MIN_SILENCE_FRAMES: u64 = 1_000;
+
+/// Extracts metadata and cross-checks it for consistency (spec §25, §26).
+///
+/// Entries retain the scope and source element they came from, because a
+/// conflict is only visible when both competing values survive.
+fn metadata_report(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let entries = extract_metadata(&bytes);
+    let tree = tpt_app_media_forensics_metadata::MetadataTree::new(entries);
+    let conflicts = find_conflicts(&tree);
+
+    if json {
+        let value = serde_json::json!({
+            "source_path": path.display().to_string(),
+            "entry_count": tree.len(),
+            "entries": tree.entries,
+            "conflicts": conflicts,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("Source        {}", path.display());
+        println!("Entries       {}", tree.len());
+        for entry in &tree.entries {
+            let track = entry
+                .track_index
+                .map_or_else(String::new, |i| format!("[track {i}] "));
+            println!(
+                "  {:<9} {}{:<16} = {}  ({})",
+                entry.scope.tag(),
+                track,
+                entry.key,
+                entry.value,
+                entry.source
+            );
+        }
+        println!("Conflicts     {}", conflicts.len());
+        for conflict in &conflicts {
+            println!("  finding: {}", conflict.describe());
+        }
+        if conflicts.is_empty() {
+            println!("  no cross-scope inconsistencies found");
+        }
+        println!("Source was opened read-only; it has not been modified.");
+    }
+
+    Ok(())
+}
+
+/// Reads top-level metadata atoms from a container (spec §25).
+///
+/// Deliberately conservative: it reads the well-known free-text atoms without
+/// claiming to fully parse every box. Values it cannot interpret are omitted
+/// rather than invented, so the report never asserts something the file did not
+/// state.
+fn extract_metadata(bytes: &[u8]) -> Vec<MetadataEntry> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+
+    while offset + 8 <= bytes.len() {
+        let size = read_box_size(&bytes[offset..]);
+        let Some(size) = size else { break };
+        if size > bytes.len() - offset {
+            break;
+        }
+        let kind = &bytes[offset + 4..offset + 8];
+        let payload = &bytes[offset + 8..offset + size];
+
+        if kind == b"moov" {
+            collect_free_text(payload, Scope::Container, None, &mut entries);
+
+            // Track-scoped atoms live inside `trak`, one box per track. The
+            // index is what makes two tracks' same-key values distinguishable.
+            let mut track_index = 0u32;
+            let mut inner = 0usize;
+            while inner + 8 <= payload.len() {
+                let Some(inner_size) = read_box_size(&payload[inner..]) else {
+                    break;
+                };
+                if inner_size > payload.len() - inner {
+                    break;
+                }
+                if &payload[inner + 4..inner + 8] == b"trak" {
+                    collect_free_text(
+                        &payload[inner + 8..inner + inner_size],
+                        Scope::Track,
+                        Some(track_index),
+                        &mut entries,
+                    );
+                    track_index = track_index.saturating_add(1);
+                }
+                inner += inner_size;
+            }
+        }
+        offset += size;
+    }
+
+    entries
+}
+
+/// Reads a box size, rejecting the degenerate forms.
+fn read_box_size(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    // A size below 8 cannot describe a box, and size 0 means "to end of file",
+    // which we do not accept: it makes an off-by-one unbounded.
+    (size >= 8).then_some(size)
+}
+
+/// Reads text atoms from a box payload.
+fn collect_free_text(
+    payload: &[u8],
+    scope: Scope,
+    track_index: Option<u32>,
+    entries: &mut Vec<MetadataEntry>,
+) {
+    const TEXT_BOXES: [&[u8; 4]; 3] = [b"\xa9nam", b"\xa9too", b"\xa9cmt"];
+
+    let mut offset = 0usize;
+    while offset + 8 <= payload.len() {
+        let Some(size) = read_box_size(&payload[offset..]) else {
+            break;
+        };
+        if size > payload.len() - offset {
+            break;
+        }
+        let kind = &payload[offset + 4..offset + 8];
+
+        if TEXT_BOXES.iter().any(|t| *t == kind) {
+            // The value begins after a 4-byte version/flags field and a
+            // 4-byte locale field.
+            let value_start = offset + 16;
+            if value_start < offset + size {
+                let raw = &payload[value_start..offset + size];
+                let text: String = raw
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| char::from(b))
+                    .collect();
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    entries.push(MetadataEntry {
+                        scope,
+                        track_index,
+                        key: escape_atom(kind),
+                        value: trimmed.to_owned(),
+                        source: if scope == Scope::Container {
+                            "moov".to_owned()
+                        } else {
+                            "trak".to_owned()
+                        },
+                    });
+                }
+            }
+        }
+        offset += size;
+    }
+}
+
+/// Renders a four-character atom name for display.
+///
+/// MP4 metadata atoms begin with `0xA9` and render as `©` followed by the
+/// key. Printing the raw byte makes the key illegible in a terminal, so the
+/// copyright sign is written as `u+a9` and the result stays pure ASCII — which
+/// also keeps the output stable across encodings.
+fn escape_atom(kind: &[u8]) -> String {
+    kind.iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() {
+                char::from(b).to_string()
+            } else {
+                format!("u+{b:02x}")
+            }
+        })
+        .collect()
+}
