@@ -32,6 +32,14 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Used only to build fixtures for the audio, A/V, and stage-guard tests. Without
+# real encoded streams there is no way to prove those stages run, as opposed to
+# silently skipping.
+tpt-av-cadence-opus = { workspace = true }
+tpt-av-cadence-ogg = { workspace = true }
+tpt-av-cadence-core = { workspace = true }
+tpt-kinetix-av1 = { workspace = true }
+tpt-kinetix-core = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

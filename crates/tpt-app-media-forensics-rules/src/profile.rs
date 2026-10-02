@@ -75,6 +75,20 @@ pub struct RuleProfile {
     /// is quadratic, and over a long file that is not a computation an analyst
     /// will wait for.
     pub near_duplicate_window: usize,
+
+    /// Frames per sliding window for the bitrate measurement (spec §29).
+    ///
+    /// A window, not the whole file: one average over a long recording hides
+    /// every local change, which is the entire subject of §29.
+    pub bitrate_window_frames: usize,
+
+    /// Fraction of the file's average bitrate below which a window is anomalous.
+    ///
+    /// Must be well under 1.0. Spec §29 asks for *sudden changes*, and a window
+    /// at or above the average is not a change. 0.5 means "less than half the
+    /// average", which a normal encoder produces only on genuinely static
+    /// content.
+    pub bitrate_anomaly_ratio: f64,
 }
 
 impl Default for RuleProfile {
@@ -98,6 +112,10 @@ impl Default for RuleProfile {
             av_drift_tolerance_ms: 20.0,
             scene_change_threshold: 60.0,
             near_duplicate_window: 8,
+            // 12 frames is half a second at 25 fps: long enough that ordinary
+            // encoder variation averages out, short enough to localise a cut.
+            bitrate_window_frames: 12,
+            bitrate_anomaly_ratio: 0.5,
         }
     }
 }

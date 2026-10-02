@@ -39,4 +39,4 @@ pub use cache::{AnalysisCache, CacheEntry};
 pub mod batch;
 pub mod pipeline;
 
-pub use pipeline::{AnalysisEngine, AnalysisOutcome};
+pub use pipeline::{measure_audio, AnalysisEngine, AnalysisOutcome, AudioMeasurements};

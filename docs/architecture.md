@@ -56,13 +56,13 @@ tpt-app-media-forensics/
   crates/
     ...-model/       domain types; no I/O, no workspace deps
     ...-container/   container boxes and stream enumeration
-    ...-video/       GOP, frames, duplicates, scenes, colour
-    ...-audio/       channels, silence, clipping, loudness, spectrum
+    ...-video/       GOP, frames, duplicates, scenes
+    ...-audio/       channels, silence, clipping, loudness
     ...-timing/      PTS/DTS forensics and A/V sync
     ...-metadata/    metadata tree and consistency checks
     ...-evidence/    writes derived artefacts with hashes
     ...-rules/       ForensicRule trait, profiles, rule set
-    ...-core/        orchestration, caching, progress, cancellation
+    ...-core/        orchestration and caching
     ...-report/      PDF / HTML / JSON / CSV rendering
     ...-cli/         command-line front end
     ...-tauri/       desktop shell (separate workspace)

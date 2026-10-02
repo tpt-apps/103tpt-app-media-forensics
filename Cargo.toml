@@ -82,12 +82,19 @@ tpt-app-media-forensics-report = { path = "crates/tpt-app-media-forensics-report
 # ...). The actual crate names are the sub-crates inside those repositories,
 # e.g. `tpt-kinetix-core`, `tpt-kinetix-demux`. See docs/foundation.md.
 # ---------------------------------------------------------------------------
-tpt-kinetix-core = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "9747a2b17c77479377f69ad2f2621e1ed674b518" }
-tpt-kinetix-demux = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "9747a2b17c77479377f69ad2f2621e1ed674b518" }
-tpt-kinetix-h264 = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "9747a2b17c77479377f69ad2f2621e1ed674b518" }
-tpt-av-cadence-core = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "72794ef2a270a538efc4bfa24b6f9de96e1df05e" }
-tpt-av-cadence-wav = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "72794ef2a270a538efc4bfa24b6f9de96e1df05e" }
-tpt-av-cadence-flac = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "72794ef2a270a538efc4bfa24b6f9de96e1df05e" }
+tpt-kinetix-core = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "28cefd802f7d4684057c5765aeb1c7edf086a10e" }
+tpt-kinetix-demux = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "28cefd802f7d4684057c5765aeb1c7edf086a10e" }
+tpt-kinetix-vp9 = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "28cefd802f7d4684057c5765aeb1c7edf086a10e" }
+tpt-kinetix-av1 = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "28cefd802f7d4684057c5765aeb1c7edf086a10e" }
+tpt-av-cadence-core = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "95ff6bf9349641d4cecfc15a3bd191fa228b5617" }
+tpt-av-cadence-wav = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "95ff6bf9349641d4cecfc15a3bd191fa228b5617" }
+tpt-av-cadence-flac = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "95ff6bf9349641d4cecfc15a3bd191fa228b5617" }
+# Royalty-free audio codecs only, matching the video-side rule in
+# `-video::decode`: Opus and Vorbis are decoded, AAC is not. Both decode through
+# their Ogg container, so `-ogg` is pulled in for the page layer.
+tpt-av-cadence-opus = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "95ff6bf9349641d4cecfc15a3bd191fa228b5617" }
+tpt-av-cadence-vorbis = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "95ff6bf9349641d4cecfc15a3bd191fa228b5617" }
+tpt-av-cadence-ogg = { git = "https://github.com/tpt-solutions/tpt-cadence", rev = "95ff6bf9349641d4cecfc15a3bd191fa228b5617" }
 tpt-av-test-reference = { git = "https://github.com/tpt-solutions/tpt-av-test", path = "tpt-av-test-reference" }
 
 # ---------------------------------------------------------------------------

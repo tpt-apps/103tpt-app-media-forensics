@@ -20,14 +20,14 @@
 //! bounded instead by [`MAX_MOOV_BYTES`]. Sample-level work does need the
 //! encoded bytes and keeps its own bound, [`MAX_SAMPLED_BYTES`].
 use tpt_app_media_forensics_model::{
-    ChromaSubsampling, CodecInfo, MediaTime, PixelFormat, Rational, StreamAnalysis, StreamTiming,
-    Timebase, VideoFormat,
+    ChromaSubsampling, CodecInfo, MediaTime, PixelFormat, Rational, StreamAnalysis, StreamKind,
+    StreamTiming, Timebase, VideoFormat,
 };
 use tpt_kinetix_core::codec::CodecId;
 use tpt_kinetix_demux::mp4::{Mp4Demuxer, Mp4Track};
 
 use crate::error::ContainerError;
-use crate::probe::stream_kind_of;
+use crate::probe::{stream_kind_of, ContainerFormat};
 
 /// Largest file this inspector will load into memory.
 ///
@@ -42,9 +42,20 @@ pub const MAX_INSPECTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// make the engine allocate without limit.
 pub const MAX_EXPANDED_SAMPLES: usize = 8_000_000;
 
-/// The result of inspecting an MP4 container.
+/// The result of inspecting a container, whatever the format.
+///
+/// Deliberately format-neutral. It was once named `Mp4Inspection`, which
+/// became a lie the moment WebM support landed: a report that labelled a
+/// Matroska file's own inspection result "MP4" would assert a container format
+/// that the file demonstrably is not, in a tool whose entire purpose is not
+/// asserting things the evidence does not support.
+///
+/// [`crate::probe`] is the single source of truth for which format a file is;
+/// this type describes whatever that file turned out to contain.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Mp4Inspection {
+pub struct ContainerInspection {
+    /// The container format actually parsed.
+    pub format: ContainerFormat,
     /// The streams recovered from the file, in container order.
     pub streams: Vec<StreamAnalysis>,
     /// Frame timing and keyframe positions per recovered stream, in the same
@@ -52,8 +63,35 @@ pub struct Mp4Inspection {
     pub frame_info: Vec<Option<TrackFrameInfo>>,
     /// Observed problems, recorded rather than raised (spec §30).
     pub anomalies: Vec<String>,
-    /// Number of `trak` boxes the container declared.
+    /// Number of tracks the container declared.
     pub declared_track_count: usize,
+}
+
+impl ContainerInspection {
+    /// Builds an inspection result, recording that no tracks were recovered.
+    ///
+    /// An empty container is a finding, not a parse failure: a file that parses
+    /// cleanly and contains no usable tracks has been successfully measured as
+    /// having none.
+    #[must_use]
+    pub fn empty(format: ContainerFormat) -> Self {
+        Self {
+            format,
+            streams: Vec::new(),
+            frame_info: Vec::new(),
+            anomalies: vec!["container declared no usable tracks".to_owned()],
+            declared_track_count: 0,
+        }
+    }
+
+    /// Returns the first video stream's frame timing, if any.
+    #[must_use]
+    pub fn first_video_frames(&self) -> Option<&crate::TrackFrameInfo> {
+        self.streams
+            .iter()
+            .position(|s| s.kind == StreamKind::Video)
+            .and_then(|index| self.frame_info.get(index)?.as_ref())
+    }
 }
 
 /// Inspects an MP4 file that has already been read into memory.
@@ -61,8 +99,8 @@ pub struct Mp4Inspection {
 /// # Errors
 ///
 /// Returns an error only when the container itself cannot be opened. Malformed
-/// *tracks* are reported through [`Mp4Inspection::anomalies`], not errors.
-pub fn inspect_bytes(data: Vec<u8>) -> Result<Mp4Inspection, ContainerError> {
+/// *tracks* are reported through [`ContainerInspection::anomalies`], not errors.
+pub fn inspect_bytes(data: Vec<u8>) -> Result<ContainerInspection, ContainerError> {
     let demuxer = Mp4Demuxer::new(data).map_err(|e| ContainerError::Parse(e.to_string()))?;
     let tracks = demuxer.tracks();
 
@@ -78,7 +116,8 @@ pub fn inspect_bytes(data: Vec<u8>) -> Result<Mp4Inspection, ContainerError> {
         anomalies.push("container declared no usable tracks".to_owned());
     }
 
-    Ok(Mp4Inspection {
+    Ok(ContainerInspection {
+        format: ContainerFormat::IsoBmff,
         streams,
         frame_info,
         anomalies,
@@ -92,7 +131,7 @@ pub fn inspect_bytes(data: Vec<u8>) -> Result<Mp4Inspection, ContainerError> {
 ///
 /// Returns an error if the file cannot be read, or if it exceeds
 /// [`MAX_INSPECTED_BYTES`].
-pub fn inspect_file(path: &std::path::Path) -> Result<Mp4Inspection, ContainerError> {
+pub fn inspect_file(path: &std::path::Path) -> Result<ContainerInspection, ContainerError> {
     let metadata = std::fs::metadata(path)
         .map_err(|e| ContainerError::io("stat container", path.display().to_string(), e))?;
 
@@ -185,20 +224,41 @@ fn fourcc_string(fourcc: [u8; 4]) -> String {
 /// (spec §26).
 fn convert_timing(track: &Mp4Track) -> StreamTiming {
     let timebase = Timebase::from_ticks_per_second(track.timescale.max(1));
-    let duration = track
-        .duration
-        .checked_div(u64::from(track.timescale.max(1)));
-
     StreamTiming {
         timebase,
         start_time: MediaTime::ZERO,
-        duration: duration.map(|secs| {
-            MediaTime::from_micros(
-                i64::try_from(secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX),
-            )
-        }),
+        duration: ticks_to_media_time(track.duration, track.timescale),
+        measured_duration: measured_duration(track),
         edit_list_offset: None,
     }
+}
+
+/// Converts a duration in `timescale` units to microseconds.
+///
+/// Kept exact rather than rounded to whole seconds. The previous code truncated
+/// with `checked_div(timescale)` first, which discarded sub-second precision and
+/// would have hidden exactly the small disagreements this
+/// declared-versus-measured comparison exists to surface.
+fn ticks_to_media_time(ticks: u64, timescale: u32) -> Option<MediaTime> {
+    if ticks == 0 {
+        return None;
+    }
+    let micros = u128::from(ticks).saturating_mul(1_000_000) / u128::from(timescale.max(1));
+    i64::try_from(micros).ok().map(MediaTime::from_micros)
+}
+
+/// The duration the sample tables actually describe, from `stts`.
+///
+/// This is the measured side: every sample's own delta, summed. It is computed
+/// independently of `mdhd`, so the two can genuinely disagree.
+fn measured_duration(track: &Mp4Track) -> Option<MediaTime> {
+    let total: u64 = track
+        .stts
+        .entries
+        .iter()
+        .map(|entry| u64::from(entry.sample_count) * u64::from(entry.sample_delta))
+        .sum();
+    ticks_to_media_time(total, track.timescale)
 }
 
 /// Converts video properties, including the measured frame rate.
@@ -388,10 +448,12 @@ pub fn read_samples(data: Vec<u8>) -> Result<Vec<SampleRecord>, ContainerError> 
     use tpt_app_media_forensics_model::Timebase;
     use tpt_kinetix_demux::{Demuxer as _, Mp4Demuxer};
 
+    let file_len = data.len();
     let mut demuxer = Mp4Demuxer::new(data).map_err(|e| ContainerError::Parse(e.to_string()))?;
     let tracks = demuxer.tracks().to_vec();
 
     let mut per_stream_index = vec![0u32; tracks.len()];
+    let mut consumed = 0usize;
     let mut out = Vec::new();
 
     loop {
@@ -400,6 +462,21 @@ pub fn read_samples(data: Vec<u8>) -> Result<Vec<SampleRecord>, ContainerError> 
             Ok(None) => break,
             Err(_) => break, // Truncated or damaged: keep what was recovered.
         };
+
+        // A packet with no bytes cannot advance a reader, so one that keeps
+        // producing them will never end the loop. Stop, but keep what was read:
+        // a truncated file is evidence, not a failure.
+        if packet.size() == 0 {
+            break;
+        }
+
+        consumed += packet.size();
+        if consumed > file_len || consumed > MAX_SAMPLE_BYTES {
+            return Err(ContainerError::Parse(format!(
+                "the demuxer reported {consumed} bytes of samples from a {file_len}-byte file; \
+                 it is not advancing, so the packets cannot be trusted"
+            )));
+        }
 
         let Some(track) = tracks.get(packet.stream_index as usize) else {
             continue;
@@ -425,6 +502,15 @@ pub fn read_samples(data: Vec<u8>) -> Result<Vec<SampleRecord>, ContainerError> 
 
     Ok(out)
 }
+
+/// Ceiling on sample bytes accepted from one file.
+///
+/// Not a limit on file size: a legitimate file can never yield more sample
+/// bytes than it contains. Exceeding this means the reader is re-reading or
+/// inventing packets rather than advancing, which is not damaged evidence but a
+/// malfunction — and the recovered samples would be fabricated. Reported as an
+/// error so the caller records a limitation instead of analysing nonsense.
+const MAX_SAMPLE_BYTES: usize = 1 << 31;
 
 /// Formats a digest as lowercase hex.
 fn digest_hex(digest: &[u8]) -> String {
@@ -568,7 +654,7 @@ fn read_up_to(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or carries no usable `moov`.
-pub fn inspect_path(path: &std::path::Path) -> Result<Mp4Inspection, ContainerError> {
+pub fn inspect_path(path: &std::path::Path) -> Result<ContainerInspection, ContainerError> {
     inspect_bytes(read_moov(path)?)
 }
 

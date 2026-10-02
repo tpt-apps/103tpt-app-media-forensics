@@ -747,3 +747,92 @@ fn batch_writes_a_bundle_over_every_file_in_the_case() {
         );
     }
 }
+
+/// Builds a minimal WebM document with one VP9 track.
+fn webm_bytes() -> Vec<u8> {
+    let mut track_entry = vec![0xD7, 0x81, 1, 0x83, 0x81, 1, 0x86, 0x80 | 5];
+    track_entry.extend_from_slice(b"V_VP9");
+
+    let mut tracks_body = vec![0xAE, 0x80 | track_entry.len() as u8];
+    tracks_body.extend_from_slice(&track_entry);
+
+    let mut cluster = vec![0xE7, 0x81, 0x00];
+    for (index, is_key) in [true, false, true].into_iter().enumerate() {
+        let mut block = vec![0x81];
+        block.extend_from_slice(&((index as u16) * 33).to_be_bytes());
+        block.push(u8::from(is_key) << 7);
+        block.extend_from_slice(&[index as u8 + 1, 0xAA]);
+        cluster.extend_from_slice(&[0xA3, 0x80 | block.len() as u8]);
+        cluster.extend_from_slice(&block);
+    }
+
+    let mut segment = vec![0x16, 0x54, 0xAE, 0x6B, 0x80 | tracks_body.len() as u8];
+    segment.extend_from_slice(&tracks_body);
+    segment.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75, 0x80 | cluster.len() as u8]);
+    segment.extend_from_slice(&cluster);
+
+    let mut doc = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x18, 0x53, 0x80, 0x67];
+    doc.push(0x80 | segment.len() as u8);
+    doc.extend_from_slice(&segment);
+    doc
+}
+
+#[test]
+fn inspect_reports_a_webm_container_and_its_streams() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let path = fixture(tmp.path(), "clip.webm", &webm_bytes());
+
+    let output = cli().arg("inspect").arg(&path).output().expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "a WebM file must inspect cleanly: {stderr}");
+    assert!(stdout.contains("matroska"), "{stdout}");
+    assert!(
+        stdout.contains("vp09"),
+        "the VP9 tag must be reported: {stdout}"
+    );
+    // The decisive line: WebM is no longer an unintegrated format.
+    assert!(
+        !stdout.contains("not integrated yet"),
+        "WebM has a demuxer now: {stderr}"
+    );
+}
+
+#[test]
+fn inspect_json_reports_the_webm_container_tag() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let path = fixture(tmp.path(), "clip.webm", &webm_bytes());
+
+    let output = cli()
+        .args(["inspect", "--json"])
+        .arg(&path)
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "{stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{stdout}"));
+    assert_eq!(value["container"], "matroska");
+    assert_eq!(value["stream_count"], 1);
+    assert_eq!(value["streams"][0]["codec"]["name"], "vp09");
+}
+
+#[test]
+fn a_renamed_webm_file_is_reported_as_a_mismatch() {
+    // The whole point of signature-based detection: a renamed file is a finding.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let path = fixture(tmp.path(), "actually_webm.mp4", &webm_bytes());
+
+    let output = cli().arg("inspect").arg(&path).output().expect("runs CLI");
+    let (_, stdout, stderr) = split(output);
+
+    assert!(
+        stdout.contains("matroska"),
+        "the bytes decide, not the name: {stdout}"
+    );
+    assert!(
+        stderr.contains("DOES NOT MATCH") || stdout.contains("DOES NOT MATCH"),
+        "the rename must be reported: {stdout}{stderr}"
+    );
+}

@@ -1,6 +1,522 @@
 # Changelog
 
-All notable changes to this project are docum
+All notable changes to this project are documented in this file, following
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+[Semantic Versioning](https://semver.org/).
+
+#### The README claimed colour and HDR analysis that no reader performs
+- "Video analysis — structure, GOP layout, duplicate and near-duplicate
+  detection, scene changes, **colour and HDR signalling**" was listed under
+  "What it does". `ColourInfo` exists in `-model` and serialises, which is
+  presumably why the claim survived review: the types are right there
+- No reader populates it. `mp4.rs` assigns `colour: Default::default()` and
+  `is_hdr: false` on every track, so all five fields are empty for every file
+  analysed. The Matroska reader exposes no picture geometry at all
+- This is the same shape as the two unwired stages already fixed below: a
+  capability that is *modelled* but never *measured*. A report rendering a
+  `ColourInfo` would show an empty struct and read as "no colour information
+  found" rather than "never looked"
+- Moved to "Planned, not built" with the reason stated. The rule set never fired
+  on colour, so nothing downstream depended on the claim
+
+#### The guard could only fail in one direction, and had
+- `readme_claims.rs` maintained a denylist of capabilities that must not be
+  claimed. Its BLAKE3 entry read "declared as a dependency but never called" —
+  which stopped being true the moment `acquisition.rs` began hashing with it,
+  and nobody noticed until the README was read against the source
+- A denylist cannot detect a claim going stale in the other direction, which is
+  precisely how this file's own subject matter rots. It asserts absences, and
+  nothing verified the presences
+- Added `every_claimed_capability_exists_in_the_source`: twelve claimed
+  capabilities, each paired with the file that implements it, compared with
+  `include_str!` at compile time. A path that stops resolving is a build error
+  rather than a check that quietly matches nothing
+- Verified by breaking it rather than by reading it. Reintroducing the colour
+  claim failed two of the four tests by name; a deliberately wrong marker
+  (`pub fn probe`, a function that does not exist) was caught before the test
+  was trusted with anything real
+
+#### Three more capabilities were claimed in docs rather than code
+- `docs/architecture.md` listed `...-audio/ ... spectrum`, `...-video/ ... colour`,
+  and `...-core/ ... progress, cancellation`. The audio crate has no FFT, the
+  video crate has no colour reader, and `-core` contains no progress or
+  cancellation type at all — the last one had been true since the crate was
+  scaffolded
+- The audio crate's own module docs claimed "spectral measurement". This is the
+  sharpest of the four, because a crate-level doc comment is the thing a new
+  contributor reads first and trusts most
+- All corrected. The README's own gap table now carries colour/HDR, which is
+  where a reader would look for it
+
+#### Seven `todo.md` boxes were ticked for work already shipped
+- Acquisition (both digests, timestamps, filesystem metadata), near-duplicate
+  detection, scene-change analysis, report generation, the CLI, batch mode, the
+  Finding model, and the reproducibility verification were all implemented and
+  all still unchecked
+- A checklist that under-reports is as misleading as a README that over-reports,
+  and it costs more: it hides the work from anyone planning the next phase. Two
+  entries are now `[~]` partial rather than falsely `[x]` or falsely `[ ]` —
+  §14 video analysis is done except colour, and §55–56 is done for bounded
+  memory but has no workers, cancellation or progress
+- The reasons are recorded inline against each box rather than left to be
+  rediscovered, so the next reader learns *why* something is partial
+
+#### A rule that was wired, declared, documented — and unfireable
+- `VIDEO.BITRATE_DROP` passed every guard this project has. `required_inputs` was
+  declared, the stage was called, `BundleInput::Bitrate` was populated, and the
+  stage guard confirmed it. It still could not fire on any file
+- Cause: every fixture gave every sample the same 100 bytes, so the whole corpus
+  held one flat bitrate. This is the same defect `repeated_frames` was added for,
+  one analysis layer up
+- The stage guard cannot see this class. It asks whether an input is *populated*,
+  and a report describing a bitrate that never varies is perfectly populated.
+  Populated is not the same as *interesting*
+- Added `the_corpus_contains_a_file_the_bitrate_rule_can_fire_on`, which runs the
+  pipeline over every fixture and asserts at least one makes the rule fire. It is
+  the general shape of the missing check: not "is this input reachable" but "can
+  this rule ever say anything"
+
+#### `stsz` declared every sample the same size regardless of its contents
+- The bitrate fixture was built by shrinking sample payloads, and the rule still
+  found nothing. The `stsz` box wrote `SAMPLE_BYTES` for all entries — the size
+  the payload *usually* had, not the size it *had*
+- So the container declared a perfectly uniform bitrate while its `mdat` varied.
+  The analysis is correct; it was reading a table that lied
+- Invisible to every existing test, because nothing had read sample *sizes* before
+  — duplicate detection reads digests, GOP analysis reads timestamps, and both are
+  blind to a wrong `stsz`. A fixture defect that only a new analysis layer can
+  surface
+- `stsz` now derives each entry from `sample_payload(index).len()`. Worth noting
+  what this class of defect is: the fixture corpus had been encoding a
+  *contradiction* between two boxes, and only one consumer of those boxes could
+  tell
+
+#### `total_bytes` used `sum()` and panicked on hostile input
+- `samples.iter().map(|s| s.size).sum()` overflows on four `u64::MAX` entries:
+  panic in debug, silent wrap in release
+- Caught by `absurd_sample_sizes_do_not_panic`. Sample sizes come from an
+  attacker-controlled table, so this is the direction that matters — and a wrapped
+  total would report a small, entirely plausible bitrate for an enormous file,
+  which is the worst way for this particular number to be wrong
+- Now `saturating_add`. The same test asserts only that the call survives, because
+  pinning the exact saturated value would only encode the current implementation
+
+#### Two types derived `Eq` over `f64`
+- `BitrateReport` and `BitrateAnomaly` both derived `PartialEq, Eq` while holding
+  bitrate measurements as `f64`. `Eq` on floats is not a relation to rely on, and
+  a future `Hash` or `Ord` derive would have produced silently wrong ordering
+- Caught by the compiler, not by review — the first sign that deriving `Eq` over a
+  measurement is a category error rather than a style choice
+
+#### Fourteen rules have no fixture that triggers them
+- The bitrate guard I added was one rule. Generalised it to every rule, and the
+  first run reported **19 of 26 could not fire**. Two of those four extra were my
+  test's fault: it filtered to ISO-BMFF, so the audio and Tier-2 rules were judged
+  against fixtures that cannot possibly trigger them. Fixed, and the real number
+  is 15
+- All 15 are tested — `new_rules.rs` exercises each against a hand-assembled
+  `AnalysisBundle`. So my first version of the test, which said they were
+  "untestable" and should be "removed", was simply wrong, and the message would
+  have been quoted back at whoever read it
+- The real gap is narrower and worth stating precisely: those rules are tested
+  against state the test *builds*, never state the pipeline *produces*. A
+  hand-built bundle can drift from what the pipeline actually fills in, and the
+  existing guards catch only the extreme case (a stage never called)
+- Recorded as `NO_END_TO_END_FIXTURE` rather than fixed. Closing it is roughly
+  fifteen fixtures, each built to trip one rule. The list exists so that cost is
+  visible and so a *newly* inert rule fails instead of joining the list quietly
+- The test asserts both directions. Adding a firing rule to the list fails with
+  "now fire end to end"; removing its fixture fails with "not recorded". A gap
+  list that silently keeps solved entries is worse than no gap list at all
+
+#### The demuxer cannot tell you where a file stopped being trustworthy
+- Spec §30 asks for corruption detection with graceful continuation. What shipped
+  was `ContainerInspection::anomalies: Vec<String>`, populated by one check: an
+  empty track list. A file truncated mid-`mdat` produced **no** anomaly at all
+- The reason is structural. `tpt-kinetix-demux` stops when the bytes stop making
+  sense and returns the tracks it managed to read as a success. That is correct
+  for a player. For an examination it is the wrong answer, because the demuxer
+  has by construction lost the boundary — it cannot report where it gave up
+- So the scan is a shallow, independent walk of the top-level box list
+  (`-container/src/damage.rs`). Shallow deliberately: a damaged file's inner
+  structure is exactly what cannot be trusted, and a recursive descent is how a
+  malformed file turns an examination into a crash (spec §75)
+- Typed rather than free text. `StructuralDamage` carries the byte offsets and
+  the declared-vs-available numbers, so "truncated" is distinguishable from "has
+  unaccounted bytes" — a distinction a string cannot express and an examiner
+  needs, because only the first means content is missing
+- Two rules at deliberately different severities. `CONTAINER.TRUNCATED_MEDIA` is
+  Critical/High: the media the file describes is absent, so every other
+  measurement from it is partial by construction. `CONTAINER.STRUCTURAL_DEFECT` is
+  Warning/Medium: appended data is a legitimate technique and does not mean
+  content is missing. Grading both Critical would have diluted the one finding
+  that genuinely is
+
+#### The damage scan reports a box-size of 0 as damage in a valid file
+- ISO-BMFF defines a size field of 0 as "this box runs to the end of the file",
+  and 1 as "a 64-bit size follows the type field". Both are legal
+- The first version treated 0 as a literal size, so any file using the
+  end-of-file form was reported as defective. That is the dangerous direction for
+  this guard: a scanner that flags valid files trains an examiner to ignore it
+- Caught by `a_size_of_zero_means_extent_to_end_of_file_not_a_defect`, written
+  specifically because the case is easy to get wrong and invisible otherwise
+
+#### One defect was being reported as two
+- After finding truncation, the walk left `offset` pointing at the shortfall, and
+  the trailing-data check then reported those same bytes again as "unaccounted
+  for"
+- One defect, two findings, two severities — and severity counts are what a
+  dashboard leads with, so the duplication was not cosmetic
+- Fixed by consuming the remainder before breaking, with a comment saying why.
+  Both branches that `break` now do it
+
+#### A limitation that cannot be fixed, pinned so it is not silently relied on
+- Appended data of 8 bytes or more is indistinguishable from a further box: a box
+  is exactly a size followed by a type, and appended payloads frequently have that
+  shape. The scan parses it as a box header and reports what the bytes say
+- The alternative — treating leftover bytes as opaque — would hide genuine
+  trailing boxes, which are themselves a forensic signal. A reader that silently
+  discarded structure is worse than one that reports structure it may have
+  over-read, because the former cannot be detected from the report
+- `appended_data_long_enough_to_mimic_a_box_is_read_as_one` pins the behaviour so
+  a change to it has to be deliberate
+
+#### A doc comment described the opposite of what the code did
+- `BundleInput::is_populated` claimed "an empty `Vec` counts as populated ... the
+  stage ran and found nothing, which is a measurement". Every collection arm
+  returned `!is_empty()`, which is the opposite
+- The code was right and the comment was wrong: the guard asks whether a stage is
+  *reachable*, and a collection nothing ever fills means no fixture exercises it.
+  But a reader taking the comment at face value would conclude the guard could
+  not detect an unwired collection stage, which is precisely what it is for
+- Corrected, and the distinction between "populated" (guard reachability) and
+  "complete" (the bundle carrying an empty vector meaning *scanned and clean*) is
+  now spelled out
+
+#### A byte offset is not a timecode, and the engine now says which it has
+- Structural damage reports *where in the file* it was found. Spec §31 wants it on
+  an error timeline, which means a media time — and the two are only connected
+  through the sample table
+- `SampleIndex` walks the samples already read for duplicate detection (no extra
+  I/O) and resolves an offset to the sample containing it. `CONTAINER.TRUNCATED_MEDIA`
+  then sets `timeline_start` to that sample's presentation time
+- The placement carries its provenance. Offsets are **inferred** — an anchor plus
+  accumulated sample sizes — not read from `stco`, and `SampleOrigin` records which.
+  The finding says "offset inferred, not read from the chunk offset table" in its
+  own text, because a precise-looking timecode is exactly what a reader will trust
+- Where no sample index exists (file above the sampling bound), the finding carries a
+  byte offset and **no** timecode. Filling in `00:00:00` would read as a measured
+  position; `damage_without_a_sample_index_is_reported_without_a_timecode` pins that
+- The `mdat` anchor is read from the file's own box layout rather than assumed.
+  MP4 may place `mdat` before or after `moov`, and a constant anchor would shift
+  every sample position by whatever precedes it
+
+#### A test asserted the placement was non-zero, and was wrong
+- `damage_is_placed_on_the_timeline_when_samples_were_read` asserted the resolved
+  time was greater than zero "so the placement is not a fabricated zero"
+- It failed against correct code. The first sample of every file *is* at time zero,
+  and this fixture's damage falls inside that first sample's byte range
+- The assertion was the bug: it encoded an intuition about what a good placement
+  looks like rather than what makes one correct. Rewritten to assert the placement
+  equals the sample the index actually located — which checks the wiring rather than
+  a property of the data, and would still pass if the fixture changed
+
+#### The anchor walk stops at `moov`, so `mdat`-before-`moov` files get no placement
+- ISO-BMFF permits media data before the sample tables. The walk returns `None` at
+  `moov` to avoid descending into `mdat` payload looking for another `mdat`, which
+  means a file ordered that way gets an empty index and therefore byte offsets with
+  no timecode
+- Stated in `todo.md` rather than papered over. The alternative — continuing the
+  walk and hoping the bytes it finds are structure — is how a reader interprets
+  sample payload as boxes, which is the failure `NonPrintableBoxType` exists to
+  report
+
+#### The declared-versus-measured rule was returning nothing, always
+- `METADATA.DECLARED_VS_MEASURED_MISMATCH` was registered, documented, listed in
+  the rule inventory, and returned an empty vector. Twenty-three of twenty-three
+  rules were reachable on paper; one of them could not fire on any input
+- The cause was a modelling gap, not a missing `if`. The stream timing stored a
+  single duration, so after the reader had compared `mdhd` against the sample
+  table there was nothing left to report: the losing value had been discarded
+- Declared and measured are now separate fields on `StreamTiming`. Declared comes
+  from `mdhd`; measured is summed from every `stts` delta, computed independently
+  so the two can genuinely disagree
+- Reading `mdhd` also fixed a latent bug: the duration was divided down to whole
+  seconds before conversion, silently discarding sub-second precision — which
+  would have hidden exactly the small disagreements this rule exists to surface
+- The finding states both numbers and their difference, and asserts no cause. A
+  test asserts the text contains no accusatory vocabulary, so "it was tampered
+  with" cannot creep back in through a reworded summary
+- 100 ms of slack is allowed, because muxers round durations and a clean file is
+  not guaranteed an exact match. That trades some sensitivity for no false
+  alarms, which is stated at the constant rather than left for someone to
+  discover as a tuning question
+
+#### The guard now catches rules that under-declare, not just rules that under-wired
+- `required_inputs` was checked in one direction only: that every declared input
+  was reachable. A rule reading an analysis it had not declared was invisible.
+  That is the same silent failure as an unwired stage, one level removed, and it
+  was the last known hole in the guard
+- `stage_guard.rs` now reads `builtin.rs` as source, strips comments and string
+  literals, and compares each rule's `bundle.<field>` accesses against its
+  declaration. Calling `evaluate` cannot do this — it cannot know what the rule
+  would have read had the bundle been fuller, and Rust has no reflection to ask
+- A second direction: every optional field on `AnalysisBundle` must have a
+  matching `BundleInput`, so a new analysis cannot be added with no way to
+  declare it. `asset_id` is exempt by construction — it is always present and
+  identifies the asset rather than reporting on it
+- Both were verified by breaking them: three under-declarations, including one
+  declaring nothing at all, were reported in a single run; and a new bundle field
+  with no variant was named. Neither check had been run against a mutation
+  before, which is the only reason to believe they work
+- The scanner asserts it found exactly one block per registered rule. Without
+  that, a scanner that silently matched nothing would pass forever — the trap this
+  file exists to avoid, appearing inside the guard against it
+
+#### The README was claiming six things the engine does not do
+- It listed a comparison engine, BLAKE3 alongside SHA-256, spectral audio
+  analysis, and a corrupt-media corpus on disk. None existed. BLAKE3 is
+  declared as a dependency and never called; there is no comparison module
+  anywhere; the only mention of a spectrum is a doc comment; `fixtures/` and
+  `rules/` are empty placeholder directories the README described as populated
+- It also said "Opus and Vorbis are decoded" in the same sentence that named
+  Matroska as analysed. Vorbis is decoded from bare Ogg streams only — inside
+  a `.webm` it is identified and not measured. A reader would reasonably have
+  concluded otherwise
+- This was the project's own failure mode pointed the other way. The README
+  says "a tool that quietly omits a measurement is worse than one that names the
+  gap", and then quietly invented measurements. In forensic work a false
+  capability claim is worse than a missing feature: the report asserts a check
+  that never ran
+- Correcting the prose leaves it free to drift back, so
+  `-core/tests/readme_claims.rs` checks the claims against the code: a capability
+  the engine lacks may not appear under "What it does", the shipped and planned
+  lists may not overlap, and every codec the status paragraph calls decoded must
+  satisfy `is_decodable`. Verified by reintroducing three false claims, all
+  named in one run
+
+#### The A/V fixture was three separate defects wearing one coat
+- `build_mp4_av` spliced a second track into a finished single-track file. The
+  audio track's `mdat` was never copied, so its samples resolved to the *video's*
+  bytes; and growing `moov` moved the data the video's offset pointed at. Both
+  tracks also declared `track_id` 1
+- Every fix for this went in wrong at first, which is the real lesson. Locating
+  `stco` by walking the bytes failed three different ways: a flat scan found
+  nothing and returned `false` that the caller ignored; a recursive scan read the
+  entry count from the wrong word; and a rewrite briefly left the file with
+  `tkhd` and `mdia` sitting directly in `moov`, which parses as a file declaring
+  no tracks and looks entirely plausible in a hex dump
+- The builder no longer searches for anything. `build_trak` returns the position
+  of the chunk-offset value *as it assembles the boxes*, so the offset cannot be
+  mislocated, and one `mdat` holds every track's samples
+- `tests/av_fixture.rs` checks both tracks declare distinct in-range offsets
+  directly against the bytes, so the invariant holds even while the reader below
+  is broken. That test also had to stop searching for the text `mdat`: the
+  fixture's sample pattern happens to spell it, so a text search finds a box
+  that does not exist
+
+#### A demuxer that never returns is now a reported limitation
+- The upstream MP4 demuxer cannot read sample data from a valid two-track file.
+  It yields packets indefinitely, each with a plausible non-zero size, so no
+  simple check stops it — an analysis of such a file simply never finishes
+- `read_samples` now stops when a packet cannot advance the reader, and returns
+  an error when reported sample bytes exceed the file's own length. That second
+  test needs no tuning: a legitimate file cannot contain more sample bytes than
+  it has bytes. Reporting rather than returning is the point — the fabricated
+  samples it was producing would have reached the rules as evidence
+- A report that never arrives is indistinguishable from a clean file, which is
+  the one failure mode a forensic tool must not have
+
+#### The fixtures were lying about their own media data
+- Every synthetic MP4 wrote its `mdat` as a run of zero bytes. Every sample then
+  hashed identically, so duplicate detection reported **every** fixture as a
+  single 60-frame repeated run. A real detection, rendered indistinguishable
+  from noise on healthy input, and `VIDEO.DUPLICATE_FRAME_RUN` had never once
+  been exercised against a file that was meant to trigger it
+- Worse, the chunk offset table said `0`, so samples were read from the start of
+  the file — the demuxer was digesting the `ftyp` and `moov` bytes *as if they
+  were video frames*. Any test reasoning about sample content was reasoning
+  about the container. The chunk offset now points at the real first sample
+- Each sample gets its own payload, seeded so distinct samples cannot collide,
+  and `TrackSpec::repeated_frames` builds a file with a genuinely frozen
+  stretch. `build_mp4_with_repeated_frames(10, 15)` is that fixture
+- A clean fixture reporting zero duplicate frames is now a regression test. So
+  is a frozen run reporting its true length of 15 — the clean case alone would
+  pass with duplicate detection switched off entirely
+- `KNOWN_UNREACHABLE` is now empty. It last held `RepeatedRuns`, on the belief
+  that no fixture produced a repeated run; the fixtures were not lacking, they
+  were producing one each by accident. A documented-exceptions list can hide a
+  defect as easily as it records a limitation
+- One test was passing for the wrong reason and is now honest. It compared
+  finding *counts* between two fixtures raising unrelated findings, so the
+  totals tracked whatever else each happened to report. It asserts the GOP rule
+  fires on one and not the other
+
+#### A guard against analysis stages that are written but never called
+- Two stages shipped fully implemented, documented, and unit-tested, and that no
+  test could catch: `measure_audio` and `av_sync::analyse`. Nothing invoked
+  either, so six rules could not fire on any file, over any number of green
+  tests. The analyser was healthy and its caller was missing, which is exactly
+  what a unit test cannot see
+- `ForensicRule::required_inputs` is now mandatory, with no default. Every rule
+  declares the analysis it reads, so "which stage does this rule depend on?" is
+  answered in code rather than inferred from reading `evaluate`
+- `BundleInput` carries `is_populated`, and `AnalysisEngine::observe_stages`
+  exposes the bundle without the cache or persistence, so a test can ask *which
+  analyses ran* — which findings cannot distinguish from *found nothing*
+- `-core/tests/stage_guard.rs` runs the pipeline over a corpus that between them
+  exercises every stage, and fails naming the affected rules when a declared
+  input is never populated. Verified by unwiring the audio and A/V stages: it
+  caught both, naming all five dependent rules
+
+#### A/V synchronisation now runs, too (spec §23)
+- **A second dead stage.** `av_sync::analyse` is fully implemented, documented,
+  and tested — and nothing in the pipeline ever called it, so `bundle.sync` stayed
+  `None` and `TIMING.AV_SYNC_DRIFT` could not fire on any file. Same shape as the
+  audio gap: the unit under test was healthy and its caller was missing
+- `-core::run_av_sync` locates both tracks **by kind**. Taking the first two
+  streams would compare audio against video for most files and audio against
+  audio for the rest, and the second case yields a confident, meaningless zero
+  offset
+- A single-stream file raises no limitation at all: sync was never applicable,
+  which is a different statement from having been attempted and failed
+- `build_mp4_av` is a new two-track fixture, composed by splicing a second `trak`
+  into a single-track file rather than teaching the existing builder about
+  multiple tracks. Its audio delay is expressed through a real `elst` edit list,
+  because without one both tracks start at zero and there is nothing to measure —
+  a fixture that would have passed vacuously
+
+#### The pipeline now decodes audio, which it never did
+- **Four rules were permanently dead.** `AUDIO.CLIPPING`, `AUDIO.DC_OFFSET`,
+  `AUDIO.SILENCE_REGION`, and `AUDIO.INAUDIBLE` read `AnalysisBundle`'s
+  `audio_levels`, `silence`, and `loudness`. A `measure_audio` helper existed
+  and was **never called**, so those fields stayed `None` and every audio rule
+  returned early on every file. `analyze` on any media produced zero audio
+  findings, whatever the codec
+- Each rule had tests — all of which built the `AnalysisBundle` by hand. Nothing
+  exercised the missing step, so the suite was green over a feature that did
+  not run. `-core/tests/audio_pipeline.rs` now drives the real engine over a
+  real Opus-in-WebM file built with the foundation's own encoder
+- `measure_audio` now also computes silence regions, from the same PCM buffer as
+  the levels, and refuses a zero-channel stream rather than reporting zeroes
+
+#### Fixed: three container-blind measurements
+Writing the audio stage surfaced a family of bugs, all the same shape: a
+**video** measurement applied to whichever stream happened to be first
+- GOP structure and PTS scanning read `frame_info[0]` regardless of kind, so an
+  audio-only file got GOP analysis and `VIDEO.SINGLE_KEYFRAME` fired on it
+- Duplicate detection hashed samples from *every* stream into one flattened
+  sequence, so a run of identical silence packets in an audio track produced
+  `VIDEO.DUPLICATE_FRAME_RUN` — a video finding derived entirely from audio
+- Both now select the video stream explicitly. An audio-only file makes no video
+  claims at all, which `a_video_only_file_makes_no_audio_claims` and the silence
+  test assert from opposite directions
+
+#### Fixed: Opus inside a WebM container could not be decoded
+- A `.webm` file is Matroska, not Ogg. The audio stage handed the whole
+  container to an Ogg reader, which failed on the capture pattern — the two
+  formats share a lineage and nothing else
+- `-audio::decode_opus_packets` decodes demuxed access units directly, which is
+  the only correct path for container-carried Opus. Vorbis in Matroska is still
+  unimplemented and says so
+
+#### Tier-2 verified end to end on a real AV1 file (spec 16-18)
+- `-video/tests/tier2_end_to_end.rs`: 7 tests that encode genuine AV1 with the
+  foundation's rav1e-backed encoder, wrap it in a real WebM container, read it
+  back through `tpt-kinetix-demux`, and decode it to pixels. No ffmpeg required
+  on the build machine
+- This closed the gap the earlier work left open. Every previous Tier-2 test fed
+  synthetic frames straight to the analysers, which proves the analysers work
+  but proves nothing about whether a compressed stream survives the trip. The
+  decoder integration had only ever been unit-tested at its own adapters
+- `a_real_av1_webm_file_survives_the_whole_pipeline` covers the three seams no
+  other test crossed: container writer against demuxer, demuxer sample bytes
+  against decoder, and demuxer codec tag against Tier-2 dispatch
+- **VP9 remains structurally tested only.** The foundation ships no VP9 encoder,
+  so no genuine VP9 stream can be produced on this machine. That asymmetry is
+  stated in the test file and in `todo.md` rather than left to look like parity
+
+#### Fixed: the WebM fixture builder corrupted any real-sized payload
+- `build_webm` wrote every element size as a single byte, `0x80 | len`. That is
+  valid only below 127. At 128 it emits `0x80`, which a reader decodes as
+  *unknown size* and therefore swallows the rest of the file
+- Stub fixtures never reached the threshold, so only real encoded video exposed
+  it — and when it did, the file parsed as an empty track with no error anywhere.
+  A fixture that silently stops exercising the demuxer is worse than no fixture
+- Replaced with a correct EBML variable-length integer encoder that picks the
+  narrowest width and avoids the all-ones "unknown size" value at each width
+- Two regression tests: payloads straddling every width boundary, and a direct
+  round trip of the encoder across those boundaries
+
+#### Fixed: `DecodedFrame` mixed `u32` and `usize` for its two dimensions
+- `width` was `u32` and `height` was `usize`, while every other type in the
+  codebase (`VideoFormat`, the Kinetix `VideoFrame`) uses `u32` for both. Every
+  caller had to cast one of the two, and the analyser code was visibly
+  juggling `width as usize` against a bare `height` — easy to mix up a width for
+  a height in an index computation
+- Both are now `u32`. `luma_at` computes its stride once instead of re-casting
+  on every access
+
+#### Matroska / WebM container support (spec 12, 13, 24)
+- `-container::mkv`: a new inspection path beside `mp4.rs`, wrapping
+  `tpt-kinetix-demux::mkv`. Wired into the pipeline and the CLI, so a WebM file
+  is analysed rather than reported as an unintegrated format
+- **The reader exposes keyframes, timestamps, and sample bytes — and nothing
+  else.** No picture geometry, no frame rate, no sample rate. Those are reported
+  as unmeasured (`video: None`, `sample_rate: 0`) rather than defaulted. A
+  placeholder resolution in a forensic report is worse than an admitted gap
+- Keyframe flags can be under-counted: plain `Block` elements are always
+  reported as non-key by the reader, so a reference-block file shows fewer
+  keyframes than it has. Recorded as an anomaly rather than as a finding about
+  the file, because it is an artefact of this reader
+- Timestamps are millisecond-resolution, coarser than an MP4 `mdhd` timescale.
+  The timebase is recorded so a comparison against an MP4 of the same content
+  does not mistake the resolution for a timing discrepancy
+- `Mp4Inspection` became `ContainerInspection`. The old name became a lie the
+  moment WebM landed: labelling a Matroska file's own inspection result "MP4"
+  would assert a container format the file demonstrably is not
+- Sample bytes are read once and reused. Tier-2 previously re-read the file
+  that duplicate detection had just parsed; it now decodes from the same bytes
+- 27 MKV tests plus 4 pipeline and 3 CLI tests, covering determinism, truncated
+  prefixes, and a real end-to-end WebM analysis
+
+#### Royalty-free audio decode: Opus and Vorbis (spec 19, 21)
+- `-audio::decode`: Opus and Vorbis decode through the foundation's encoders and
+  decoders. AAC is deliberately absent, mirroring the video-side rule — a
+  patent encumbrance is a reason not to ship the decoder, not a reason to
+  pretend the audio was measured
+- The refusal is worded as a policy, not a failure: "we do not decode this" and
+  "we could not decode this" are different statements and only one is true here
+- Channel count and sample rate always come from the stream's own headers, never
+  from the container's description or the caller's guess. A container that
+  disagrees with its own bitstream is a finding, not something to paper over
+- Decode is bounded, and hitting the bound sets `truncated`. Silently returning a
+  prefix would let a report describe a fragment as the track
+- The CLI `audio` command detects the codec from the file's bytes, not its
+  extension
+- 8 round-trip tests encode real streams with the foundation's own encoders and
+  decode them back. Found a genuine property along the way: **lossy Opus decode
+  overshoots full scale** (peak 1.0166 for a full-scale tone), which is why the
+  peak assertion is bounded rather than `<= 1.0`
+
+#### Documentation corrections
+- `docs/rules.md` said twenty-one rules; `builtin_rules()` registers twenty-three.
+  The list is now complete and a test asserts it matches the registered set, so
+  the document cannot drift from the code again
+- `docs/foundation.md` listed VP9, AV1, and the audio codecs as "not yet
+  integrated". They are integrated; the section now records what the Matroska
+  reader does and does not expose
+#### Royalty-free decoders only
+- Dropped the H.264 decoder (`tpt-kinetix-h264`, now `out-kinetix-h264` and unpublished upstream)
+  because H.264 encode and decode are patent-encumbered. Tier-2 pixel analysis now decodes
+  VP9 (`tpt-kinetix-vp9`) and AV1 (`tpt-kinetix-av1`), both reported `pixel_exact` upstream.
+- `-video::decode`: `DecodeSession` dispatches by codec tag. `is_h264` became `is_decodable`,
+  and `DecodeSession::capabilities` takes a codec. Only 8-bit planar frames are used.
+- Removed the stderr-capture shim, which existed only for H.264's `PPS_PARSE_ERR` noise.
+- H.264, HEVC and AAC tracks are still identified and get Tier-1 analysis. They are never decoded.
+- Moved the `tpt-kinetix` pin to 28cefd8 and the `tpt-cadence` pin to 95ff6bf.
+  `AnalysisVersion::CURRENT` is now 2, so results cached before the change are not reused.
+
 #### Phase 1 - report generation and case persistence (spec 59-63, 66)
 #### Phase 1 - batch analysis (spec 48-49)
 #### Phase 1 - Tier-2 pixel analysis (spec 16-18)
@@ -337,8 +853,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   repositories. Spec §23 is therefore implemented directly in `-timing`.
   See `docs/foundation.md`.
 - `tpt-visual` requires a GPU, so it is not a dependency of the analysis path.
-- H.264 decoding is **integrated, never implemented**: `tpt-kinetix-h264` is
-  already bit-exact against ffmpeg. Its `pixel_exact` capability is honoured —
+- Decoding is **integrated, never implemented**: the VP9 and AV1 decoders are
+  already bit-exact against ffmpeg. (H.264 was dropped as patent-encumbered.)
+  The next sentence applies to them: Its `pixel_exact` capability is honoured —
   Tier-2 measurements are withheld rather than computed on approximate frames.
 - When a pinned `rev` moves, `AnalysisVersion::CURRENT` must be reviewed and
   bumped if any analysis result could change, so cached results are never

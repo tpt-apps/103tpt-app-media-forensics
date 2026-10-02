@@ -7,7 +7,7 @@
 
 use tpt_app_media_forensics_model::{Confidence, Finding, MediaTime, Observation, Severity};
 
-use crate::engine::{finding_id, AnalysisBundle, ForensicRule};
+use crate::engine::{finding_id, AnalysisBundle, BundleInput, ForensicRule};
 use crate::profile::RuleProfile;
 
 /// Builds a finding from the engine's standard parts.
@@ -41,10 +41,226 @@ fn finding(
     }
 }
 
+/// Reports a window whose bitrate falls well below the file's average.
+///
+/// Modelled directly on spec §29's worked example, which gives the shape of the
+/// finding the specification wants:
+///
+/// ```text
+/// Average: 8.2 Mbps
+/// Segment: 00:17:31 - 00:17:34
+/// Observed: 1.1 Mbps
+/// ```
+///
+/// The finding reproduces those three numbers and stops there. Spec §29 lists
+/// the possible explanations itself — low-complexity content, a still shot — and
+/// choosing between them is not something the engine can do from a size table.
+pub struct BitrateDrop;
+
+impl ForensicRule for BitrateDrop {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Bitrate]
+    }
+    fn id(&self) -> &'static str {
+        "VIDEO.BITRATE_DROP"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether any window of the file carries a bitrate substantially below \
+         the file's own average."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A sustained drop in bitrate marks a region that compresses far more \
+         easily than the rest of the file, which is where a splice, a freeze, or \
+         a change of encoder would appear."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(report) = &bundle.bitrate else {
+            return Vec::new();
+        };
+
+        report
+            .anomalies
+            .iter()
+            .map(|anomaly| {
+                let ratio = anomaly.ratio_to_average().unwrap_or_default();
+                let mut measurements = vec![
+                    format!("average: {}", megabits(anomaly.average_bps)),
+                    format!(
+                        "segment: {} to {}",
+                        anomaly.start.to_timecode(),
+                        anomaly.end.to_timecode()
+                    ),
+                    format!("observed: {}", anomaly.describe_mbps()),
+                    format!("{:.0}% of the file average", ratio * 100.0),
+                ];
+
+                // The keyframe count travels with the finding because it is the
+                // first thing that should be ruled out: a window whose low rate
+                // is simply a quiet stretch between two keyframes is a different
+                // observation from one where the content stopped changing.
+                if anomaly.keyframes == 0 {
+                    measurements.push(
+                        "this window contains no keyframe, so the rate reflects \
+                         inter-frame coding rather than keyframe size"
+                            .to_owned(),
+                    );
+                }
+
+                finding(
+                    self.id(),
+                    bundle,
+                    // Warning, not Significant. Spec §29's own example is a
+                    // low-complexity segment, which is benign far more often than
+                    // not; grading it Significant would make the rule cry wolf on
+                    // every static shot.
+                    Severity::Warning,
+                    // High for the numbers, which are measured directly from the
+                    // sample table with no interpretation.
+                    Confidence::High,
+                    "Bitrate falls well below the file average".to_owned(),
+                    measurements,
+                    Some(anomaly.start),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Renders bits per second in Mbps with two decimal places.
+fn megabits(bits_per_second: f64) -> String {
+    format!("{:.2} Mbps", bits_per_second / 1_000_000.0)
+}
+
+/// Reports a container whose declared structure runs past the end of the file.
+///
+/// The most consequential defect this engine can find: the media data the file
+/// describes is not present. Every other measurement drawn from the file is
+/// partial by construction, which is why the severity is `Critical` and why the
+/// finding says so explicitly rather than leaving the analyst to infer it.
+pub struct TruncatedMedia;
+
+impl ForensicRule for TruncatedMedia {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Damage, BundleInput::SampleIndex]
+    }
+    fn id(&self) -> &'static str {
+        "CONTAINER.TRUNCATED_MEDIA"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether any top-level box declares a size larger than the bytes the file \
+         actually contains."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A box that runs past the end of the file means declared media data is \
+         missing, so every other measurement taken from this file is partial."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        bundle
+            .damage
+            .iter()
+            .filter(|defect| defect.is_missing_data())
+            .map(|defect| {
+                // Where the damage starts is where the last readable sample
+                // ends, so that sample is the point an analyst needs. Without
+                // the sample table there is no timecode to give, and inventing
+                // one would put a precise-looking number on a guess.
+                let placed = bundle.sample_index.locate(defect.offset());
+                let at = placed.map(|position| position.time);
+
+                let mut measurements = vec![
+                    defect.describe(),
+                    "measurements from this file describe only the portion that \
+                     is present"
+                        .to_owned(),
+                ];
+                measurements.extend(placed.map(|position| {
+                    // The placement's provenance travels with it. An inferred
+                    // timecode presented like a measured one is the exact
+                    // confusion this engine exists to avoid.
+                    format!(
+                        "last readable sample at {} on stream {} (offset inferred, not read \
+                         from the chunk offset table)",
+                        position.time.to_timecode(),
+                        position.stream_index
+                    )
+                }));
+
+                finding(
+                    self.id(),
+                    bundle,
+                    // Critical rather than Significant: the file cannot be fully
+                    // analysed at all, and a report that scored this the same as
+                    // a GOP irregularity would misrepresent how much of the file
+                    // is actually present.
+                    Severity::Critical,
+                    // High, because this is arithmetic on the file's own declared
+                    // sizes. It does not depend on interpreting the media.
+                    Confidence::High,
+                    format!("Declared media data is missing ({})", defect.tag()),
+                    measurements,
+                    at,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Reports structural defects that do not amount to missing data.
+///
+/// Kept separate from [`TruncatedMedia`] because the severities are genuinely
+/// different. Unaccounted bytes or an unparseable box header are worth an
+/// examiner's attention but do not mean the file is incomplete, and grading them
+/// as `Critical` would dilute the one finding that genuinely is.
+pub struct StructuralDefect;
+
+impl ForensicRule for StructuralDefect {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Damage]
+    }
+    fn id(&self) -> &'static str {
+        "CONTAINER.STRUCTURAL_DEFECT"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether the container's box list contains bytes no declared structure \
+         accounts for, or a box whose declared size cannot be reconciled."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "Bytes outside any declared structure, or a box header that cannot be \
+         parsed, indicate the file's structure is not what it claims to be."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        bundle
+            .damage
+            .iter()
+            .filter(|defect| !defect.is_missing_data())
+            .map(|defect| {
+                finding(
+                    self.id(),
+                    bundle,
+                    // Warning, not Significant: the declared media may be entirely
+                    // present. Appending data to a file is a legitimate technique,
+                    // and this finding must not imply the content is missing.
+                    Severity::Warning,
+                    // Medium. The bytes are observed directly, but whether they
+                    // are damage or intentional padding is not decidable from the
+                    // file alone.
+                    Confidence::Medium,
+                    format!("Structural defect observed ({})", defect.tag()),
+                    vec![defect.describe()],
+                    None,
+                )
+            })
+            .collect()
+    }
+}
+
 /// Reports a change in GOP length at a located position.
 pub struct GopLengthChange;
 
 impl ForensicRule for GopLengthChange {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Gop]
+    }
     fn id(&self) -> &'static str {
         "VIDEO.GOP_LENGTH_CHANGE"
     }
@@ -88,6 +304,9 @@ impl ForensicRule for GopLengthChange {
 pub struct DuplicateFrameRun;
 
 impl ForensicRule for DuplicateFrameRun {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::RepeatedRuns]
+    }
     fn id(&self) -> &'static str {
         "VIDEO.DUPLICATE_FRAME_RUN"
     }
@@ -137,6 +356,9 @@ impl ForensicRule for DuplicateFrameRun {
 pub struct NonMonotonicPts;
 
 impl ForensicRule for NonMonotonicPts {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Timestamps]
+    }
     fn id(&self) -> &'static str {
         "TIMING.NON_MONOTONIC_PTS"
     }
@@ -180,6 +402,9 @@ impl ForensicRule for NonMonotonicPts {
 pub struct TimestampGap;
 
 impl ForensicRule for TimestampGap {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Timestamps]
+    }
     fn id(&self) -> &'static str {
         "TIMING.TIMESTAMP_GAP"
     }
@@ -221,6 +446,9 @@ impl ForensicRule for TimestampGap {
 pub struct AvSyncDrift;
 
 impl ForensicRule for AvSyncDrift {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Sync]
+    }
     fn id(&self) -> &'static str {
         "TIMING.AV_SYNC_DRIFT"
     }
@@ -270,6 +498,9 @@ impl ForensicRule for AvSyncDrift {
 pub struct MetadataConflict;
 
 impl ForensicRule for MetadataConflict {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Metadata]
+    }
     fn id(&self) -> &'static str {
         "METADATA.TIMESTAMP_CONFLICT"
     }
@@ -306,26 +537,87 @@ impl ForensicRule for MetadataConflict {
     }
 }
 
-/// Reports a measured frame rate differing from the declared one.
+/// How far a declared duration and a measured duration may differ before the
+/// disagreement is reported, in microseconds.
+///
+/// Not zero, on purpose. Muxers round durations when they write them, and a
+/// final sample may be a tick or two off its nominal length, so a well-formed
+/// file is not guaranteed an exact match. Without slack this rule would fire
+/// on ordinary rounding and train a reader to ignore it, which is worse than
+/// not having the rule at all.
+///
+/// The cost of the slack is real and worth stating: a genuine edit smaller
+/// than this window would pass unreported. That is a deliberate trade of some
+/// sensitivity for no false alarms on clean files, and it is why the constant
+/// is named and bounded rather than buried as a literal.
+const DURATION_AGREEMENT_TOLERANCE_MICROS: i64 = 100_000;
+
+/// Reports a stream whose declared duration disagrees with its measured one.
 pub struct DeclaredVsMeasuredMismatch;
 
 impl ForensicRule for DeclaredVsMeasuredMismatch {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "METADATA.DECLARED_VS_MEASURED_MISMATCH"
     }
     fn what_it_checks(&self) -> &'static str {
-        "Whether a track declares a frame rate that its own timing table does \
-         not support."
+        "Whether a stream's declared duration disagrees with the duration its \
+         own sample table adds up to."
     }
     fn why_it_matters(&self) -> &'static str {
-        "Declared and measured values that disagree indicate the container's \
-         description and its contents differ."
+        "A container whose header and sample table describe different lengths \
+         is describing something other than what it contains. The engine \
+         reports the disagreement and how far apart the two are, without \
+         claiming why they differ."
     }
-    fn evaluate(&self, _bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
-        // A track whose cadence varies yields no single measured rate; the
-        // engine reports that it could not be measured rather than guessing,
-        // so this rule stays quiet rather than inventing a disagreement.
-        Vec::new()
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(inspection) = &bundle.container else {
+            return Vec::new();
+        };
+        inspection
+            .streams
+            .iter()
+            .filter_map(|stream| {
+                // Either side missing is "could not compare", never
+                // "agrees". Treating an absent value as agreement would let a
+                // container with no readable sample table look clean.
+                let declared = stream.timing.duration?;
+                let measured = stream.timing.measured_duration?;
+                let drift = declared.signed_diff(measured).as_micros().abs();
+                if drift <= DURATION_AGREEMENT_TOLERANCE_MICROS {
+                    return None;
+                }
+                Some(finding(
+                    self.id(),
+                    bundle,
+                    Severity::Warning,
+                    // Both numbers were read straight from the container, so
+                    // the disagreement itself is certain. What it means is not,
+                    // and the summary below says only that they differ.
+                    Confidence::High,
+                    format!(
+                        "Stream {} ({}) declares {} but its sample table totals {}",
+                        stream.index,
+                        stream.kind.tag(),
+                        declared.to_timecode(),
+                        measured.to_timecode()
+                    ),
+                    vec![
+                        format!("timebase: {}", stream.timing.timebase),
+                        format!("declared (mdhd): {}", declared.to_timecode()),
+                        format!("measured (stts): {}", measured.to_timecode()),
+                        format!(
+                            "difference: {}{}",
+                            drift / 1_000,
+                            if drift % 1_000 == 0 { "ms" } else { "us" }
+                        ),
+                    ],
+                    None,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -333,6 +625,9 @@ impl ForensicRule for DeclaredVsMeasuredMismatch {
 pub struct NoUsableStreams;
 
 impl ForensicRule for NoUsableStreams {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "CONTAINER.NO_USABLE_STREAMS"
     }
@@ -366,6 +661,9 @@ impl ForensicRule for NoUsableStreams {
 pub struct ContainerAnomaly;
 
 impl ForensicRule for ContainerAnomaly {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "CONTAINER.MALFORMED_STRUCTURE"
     }
@@ -399,6 +697,9 @@ impl ForensicRule for ContainerAnomaly {
 pub struct AudioClipping;
 
 impl ForensicRule for AudioClipping {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::AudioLevels]
+    }
     fn id(&self) -> &'static str {
         "AUDIO.CLIPPING"
     }
@@ -435,6 +736,9 @@ impl ForensicRule for AudioClipping {
 pub struct AudioDcOffset;
 
 impl ForensicRule for AudioDcOffset {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::AudioLevels]
+    }
     fn id(&self) -> &'static str {
         "AUDIO.DC_OFFSET"
     }
@@ -471,6 +775,9 @@ impl ForensicRule for AudioDcOffset {
 pub struct AudioSilence;
 
 impl ForensicRule for AudioSilence {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Silence]
+    }
     fn id(&self) -> &'static str {
         "AUDIO.SILENCE_REGION"
     }
@@ -517,6 +824,9 @@ impl ForensicRule for AudioSilence {
 pub struct DeclaredTrackMismatch;
 
 impl ForensicRule for DeclaredTrackMismatch {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "CONTAINER.DECLARED_TRACK_MISMATCH"
     }
@@ -559,6 +869,9 @@ impl ForensicRule for DeclaredTrackMismatch {
 pub struct StreamDurationMissing;
 
 impl ForensicRule for StreamDurationMissing {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "CONTAINER.STREAM_DURATION_MISSING"
     }
@@ -606,6 +919,9 @@ impl ForensicRule for StreamDurationMissing {
 pub struct StreamStartOffset;
 
 impl ForensicRule for StreamStartOffset {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "CONTAINER.STREAM_START_OFFSET"
     }
@@ -663,6 +979,9 @@ impl ForensicRule for StreamStartOffset {
 pub struct ContainerAnomalyList;
 
 impl ForensicRule for ContainerAnomalyList {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "CONTAINER.PARSE_ANOMALY"
     }
@@ -706,6 +1025,9 @@ impl ForensicRule for ContainerAnomalyList {
 pub struct SingleKeyframe;
 
 impl ForensicRule for SingleKeyframe {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Gop]
+    }
     fn id(&self) -> &'static str {
         "VIDEO.SINGLE_KEYFRAME"
     }
@@ -742,6 +1064,9 @@ impl ForensicRule for SingleKeyframe {
 pub struct AllFramesKeyframes;
 
 impl ForensicRule for AllFramesKeyframes {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "VIDEO.ALL_FRAMES_KEYFRAMES"
     }
@@ -758,7 +1083,7 @@ impl ForensicRule for AllFramesKeyframes {
         };
         // `frame_info` is parallel to `streams`, so the two are zipped rather
         // than matched: a pointer comparison would be fragile, and the ordering
-        // is part of `Mp4Inspection`'s contract.
+        // is part of `ContainerInspection`'s contract.
         inspection
             .frame_info
             .iter()
@@ -792,6 +1117,9 @@ impl ForensicRule for AllFramesKeyframes {
 pub struct FrameRateChange;
 
 impl ForensicRule for FrameRateChange {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
     fn id(&self) -> &'static str {
         "VIDEO.FRAME_RATE_CHANGE"
     }
@@ -863,6 +1191,9 @@ impl ForensicRule for FrameRateChange {
 pub struct InaudibleAudio;
 
 impl ForensicRule for InaudibleAudio {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Loudness]
+    }
     fn id(&self) -> &'static str {
         "AUDIO.INAUDIBLE"
     }
@@ -905,6 +1236,9 @@ impl ForensicRule for InaudibleAudio {
 pub struct MissingCreationMetadata;
 
 impl ForensicRule for MissingCreationMetadata {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Metadata]
+    }
     fn id(&self) -> &'static str {
         "METADATA.MISSING_CREATION_TIME"
     }
@@ -985,6 +1319,9 @@ fn mode(values: &[i64]) -> Option<i64> {
 pub struct SceneChange;
 
 impl ForensicRule for SceneChange {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Scene]
+    }
     fn id(&self) -> &'static str {
         "VIDEO.SCENE_CHANGE"
     }
@@ -1040,6 +1377,9 @@ impl ForensicRule for SceneChange {
 pub struct NearDuplicateFrames;
 
 impl ForensicRule for NearDuplicateFrames {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::NearDuplicates]
+    }
     fn id(&self) -> &'static str {
         "VIDEO.NEAR_DUPLICATE_FRAME"
     }
@@ -1100,6 +1440,7 @@ pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
     vec![
         Box::new(AllFramesKeyframes),
         Box::new(AvSyncDrift),
+        Box::new(BitrateDrop),
         Box::new(AudioClipping),
         Box::new(AudioDcOffset),
         Box::new(AudioSilence),
@@ -1108,6 +1449,7 @@ pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
         Box::new(DeclaredTrackMismatch),
         Box::new(DeclaredVsMeasuredMismatch),
         Box::new(DuplicateFrameRun),
+        Box::new(StructuralDefect),
         Box::new(FrameRateChange),
         Box::new(GopLengthChange),
         Box::new(InaudibleAudio),
@@ -1121,5 +1463,6 @@ pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
         Box::new(StreamDurationMissing),
         Box::new(StreamStartOffset),
         Box::new(TimestampGap),
+        Box::new(TruncatedMedia),
     ]
 }

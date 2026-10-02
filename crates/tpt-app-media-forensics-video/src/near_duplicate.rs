@@ -84,7 +84,7 @@ impl NearDuplicateReport {
 #[must_use]
 pub fn hash_frame(frame: &DecodedFrame) -> PerceptualHash {
     let width = frame.width as usize;
-    let height = frame.height;
+    let height = frame.height as usize;
     if width < BLOCK || height < BLOCK {
         return PerceptualHash(0);
     }
@@ -181,7 +181,7 @@ mod tests {
             index,
             is_key_frame: index == 0,
             width: size as u32,
-            height: size,
+            height: size as u32,
             luma: vec![value; size * size],
         }
     }
@@ -199,7 +199,7 @@ mod tests {
             index,
             is_key_frame: index == 0,
             width: size as u32,
-            height: size,
+            height: size as u32,
             luma,
         }
     }

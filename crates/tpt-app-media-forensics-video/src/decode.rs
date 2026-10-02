@@ -2,9 +2,15 @@
 //!
 //! # Why decoding is delegated, never reimplemented
 //!
-//! `tpt-kinetix-h264` is a bit-exact H.264 decoder already verified against
-//! ffmpeg. Reimplementing it would be both worse and unnecessary, so this module
-//! adapts its output and nothing else. The analysis that produces findings lives
+//! `tpt-kinetix-vp9` and `tpt-kinetix-av1` are bit-exact decoders already
+//! verified against ffmpeg. Reimplementing them would be both worse and
+//! unnecessary, so this module adapts their output and nothing else.
+//!
+//! # Only royalty-free codecs are decoded
+//!
+//! VP9 and AV1 are the only codecs decoded here. H.264, HEVC and AAC are
+//! covered by patent pools, so those tracks are identified from the container
+//! and analysed at Tier 1, but never decoded. The analysis that produces findings lives
 //! in [`crate::near_duplicate`] and [`crate::scene`] and never sees a decoder.
 //!
 //! # Pixel-exactness gates everything
@@ -24,11 +30,13 @@
 //! stops decoding and is reported, rather than silently producing a partial
 //! result that reads as complete.
 
+use tpt_kinetix_av1::Av1Decoder;
 use tpt_kinetix_core::capabilities::DecoderCapabilities;
 use tpt_kinetix_core::frame::VideoFrame;
 use tpt_kinetix_core::packet::Packet;
+use tpt_kinetix_core::pixel_format::PixelFormat;
 use tpt_kinetix_core::timestamp::Timestamp;
-use tpt_kinetix_h264::H264Decoder;
+use tpt_kinetix_vp9::Vp9Decoder;
 
 /// Bounds on how much work a decode session will do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +68,7 @@ pub enum DecodeError {
         /// What the decoder reported.
         notes: String,
     },
-    /// The codec is not H.264, and no other decoder is integrated.
+    /// The codec has no integrated decoder.
     UnsupportedCodec {
         /// The codec tag as the container recorded it.
         codec: String,
@@ -93,7 +101,7 @@ impl std::fmt::Display for DecodeError {
         match self {
             Self::NotPixelExact { notes } => write!(
                 f,
-                "the H.264 decoder is not pixel-exact, so Tier-2 measurements would \
+                "the decoder is not pixel-exact, so Tier-2 measurements would \
                  describe the decoder rather than the media: {notes}"
             ),
             Self::UnsupportedCodec { codec } => {
@@ -114,66 +122,6 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// Runs `body` with this process's stderr captured, returning what it wrote.
-///
-/// The decoder's diagnostics are read here and discarded by the caller, having
-/// been recorded in the case's limitations. Duplicating stderr is avoided by
-/// pointing the descriptor at the null device for the duration rather than
-/// teeing it, so nothing is buffered unboundedly if a decoder is very chatty.
-///
-/// Not thread-safe: it redirects a process-wide descriptor. Decoding is
-/// single-threaded in this engine, and the redirect is restored before this
-/// returns.
-#[cfg(unix)]
-fn capture_stderr<T>(body: impl FnOnce() -> T) -> (String, T) {
-    use std::io::Read as _;
-
-    let mut saved = std::fs::File::from_raw_fd(libc_stderr_fd());
-    let sink = std::fs::File::create("/dev/null").expect("null device exists");
-    std::fs::rename("/dev/stderr", "/dev/stderr.tpt-saved").ok();
-    if std::fs::hard_link("/dev/stderr.tpt-saved", "/dev/null").is_err() {
-        // Restoring immediately is safer than running with stderr pointed at the
-        // null device for the rest of the process.
-        std::fs::rename("/dev/stderr.tpt-saved", "/dev/stderr").ok();
-        return (String::new(), body());
-    }
-    let _ = sink;
-
-    let outcome = body();
-
-    std::fs::rename("/dev/null", "/dev/null.tpt-sink").ok();
-    std::fs::rename("/dev/stderr.tpt-saved", "/dev/stderr").ok();
-    std::fs::rename("/dev/null.tpt-sink", "/dev/null").ok();
-
-    let mut captured = String::new();
-    let _ = saved.read_to_string(&mut captured);
-    (captured, outcome)
-}
-
-/// The process's stderr descriptor.
-#[cfg(unix)]
-const fn libc_stderr_fd() -> i32 {
-    2
-}
-/// Runs `body` with standard error redirected to the null device.
-///
-/// The Windows implementation is a no-op, and that is a deliberate choice.
-/// Redirecting the standard error handle needs `SetStdHandle`, which requires
-/// `unsafe` to call, and this crate forbids unsafe code. Introducing it to
-/// silence a cosmetic diagnostic would be the wrong trade.
-///
-/// The consequence on Windows: `tpt-kinetix-h264` prints `PPS_PARSE_ERR` to
-/// standard error when a parameter set will not parse and then carries on. Those
-/// lines reach the console. They are the decoder's, not this tool's, and the
-/// examination still completes with a success exit status, with the reason
-/// decoding produced nothing recorded in the case's limitations - which is where
-/// an analyst needs it. A stray debug line is a wart; a missing measurement
-/// would be a defect.
-#[cfg(not(unix))]
-fn capture_stderr<T>(body: impl FnOnce() -> T) -> (String, T) {
-    (String::new(), body())
-}
-
 /// The abort reason, carried so a caller can report it like any other failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeAbort {
@@ -189,16 +137,46 @@ impl std::fmt::Display for DecodeAbort {
 
 impl std::error::Error for DecodeAbort {}
 
-/// Wraps the foundation decoder's decode call.
+/// A decoder for one of the supported royalty-free codecs.
+enum Backend {
+    Vp9(Box<Vp9Decoder>),
+    Av1(Box<Av1Decoder>),
+}
+
+impl Backend {
+    /// Builds the decoder for `codec`, or `None` if it is not decodable here.
+    fn for_codec(codec: &str) -> Option<Self> {
+        match codec.to_ascii_lowercase().as_str() {
+            "vp09" | "vp9" => Some(Self::Vp9(Box::new(Vp9Decoder::new().with_strict(true)))),
+            "av01" | "av1" => Some(Self::Av1(Box::new(Av1Decoder::new().with_strict(true)))),
+            _ => None,
+        }
+    }
+
+    fn capabilities(&self) -> DecoderCapabilities {
+        match self {
+            Self::Vp9(decoder) => decoder.capabilities(),
+            Self::Av1(decoder) => decoder.capabilities(),
+        }
+    }
+
+    fn decode(&mut self, packet: &Packet) -> Result<Option<VideoFrame>, String> {
+        match self {
+            Self::Vp9(decoder) => decoder.decode(packet),
+            Self::Av1(decoder) => decoder.decode(packet),
+        }
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Wraps the decoder's decode call.
 ///
 /// # Why this exists
 ///
-/// Some Kinetix parse paths attach an `anyhow::Context` to an error instead of
-/// returning it. That construction captures a backtrace, and the capture path
-/// aborts the process. A malformed PPS in a deliberately damaged file therefore
-/// ended the whole examination instead of yielding a finding about the damage -
-/// which is the opposite of what a forensic tool must do with hostile input
-/// (spec §75).
+/// A decoder fed deliberately damaged input may panic rather than return an
+/// error. That would end the whole examination instead of yielding a finding
+/// about the damage, which is the opposite of what a forensic tool must do with
+/// hostile input (spec §75).
 ///
 /// Catching the unwind is the only way to contain it. It is not an error
 /// return, so no amount of `Result` matching will catch it. The frame is lost,
@@ -206,45 +184,20 @@ impl std::error::Error for DecodeAbort {}
 /// Withholding the remaining measurements is the correct outcome; ending the
 /// process is not.
 fn decode_guarded(
-    decoder: &mut H264Decoder,
+    backend: &mut Backend,
     packet: &Packet,
 ) -> Result<Option<VideoFrame>, DecodeAbort> {
-    // Two things are contained here, neither of which is a defect in this crate.
-    //
-    // The foundation decoder prints `PPS_PARSE_ERR` to stderr when a parameter
-    // set will not parse, then carries on. That is its internal diagnostic, not a
-    // failure of this tool, and an analyst reading the console would reasonably
-    // take it for one. It is captured rather than shown.
-    //
-    // And some of its parse paths attach an `anyhow::Context` to an error, which
-    // captures a backtrace, and the capture path aborts the process. Catching
-    // the unwind is the only way to contain that: it is not an error return, so
-    // no `Result` matching will catch it. The frame is lost, the session
-    // continues, and the caller records that decoding stopped. Withholding the
-    // remaining measurements is correct; ending the examination is not.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let captured = capture_stderr(|| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(packet)))
-    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.decode(packet)));
     std::panic::set_hook(previous_hook);
-    // `captured.0` is whatever the decoder wrote to stderr; it is retained here
-    // only to keep the abort distinguishable, and is reported by the caller as a
-    // limitation rather than printed.
-    let diagnostic = captured.0;
 
-    match captured.1 {
-        // The decoder returned a result: either frames or a parse error.
-        Ok(result) => result.map_err(|error| DecodeAbort {
-            detail: error.to_string(),
-        }),
+    match outcome {
+        // The decoder returned a result: either a frame or a parse error.
+        Ok(result) => result.map_err(|detail| DecodeAbort { detail }),
         // The decoder unwound. The frame is lost; the session continues.
         Err(_) => Err(DecodeAbort {
-            detail: if diagnostic.trim().is_empty() {
-                "the decoder unwound on this frame".to_owned()
-            } else {
-                format!("the decoder unwound on this frame: {}", diagnostic.trim())
-            },
+            detail: "the decoder unwound on this frame".to_owned(),
         }),
     }
 }
@@ -259,7 +212,12 @@ pub struct DecodedFrame {
     /// Luma plane width in pixels.
     pub width: u32,
     /// Luma plane height in pixels.
-    pub height: usize,
+    ///
+    /// Both dimensions are `u32` to match `VideoFormat` and the Kinetix
+    /// `VideoFrame`. They were previously `u32` and `usize` respectively, which
+    /// forced every caller to cast one of the two and made it easy to compare a
+    /// width against a height.
+    pub height: u32,
     /// Luma samples, `width * height` bytes in raster order.
     pub luma: Vec<u8>,
 }
@@ -271,23 +229,24 @@ impl DecodedFrame {
     /// decoded frame's dimensions are attacker-controlled.
     #[must_use]
     pub fn luma_at(&self, x: usize, y: usize) -> Option<u8> {
-        (x < self.width as usize && y < self.height).then(|| self.luma[y * self.width as usize + x])
+        let w = self.width as usize;
+        (x < w && y < self.height as usize).then(|| self.luma[y * w + x])
     }
 }
 
-/// A decode session over one H.264 track.
+/// A decode session over one VP9 or AV1 track.
 ///
 /// Constructing one checks pixel-exactness, so a session that exists is a
 /// session whose output may be measured.
 pub struct DecodeSession {
-    decoder: H264Decoder,
+    backend: Backend,
     limits: DecodeLimits,
     timebase: (u32, u32),
     decoded: usize,
 }
 
 impl DecodeSession {
-    /// Opens a session for an H.264 track.
+    /// Opens a session for a VP9 or AV1 track.
     ///
     /// # Errors
     ///
@@ -296,14 +255,13 @@ impl DecodeSession {
     /// output. The second is the important one: it is what stops Tier-2 being
     /// reported on approximate frames.
     pub fn open(codec: &str, limits: DecodeLimits) -> Result<Self, DecodeError> {
-        if !is_h264(codec) {
+        let Some(backend) = Backend::for_codec(codec) else {
             return Err(DecodeError::UnsupportedCodec {
                 codec: codec.to_owned(),
             });
-        }
+        };
 
-        let decoder = H264Decoder::new();
-        let capabilities: DecoderCapabilities = decoder.capabilities();
+        let capabilities: DecoderCapabilities = backend.capabilities();
         if !capabilities.pixel_exact {
             return Err(DecodeError::NotPixelExact {
                 notes: capabilities.notes.to_owned(),
@@ -311,7 +269,7 @@ impl DecodeSession {
         }
 
         Ok(Self {
-            decoder,
+            backend,
             limits,
             timebase: (1, 30),
             decoded: 0,
@@ -325,10 +283,11 @@ impl DecodeSession {
         self
     }
 
-    /// Returns the decoder's capabilities, for the report's methodology.
+    /// Returns the capabilities of the decoder for `codec`, for the report's
+    /// methodology, or `None` if the codec is not decoded here.
     #[must_use]
-    pub fn capabilities() -> DecoderCapabilities {
-        H264Decoder::new().capabilities()
+    pub fn capabilities(codec: &str) -> Option<DecoderCapabilities> {
+        Backend::for_codec(codec).map(|backend| backend.capabilities())
     }
 
     /// Decodes every packet in `packets`, returning the usable frames.
@@ -362,7 +321,7 @@ impl DecodeSession {
                 is_key_frame: *is_key_frame,
             };
 
-            let decoded = decode_guarded(&mut self.decoder, &packet).map_err(|reason| {
+            let decoded = decode_guarded(&mut self.backend, &packet).map_err(|reason| {
                 DecodeError::Decode {
                     frame: index,
                     reason: reason.detail,
@@ -423,7 +382,7 @@ impl DecodeSession {
                 is_key_frame: *is_key_frame,
             };
 
-            match decode_guarded(&mut self.decoder, &packet) {
+            match decode_guarded(&mut self.backend, &packet) {
                 Ok(Some(frame)) => {
                     self.decoded += 1;
                     if let Some(reduced) = reduce(index, *is_key_frame, frame) {
@@ -457,13 +416,12 @@ impl DecodeSession {
     }
 }
 
-/// Returns `true` if `codec` names an H.264 variant.
+/// Returns `true` if `codec` names a codec this engine can decode (VP9, AV1).
+///
+/// Patent-encumbered codecs such as H.264 and HEVC are deliberately absent.
 #[must_use]
-pub fn is_h264(codec: &str) -> bool {
-    matches!(
-        codec.to_ascii_lowercase().as_str(),
-        "avc1" | "avc3" | "h264" | "avc"
-    )
+pub fn is_decodable(codec: &str) -> bool {
+    Backend::for_codec(codec).is_some()
 }
 
 /// Reduces a decoded frame to its luma plane.
@@ -471,6 +429,15 @@ pub fn is_h264(codec: &str) -> bool {
 /// Only luma is kept. Chroma is not used by either analyser, and carrying the
 /// other planes would triple memory for no benefit.
 fn reduce(index: usize, is_key_frame: bool, frame: VideoFrame) -> Option<DecodedFrame> {
+    // The luma plane leads the buffer only in 8-bit planar layouts. Anything
+    // else (10-bit words, packed RGB) would be misread as 8-bit luma.
+    if !matches!(
+        frame.pixel_format,
+        PixelFormat::Yuv420p | PixelFormat::Yuv422p | PixelFormat::Yuv444p | PixelFormat::Gray
+    ) {
+        return None;
+    }
+
     let width = frame.width as usize;
     let height = frame.height as usize;
     let luma_len = width.checked_mul(height)?;
@@ -485,7 +452,7 @@ fn reduce(index: usize, is_key_frame: bool, frame: VideoFrame) -> Option<Decoded
         index,
         is_key_frame,
         width: frame.width,
-        height,
+        height: frame.height,
         luma: frame.data[..luma_len].to_vec(),
     })
 }
@@ -494,24 +461,33 @@ fn reduce(index: usize, is_key_frame: bool, frame: VideoFrame) -> Option<Decoded
 mod tests {
     use super::*;
 
-    fn frame(width: u32, height: usize) -> DecodedFrame {
+    fn frame(width: u32, height: u32) -> DecodedFrame {
         DecodedFrame {
             index: 0,
             is_key_frame: true,
             width,
             height,
-            luma: vec![0u8; width as usize * height],
+            luma: vec![0u8; width as usize * height as usize],
         }
     }
 
     #[test]
-    fn h264_codec_tags_are_recognised() {
-        for codec in ["avc1", "avc3", "AVC1", "h264"] {
-            assert!(is_h264(codec), "{codec} should be recognised as H.264");
+    fn only_royalty_free_codecs_are_decodable() {
+        for codec in ["vp09", "VP09", "vp9", "av01", "av1"] {
+            assert!(is_decodable(codec), "{codec} should be decodable");
         }
-        for codec in ["hvc1", "vp09", "av01", ""] {
-            assert!(!is_h264(codec), "{codec} must not be treated as H.264");
+        for codec in ["avc1", "avc3", "h264", "hvc1", "mp4a", ""] {
+            assert!(!is_decodable(codec), "{codec} must not be decodable");
         }
+    }
+
+    #[test]
+    fn decoders_are_pixel_exact() {
+        for codec in ["vp09", "av01"] {
+            let caps = DecodeSession::capabilities(codec).expect("decodable");
+            assert!(caps.pixel_exact, "{codec} must be pixel-exact");
+        }
+        assert!(DecodeSession::capabilities("avc1").is_none());
     }
 
     #[test]
@@ -527,11 +503,11 @@ mod tests {
     fn an_unsupported_codec_is_refused() {
         // Matched rather than `expect_err`, because `DecodeSession` holds a
         // decoder that is not `Debug` and has no reason to be.
-        let Err(error) = DecodeSession::open("hvc1", DecodeLimits::default()) else {
-            panic!("a non-H264 codec must be refused");
+        let Err(error) = DecodeSession::open("avc1", DecodeLimits::default()) else {
+            panic!("a patent-encumbered codec must be refused");
         };
         assert!(matches!(error, DecodeError::UnsupportedCodec { .. }));
-        assert!(error.to_string().contains("hvc1"));
+        assert!(error.to_string().contains("avc1"));
     }
 
     #[test]

@@ -30,7 +30,8 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use tpt_app_media_forensics_container::{
-    detect_file, extension_matches, inspect_file, read_samples, ContainerFormat, TrackFrameInfo,
+    detect_file, extension_matches, inspect_file, inspect_matroska_file, read_matroska_samples,
+    read_samples, ContainerFormat, TrackFrameInfo,
 };
 use tpt_app_media_forensics_core::{acquire, CaseDirectory};
 use tpt_app_media_forensics_metadata::{find_conflicts, MetadataEntry, Scope};
@@ -241,14 +242,20 @@ fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
     let mut repeated_runs = String::new();
 
     let streams = match format {
-        ContainerFormat::IsoBmff => {
-            let inspection =
-                inspect_file(path).with_context(|| format!("cannot inspect {}", path.display()))?;
+        ContainerFormat::IsoBmff | ContainerFormat::Matroska => {
+            // Both formats go through the same inspection result type; only the
+            // reader differs. A format that reaches this arm is genuinely
+            // parseable, so a failure here is a damaged file, not a gap.
+            let inspection = match format {
+                ContainerFormat::IsoBmff => inspect_file(path),
+                _ => inspect_matroska_file(path),
+            }
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
             for anomaly in &inspection.anomalies {
                 eprintln!("anomaly: {anomaly}");
             }
             frame_info = inspection.frame_info.clone();
-            repeated_runs = report_duplicate_runs(path);
+            repeated_runs = report_duplicate_runs(path, format);
             inspection.streams
         }
         // An unrecognised signature is a finding about the evidence, not a gap
@@ -386,8 +393,15 @@ fn emit<T: serde::Serialize>(json: bool, value: &T, text: &str) {
 ///
 /// Returns rendered text rather than printing, so the caller controls where it
 /// appears in the report.
-fn report_duplicate_runs(path: &std::path::Path) -> String {
-    let Ok(samples) = read_samples(std::fs::read(path).unwrap_or_default()) else {
+fn report_duplicate_runs(path: &std::path::Path, format: ContainerFormat) -> String {
+    // Sample reading is format-specific; using the MP4 reader on a WebM file
+    // would fail to parse and silently report "no duplicates" for a file that
+    // was never examined.
+    let read = match format {
+        ContainerFormat::Matroska => read_matroska_samples(std::fs::read(path).unwrap_or_default()),
+        _ => read_samples(std::fs::read(path).unwrap_or_default()),
+    };
+    let Ok(samples) = read else {
         return String::new();
     };
 
@@ -426,6 +440,93 @@ fn report_duplicate_runs(path: &std::path::Path) -> String {
     }
     out
 }
+/// Identifies an audio codec from the file's leading bytes.
+///
+/// Ogg carries its codec name in a header packet rather than in a magic number,
+/// so the leading bytes are searched for the two identification strings this
+/// build decodes. Searching the header region rather than the whole file keeps
+/// probing cheap and avoids matching a codec name that appears in audio data.
+fn detect_codec(bytes: &[u8]) -> String {
+    // RIFF/WAVE is unambiguous from the first twelve bytes.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return "wav".to_owned();
+    }
+    // OggS then the identification header. 256 bytes is enough for both
+    // `OpusHead` and `\x01vorbis`, which appear immediately after the page
+    // header.
+    let head = &bytes[..bytes.len().min(256)];
+    if head.starts_with(b"OggS") {
+        if find_subslice(head, b"OpusHead").is_some() {
+            return "Opus".to_owned();
+        }
+        if find_subslice(head, b"vorbis").is_some() {
+            return "vorbis".to_owned();
+        }
+        return "ogg".to_owned();
+    }
+    if bytes.starts_with(b"fLaC") {
+        return "fLaC".to_owned();
+    }
+    "unknown".to_owned()
+}
+
+/// Returns the offset of `needle` within `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Decodes a WAV file through the foundation's WAV reader.
+///
+/// WAV is not compressed and needs no codec choice, so it keeps its own path
+/// rather than being folded into the Ogg decoder.
+fn decode_wav(bytes: Vec<u8>) -> Result<tpt_app_media_forensics_audio::AudioDecode, String> {
+    use tpt_app_media_forensics_audio::AudioDecode;
+    use tpt_av_cadence_core::FormatReader as _;
+
+    let source = Box::new(std::io::Cursor::new(bytes));
+    let mut reader = tpt_av_cadence_wav::WavReader::open(source).map_err(|e| e.to_string())?;
+
+    let channels = reader.info().channels;
+    let sample_rate = reader.info().sample_rate;
+    if channels == 0 {
+        return Err("the WAV header declares zero channels".to_owned());
+    }
+
+    // Bounded decode: refuse to silently truncate a long file, and say so when
+    // the cap is hit rather than presenting a prefix as the whole track.
+    let cap = MAX_AUDIO_SAMPLES.min(48_000 * 600 * usize::from(channels));
+    let mut pcm: Vec<f32> = Vec::new();
+    let mut block = vec![0.0f32; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader
+            .decoder()
+            .decode(&mut block)
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let take = read.min(cap.saturating_sub(pcm.len()));
+        pcm.extend_from_slice(&block[..take]);
+        if take < read {
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok(AudioDecode {
+        pcm,
+        channels,
+        sample_rate,
+        truncated,
+    })
+}
+
 /// Analyses a raw audio file (spec §19-§22).
 ///
 /// Decodes to PCM via `tpt-av-cadence`, then reports levels, silence regions,
@@ -434,35 +535,34 @@ fn report_duplicate_runs(path: &std::path::Path) -> String {
 /// correctly is reported as unavailable rather than approximated (spec §21).
 fn audio_report(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
     use tpt_app_media_forensics_audio::{
-        amplitude_to_dbfs, find_silence, integrated_loudness, level_stats, Measurement, Methodology,
+        amplitude_to_dbfs, decode_audio, find_silence, integrated_loudness, is_audio_decodable,
+        level_stats, AudioDecodeLimits, Measurement, Methodology,
     };
-    let file = std::fs::File::open(path)?;
-    use tpt_av_cadence_core::FormatReader as _;
-    let source = Box::new(std::io::BufReader::new(file));
-    let mut reader = tpt_av_cadence_wav::WavReader::open(source)
-        .with_context(|| format!("cannot parse WAV: {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
 
-    let sample_rate = reader.info().sample_rate;
-    let channels = reader.info().channels;
+    // The codec is chosen from the file's own signature, never its extension:
+    // an extension is a claim by whoever named the file, and this tool exists
+    // to check claims.
+    let codec = detect_codec(&bytes);
+    let decoded = if is_audio_decodable(&codec) {
+        decode_audio(bytes, &codec, AudioDecodeLimits::new(2))
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else if codec == "wav" {
+        decode_wav(bytes).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        anyhow::bail!(
+            "{}: `{codec}` is not decoded here; this build decodes WAV, Opus, and Vorbis",
+            path.display()
+        );
+    };
 
-    // Decode into a bounded buffer; refuse to silently truncate a long file.
-    let mut pcm: Vec<f32> = Vec::new();
-    let mut block = vec![0.0f32; 8192];
-    while let Ok(read) = reader.decoder().decode(&mut block) {
-        if read == 0 {
-            break;
-        }
-        pcm.truncate(pcm.len() + read);
-        pcm.extend_from_slice(&block[..read]);
-        if pcm.len() > MAX_AUDIO_SAMPLES {
-            pcm.truncate(MAX_AUDIO_SAMPLES);
-            eprintln!(
-                "audio: truncated to {} samples; loudness covers a prefix only",
-                MAX_AUDIO_SAMPLES
-            );
-            break;
-        }
+    if decoded.truncated {
+        eprintln!("audio: decode stopped at the frame limit; these figures cover a prefix only");
     }
+
+    let pcm = decoded.pcm;
+    let sample_rate = decoded.sample_rate;
+    let channels = decoded.channels;
 
     let stats = level_stats(&pcm);
     let silence = find_silence(&pcm, SILENCE_THRESHOLD, MIN_SILENCE_FRAMES);

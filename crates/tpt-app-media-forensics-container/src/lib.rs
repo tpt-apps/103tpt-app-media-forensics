@@ -25,19 +25,31 @@
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod damage;
+pub mod elst;
 pub mod error;
 pub mod fixture;
+pub mod mkv;
 pub mod mp4;
 pub mod probe;
 
+pub use damage::{scan_isobmff, SampleIndex, SampleOrigin, SamplePosition, StructuralDamage};
+pub use elst::{parse_edit_lists, EditList};
 pub use error::ContainerError;
 pub use fixture::{
-    build_mp4, build_mp4_empty_moov, build_mp4_stsd_gop_change, build_mp4_with_keyframes,
-    build_mp4_with_metadata, build_mp4_without_moov, gop_change_keyframes, TrackSpec,
+    build_mp4, build_mp4_av, build_mp4_empty_moov, build_mp4_stsd_gop_change,
+    build_mp4_with_bitrate_drop, build_mp4_with_keyframes, build_mp4_with_metadata,
+    build_mp4_with_repeated_frames, build_mp4_without_moov, build_webm, gop_change_keyframes,
+    TrackSpec,
+};
+pub use mkv::{
+    inspect_bytes as inspect_matroska_bytes, inspect_file as inspect_matroska_file,
+    read_samples as read_matroska_samples, read_samples_file as read_matroska_samples_file,
+    MAX_MKV_SAMPLES,
 };
 pub use mp4::{
     inspect_bytes, inspect_file, inspect_path, read_header, read_moov, read_samples,
-    read_samples_file, track_frame_info, Mp4Inspection, SampleRecord, TrackFrameInfo,
+    read_samples_file, track_frame_info, ContainerInspection, SampleRecord, TrackFrameInfo,
     MAX_EXPANDED_SAMPLES, MAX_INSPECTED_BYTES, MAX_MOOV_BYTES, MAX_SAMPLED_BYTES,
 };
-pub use probe::{detect, detect_file, extension_matches, ContainerFormat};
+pub use probe::{detect, detect_file, extension_matches, ContainerFormat, PROBE_BYTES};

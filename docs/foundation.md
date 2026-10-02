@@ -32,7 +32,7 @@ reviewed and bumped if any result could change.
 
 | Spec name | Repository | Crates actually available |
 |---|---|---|
-| tpt-kinetix | `tpt-solutions/tpt-kinetix` | `tpt-kinetix-core`, `-demux`, `-h264`, `-av1`, `-aac`, `-bitstream`, `-mux`, `-lossless`, `-stream`, `-pipeline`, `-vision`, `-face`, `-screen`, `-realtime`, `-lean`, `-kg`, `-volumetric`, `-cli`, `-test-utils` |
+| tpt-kinetix | `tpt-solutions/tpt-kinetix` | `tpt-kinetix-core`, `-demux`, `-vp9`, `-av1`, `-aac`, `-bitstream`, `-mux`, `-lossless`, `-stream`, `-pipeline`, `-vision`, `-face`, `-screen`, `-realtime`, `-lean`, `-kg`, `-volumetric`, `-cli`, `-test-utils` |
 | tpt-cadence | `tpt-solutions/tpt-cadence` | `tpt-av-cadence-core`, `-wav`, `-aiff`, `-flac`, `-aac`, `-opus`, `-mp3`, `-ogg`, `-vorbis`, `-pcm`, `-test-utils`, `-cli` |
 | tpt-visual | `tpt-solutions/tpt-visual` | `tpt-av-visual`, `-color`, `-compositor`, `-effects`, `-timeline`, `-utils` |
 | tpt-audio | `tpt-solutions/tpt-audio` | `tpt-av-audio`, `-core`, `-io`, `-plugin`, `-timeline`, `-utils` |
@@ -100,7 +100,12 @@ degraded-display problem rather than a lost-finding problem.
 | Crate | Purpose in this project |
 |---|---|
 | `tpt-kinetix-core` | `Packet`, `Timestamp`, `CodecId`, `MediaType` |
-| `tpt-kinetix-demux` | MP4/MKV box parsing; the container layer (spec §12, §13) |
+| `tpt-kinetix-demux` | MP4 box parsing and Matroska/WebM EBML parsing; the container layer (spec §12, §13) |
+| `tpt-kinetix-vp9` | VP9 decode for Tier-2 pixel analysis |
+| `tpt-kinetix-av1` | AV1 decode for Tier-2 pixel analysis |
+| `tpt-av-cadence-core` | The `Decoder`/`FormatReader` traits the audio path is written against |
+| `tpt-av-cadence-opus` | Opus decode |
+| `tpt-av-cadence-vorbis` | Vorbis decode |
 
 The container crate maps Kinetix tracks into this engine's `StreamAnalysis`
 model and owns two decisions the demuxer does not:
@@ -112,11 +117,42 @@ model and owns two decisions the demuxer does not:
   (2 GiB) refuses larger files with an explicit error rather than allowing an
   allocation failure to become a crash.
 
+### What the Matroska reader does and does not expose
+
+`tpt-kinetix-demux::mkv::MkvDemuxer` is a **minimal** EBML reader, and its
+limits shape what the engine can honestly report about a WebM file:
+
+| Exposed | Not exposed |
+|---|---|
+| track number, track type, `CodecID` | picture width and height |
+| presentation timestamps (1 ms resolution) | frame rate |
+| `SimpleBlock` keyframe flags | audio sample rate, channel layout |
+| full sample bytes | per-track duration |
+
+Those omissions are **reported as unmeasured, never defaulted**. A WebM video
+stream therefore carries `video: None` and no frame rate in this build. Filling
+them in would put numbers in a forensic report that no measurement produced,
+which is the specific failure mode this product exists to avoid.
+
+Two consequences worth stating plainly:
+
+- **Keyframes can be under-counted.** Plain `Block` elements inside a
+  `BlockGroup` are always reported as non-key by the reader, so a file using
+  reference-block encoding shows fewer apparent keyframes than it contains.
+  That is recorded as an anomaly.
+- **Timestamps are millisecond-resolution**, coarser than an MP4 `mdhd`
+  timescale. The timebase is recorded so a comparison against an MP4 of the same
+  content does not mistake the resolution difference for a timing discrepancy.
+
 ## Not yet integrated
 
-`tpt-av-cadence-*` (audio decode), `tpt-kinetix-h264` (video decode),
 `tpt-av-test-*` (conformance/fuzz harness). They are declared and verified to
 resolve, but no crate depends on them yet.
+
+`tpt-kinetix-mux` was evaluated and **rejected for fixture generation**: it only
+writes progressive MP4 with a single H.264 track, which is both the one codec
+this project refuses to decode and useless for the WebM fixtures. Fixtures are
+built by hand instead (see `-container::fixture`).
 
 `cargo generate --git https://github.com/tpt-solutions/tpt-av-test templates/consumer-crate`
 scaffolds the `tpt-av-test` dev-dependency wiring, which is how that harness is

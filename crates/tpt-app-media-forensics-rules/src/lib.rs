@@ -36,5 +36,5 @@ pub mod engine;
 pub mod profile;
 
 pub use builtin::builtin_rules;
-pub use engine::{AnalysisBundle, ForensicRule, RuleEngine, RuleError};
+pub use engine::{AnalysisBundle, BundleInput, ForensicRule, RuleEngine, RuleError};
 pub use profile::RuleProfile;

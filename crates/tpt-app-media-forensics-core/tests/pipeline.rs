@@ -4,7 +4,9 @@
 //! wiring between acquisition, inspection, rules, and the cache rather than
 //! any one layer in isolation.
 
-use tpt_app_media_forensics_container::fixture::{build_mp4, build_mp4_stsd_gop_change, TrackSpec};
+use tpt_app_media_forensics_container::fixture::{
+    build_mp4, build_mp4_stsd_gop_change, build_mp4_with_repeated_frames, TrackSpec,
+};
 use tpt_app_media_forensics_core::case_dir::CaseDirectory;
 use tpt_app_media_forensics_core::{acquire, AnalysisEngine};
 use tpt_app_media_forensics_model::{Case, Severity, StreamKind};
@@ -45,6 +47,109 @@ fn analysis_produces_findings_for_a_real_container() {
             .iter()
             .map(|f| &f.rule_id)
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_header_that_contradicts_its_sample_table_reaches_the_report() {
+    // The unit tests for this rule call `evaluate` directly, which would still
+    // pass if the pipeline never populated the values it reads. This drives the
+    // whole path — file on disk, container reader, stages, rules, outcome.
+    let mut track = TrackSpec::video_25fps(320, 240, 60);
+    track.declared_duration = Some(250); // claims 10 s over 2.4 s of samples
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(&build_mp4(&track), tmp.path());
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    let finding = outcome
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "METADATA.DECLARED_VS_MEASURED_MISMATCH")
+        .unwrap_or_else(|| {
+            panic!(
+                "the disagreement should survive to the outcome; got {:?}",
+                outcome
+                    .findings
+                    .iter()
+                    .map(|f| &f.rule_id)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(finding.severity, Severity::Warning);
+    assert!(
+        finding
+            .observation
+            .summary
+            .contains("declares 00:00:10.000"),
+        "{}",
+        finding.observation.summary
+    );
+}
+
+#[test]
+fn a_clean_fixture_reports_no_repeated_frames() {
+    // The regression this guards: fixtures once stored an all-zero `mdat`, so
+    // every sample hashed the same and every "clean" file reported a 60-frame
+    // duplicate run. A detection that fires on healthy input is not a detection.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(
+        &build_mp4(&TrackSpec::video_25fps(320, 240, 60)),
+        tmp.path(),
+    );
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    let repeated = outcome
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "VIDEO.DUPLICATE_FRAME_RUN")
+        .count();
+    assert_eq!(
+        repeated, 0,
+        "a clean file must not look like repeated frames"
+    );
+}
+
+#[test]
+fn a_frozen_frame_run_is_reported_at_its_true_length() {
+    // The other half: distinct samples must still allow genuinely repeated ones
+    // to be detected. Only asserting the clean case would pass with duplicate
+    // detection silently switched off.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(&build_mp4_with_repeated_frames(10, 15), tmp.path());
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    let finding = outcome
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "VIDEO.DUPLICATE_FRAME_RUN")
+        .unwrap_or_else(|| {
+            panic!(
+                "15 identical frames should be reported; got {:?}",
+                outcome
+                    .findings
+                    .iter()
+                    .map(|f| &f.rule_id)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        finding
+            .observation
+            .measurements
+            .iter()
+            .any(|m| m.contains("15")),
+        "the reported length should be the true run length: {:?}",
+        finding.observation.measurements
     );
 }
 
@@ -132,11 +237,26 @@ fn a_clean_file_produces_fewer_findings_than_a_damaged_one() {
         .analyse(&damaged_source, &damaged_case)
         .expect("analyses");
 
+    // Compared by rule, not by count. This previously asserted
+    // `damaged.len() > clean.len()`, which passed for incidental reasons: the
+    // two fixtures raise unrelated findings (an all-keyframes note on the
+    // clean one, a GOP change on the other), so the totals tracked whatever
+    // else each happened to report. A count comparison between different
+    // fixtures says nothing about the change being tested.
+    let clean_ids: Vec<&str> = clean.findings.iter().map(|f| f.rule_id.as_str()).collect();
+    let damaged_ids: Vec<&str> = damaged
+        .findings
+        .iter()
+        .map(|f| f.rule_id.as_str())
+        .collect();
+
     assert!(
-        damaged.findings.len() > clean.findings.len(),
-        "a GOP change should raise findings a clean file does not: {} vs {}",
-        damaged.findings.len(),
-        clean.findings.len()
+        damaged_ids.contains(&"VIDEO.GOP_LENGTH_CHANGE"),
+        "the GOP change fixture should raise a GOP finding; got {damaged_ids:?}"
+    );
+    assert!(
+        !clean_ids.contains(&"VIDEO.GOP_LENGTH_CHANGE"),
+        "a constant-GOP file should not raise one; got {clean_ids:?}"
     );
 }
 
@@ -258,4 +378,143 @@ fn stream_kinds_are_reported_for_a_standard_fixture() {
     );
     assert_eq!(StreamKind::Video.tag(), "video");
     assert_eq!(Severity::Significant.tag(), "SIGNIFICANT");
+}
+
+/// Builds a minimal WebM document with one VP9 track and three blocks.
+///
+/// Built here rather than imported from the container crate's unit tests
+/// because those helpers are private to that module; this is the pipeline's own
+/// copy of "a WebM file an analyst would actually hand over".
+fn webm_bytes() -> Vec<u8> {
+    let mut track_entry = vec![0xD7, 0x81, 1, 0x83, 0x81, 1, 0x86, 0x80 | 5];
+    track_entry.extend_from_slice(b"V_VP9");
+
+    let mut tracks_body = vec![0xAE, 0x80 | track_entry.len() as u8];
+    tracks_body.extend_from_slice(&track_entry);
+
+    let mut cluster = vec![0xE7, 0x82];
+    cluster.extend_from_slice(&0u16.to_be_bytes());
+    for (index, is_key) in [true, false, true].into_iter().enumerate() {
+        let mut block = vec![0x81];
+        block.extend_from_slice(&((index as u16) * 33).to_be_bytes());
+        block.push(u8::from(is_key) << 7);
+        block.extend_from_slice(&[index as u8 + 1, 0xAA]);
+        cluster.extend_from_slice(&[0xA3, 0x80 | block.len() as u8]);
+        cluster.extend_from_slice(&block);
+    }
+
+    let mut segment = vec![0x16, 0x54, 0xAE, 0x6B, 0x80 | tracks_body.len() as u8];
+    segment.extend_from_slice(&tracks_body);
+    segment.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75, 0x80 | cluster.len() as u8]);
+    segment.extend_from_slice(&cluster);
+
+    let mut doc = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x18, 0x53, 0x80, 0x67];
+    doc.push(0x80 | segment.len() as u8);
+    doc.extend_from_slice(&segment);
+    doc
+}
+
+/// Creates a case directory containing `contents` under the given file name.
+fn case_with_name(
+    contents: &[u8],
+    dir: &std::path::Path,
+    name: &str,
+) -> (CaseDirectory, std::path::PathBuf) {
+    std::fs::create_dir_all(dir).expect("creates case parent");
+    let source = dir.join(name);
+    std::fs::write(&source, contents).expect("writes source");
+
+    let case_dir = dir.join("case.tptcase");
+    CaseDirectory::create(&case_dir, &Case::new("Pipeline", None)).expect("creates case");
+    (CaseDirectory::open(&case_dir).expect("opens"), source)
+}
+
+#[test]
+fn a_webm_file_is_analysed_end_to_end() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with_name(&webm_bytes(), tmp.path(), "clip.webm");
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    // The decisive check: WebM is no longer reported as an unintegrated format.
+    assert!(
+        !outcome
+            .limitations
+            .iter()
+            .any(|l| l.contains("no demuxer integrated")),
+        "WebM has a demuxer now: {:?}",
+        outcome.limitations
+    );
+}
+
+#[test]
+fn a_webm_file_reaches_the_video_rules() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with_name(&webm_bytes(), tmp.path(), "clip.webm");
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    // Three frames, two of them keyframes: that is a single-keyframe-free track
+    // with a measurable GOP, so the video rules have something to read.
+    let saw_video_rule = outcome
+        .findings
+        .iter()
+        .any(|f| f.rule_id.starts_with("VIDEO.") || f.rule_id.starts_with("CONTAINER."));
+    assert!(
+        saw_video_rule,
+        "expected container/video findings, got {:?}",
+        outcome
+            .findings
+            .iter()
+            .map(|f| &f.rule_id)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_webm_file_states_that_matroska_tags_are_not_extracted() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with_name(&webm_bytes(), tmp.path(), "clip.webm");
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    // "No metadata in this file" and "this build does not read Matroska tags"
+    // are different observations, and only the second is true here.
+    assert!(
+        outcome
+            .limitations
+            .iter()
+            .any(|l| l.contains("Matroska tags are not extracted")),
+        "{:?}",
+        outcome.limitations
+    );
+}
+
+#[test]
+fn analysis_of_a_webm_file_is_reproducible() {
+    // Spec §77, across a second case directory so the cache cannot serve it.
+    let first_dir = tempfile::tempdir().expect("temp dir");
+    let second_dir = tempfile::tempdir().expect("temp dir");
+    let bytes = webm_bytes();
+
+    let (first_case, first_source) = case_with_name(&bytes, first_dir.path(), "clip.webm");
+    let (second_case, second_source) = case_with_name(&bytes, second_dir.path(), "clip.webm");
+
+    let first = AnalysisEngine::new()
+        .analyse(&first_source, &first_case)
+        .expect("first");
+    let second = AnalysisEngine::new()
+        .analyse(&second_source, &second_case)
+        .expect("second");
+
+    assert_eq!(
+        first.findings, second.findings,
+        "two runs over identical bytes must produce identical findings"
+    );
 }

@@ -45,6 +45,9 @@ pub fn empty_bundle(asset_id: AssetId) -> AnalysisBundle {
         loudness: None,
         scene: None,
         near_duplicates: None,
+        damage: Vec::new(),
+        sample_index: tpt_app_media_forensics_container::SampleIndex::default(),
+        bitrate: None,
     }
 }
 
@@ -57,7 +60,7 @@ pub struct AnalysisBundle {
     /// The asset under examination.
     pub asset_id: AssetId,
     /// Container structure, when the container could be read.
-    pub container: Option<tpt_app_media_forensics_container::Mp4Inspection>,
+    pub container: Option<tpt_app_media_forensics_container::ContainerInspection>,
     /// GOP structure for the first video stream, when measured.
     pub gop: Option<tpt_app_media_forensics_video::gop::GopReport>,
     /// Repeated-sample runs across the file.
@@ -79,6 +82,143 @@ pub struct AnalysisBundle {
     pub scene: Option<tpt_app_media_forensics_video::scene::SceneReport>,
     /// Near-duplicate pairs, when Tier-2 decoding ran.
     pub near_duplicates: Option<tpt_app_media_forensics_video::near_duplicate::NearDuplicateReport>,
+    /// Structural defects found by the container byte scan (spec §30).
+    ///
+    /// Always a `Vec`, never `Option`: an empty vector means the file was
+    /// scanned and no structural damage was found, which is a measurement a
+    /// report can rely on. `Option` would conflate "clean" with "not looked
+    /// at", and those are exactly the two claims a forensic report must keep
+    /// apart.
+    pub damage: Vec<tpt_app_media_forensics_container::StructuralDamage>,
+    /// Byte-offset to media-time lookup, used to place damage on a timeline
+    /// (spec §31).
+    ///
+    /// Empty when samples were not read, which the caller cannot distinguish
+    /// from "no damage to place" by looking at `damage` alone — so the timeline
+    /// layer checks this rather than assuming a placement is available.
+    pub sample_index: tpt_app_media_forensics_container::SampleIndex,
+    /// Compression and bitrate analysis for video streams (spec §28-§29).
+    ///
+    /// `None` when samples were not read, or when fewer than two video samples
+    /// were recoverable — a rate needs two points. That is different from an
+    /// empty `anomalies` list, which means the file was measured and held steady.
+    pub bitrate: Option<tpt_app_media_forensics_video::bitrate::BitrateReport>,
+}
+
+/// A piece of analysis a rule depends on.
+///
+/// Declared per rule so that a stage which was written but never called cannot
+/// hide. Two such stages shipped: audio measurement and A/V synchronisation were
+/// both fully implemented, documented, and unit-tested, and neither was ever
+/// invoked by the pipeline — so six rules could not fire on any file, over any
+/// number of green tests.
+///
+/// Declared rather than inferred, because Rust has no reflection and a field
+/// that is read but not declared cannot be detected. That makes under-declaring
+/// possible; it is a discipline cost paid once per rule, in exchange for
+/// catching an entire class of silent failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BundleInput {
+    /// Container structure and declared stream properties.
+    Container,
+    /// GOP structure and keyframe positions.
+    Gop,
+    /// Repeated compressed-sample runs.
+    RepeatedRuns,
+    /// Presentation-timestamp anomaly reports.
+    Timestamps,
+    /// Audio/video offset and drift.
+    Sync,
+    /// Decoded audio levels.
+    AudioLevels,
+    /// Detected silence regions.
+    Silence,
+    /// Integrated loudness.
+    Loudness,
+    /// Tier-2 scene-change analysis.
+    Scene,
+    /// Tier-2 perceptual near-duplicate detection.
+    NearDuplicates,
+    /// Extracted metadata tree.
+    Metadata,
+    /// Structural damage from the container byte scan.
+    Damage,
+    /// Byte-offset to media-time lookup, for the error timeline (spec §31).
+    SampleIndex,
+    /// Compression and bitrate analysis (spec §28-§29).
+    Bitrate,
+}
+
+impl BundleInput {
+    /// Every input a rule may declare, in a stable order.
+    pub const ALL: &'static [BundleInput] = &[
+        Self::Container,
+        Self::Gop,
+        Self::RepeatedRuns,
+        Self::Timestamps,
+        Self::Sync,
+        Self::AudioLevels,
+        Self::Silence,
+        Self::Loudness,
+        Self::Scene,
+        Self::NearDuplicates,
+        Self::Metadata,
+        Self::Damage,
+        Self::SampleIndex,
+        Self::Bitrate,
+    ];
+
+    /// The stable tag used in diagnostics and in the guard's messages.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Gop => "gop",
+            Self::RepeatedRuns => "repeated_runs",
+            Self::Timestamps => "timestamps",
+            Self::Sync => "sync",
+            Self::AudioLevels => "audio_levels",
+            Self::Silence => "silence",
+            Self::Loudness => "loudness",
+            Self::Scene => "scene",
+            Self::NearDuplicates => "near_duplicates",
+            Self::Metadata => "metadata",
+            Self::Damage => "damage",
+            Self::SampleIndex => "sample_index",
+            Self::Bitrate => "bitrate",
+        }
+    }
+
+    /// Whether `bundle` carries a result for this input.
+    ///
+    /// "Populated" means the analyser ran and *found something*. An empty
+    /// `Vec` therefore counts as **not** populated, because the guard's purpose
+    /// is to prove a stage is reachable: a collection input nothing ever fills
+    /// means no fixture exercises it, which is the condition being guarded
+    /// against. (`Option` inputs answer the same question by `is_some`.)
+    ///
+    /// This is deliberately the opposite of "the analysis is complete" — an
+    /// empty vector there means *scanned and clean*, which the bundle expresses
+    /// by being present rather than by being non-empty.
+    #[must_use]
+    pub fn is_populated(self, bundle: &AnalysisBundle) -> bool {
+        match self {
+            Self::Container => bundle.container.is_some(),
+            Self::Gop => bundle.gop.is_some(),
+            Self::RepeatedRuns => !bundle.repeated_runs.is_empty(),
+            Self::Timestamps => !bundle.timestamps.is_empty(),
+            Self::Sync => bundle.sync.is_some(),
+            Self::AudioLevels => bundle.audio_levels.is_some(),
+            Self::Silence => !bundle.silence.is_empty(),
+            Self::Loudness => bundle.loudness.is_some(),
+            Self::Scene => bundle.scene.is_some(),
+            Self::NearDuplicates => bundle.near_duplicates.is_some(),
+            Self::Metadata => bundle.metadata.as_ref().is_some_and(|m| !m.is_empty()),
+            Self::Damage => !bundle.damage.is_empty(),
+            Self::SampleIndex => !bundle.sample_index.is_empty(),
+            Self::Bitrate => bundle.bitrate.is_some(),
+        }
+    }
 }
 
 /// A single forensic rule.
@@ -94,6 +234,17 @@ pub trait ForensicRule: Send + Sync {
 
     /// Why the condition matters.
     fn why_it_matters(&self) -> &'static str;
+
+    /// The analysis this rule reads, without which it cannot produce a finding.
+    ///
+    /// Mandatory, with no default. A rule that declares nothing it reads is
+    /// indistinguishable from one that genuinely needs nothing, and the guard
+    /// that catches unwired stages depends on the distinction being explicit.
+    ///
+    /// A rule with **no** required input is legitimate only if it can fire from
+    /// the asset alone; `METADATA.DECLARED_VS_MEASURED_MISMATCH` is currently
+    /// listed as an exception in the guard for the opposite reason.
+    fn required_inputs(&self) -> &'static [BundleInput];
 
     /// Evaluates the rule, returning findings.
     ///

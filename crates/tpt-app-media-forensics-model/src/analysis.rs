@@ -36,7 +36,7 @@ pub struct AnalysisVersion(u32);
 
 impl AnalysisVersion {
     /// The current analysis behaviour version.
-    pub const CURRENT: Self = Self(1);
+    pub const CURRENT: Self = Self(2);
 
     /// Builds a version from a raw number.
     #[must_use]

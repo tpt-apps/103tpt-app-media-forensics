@@ -42,8 +42,9 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       filesystem metadata capture remain
 
 - [x] Integrate tpt-kinetix (container demux: `tpt-kinetix-core`, `-demux`)
-- [ ] Integrate tpt-kinetix-h264 for frame decoding (never implement it ourselves;
-      it is bit-exact vs ffmpeg. Tier-2 only — see docs/decoding-tiers.md)
+- [x] Integrate tpt-kinetix-vp9 and -av1 for frame decoding (royalty-free; never
+      implement them ourselves. H.264 is patent-encumbered and not decoded.
+      Tier-2 only — see docs/decoding-tiers.md)
 - [ ] Integrate tpt-cadence (audio codec/timing)
 - [x] Implement container/stream inspection (§12–13)
 - [ ] Implement video analysis: structural, temporal, spatial, colour (§14)

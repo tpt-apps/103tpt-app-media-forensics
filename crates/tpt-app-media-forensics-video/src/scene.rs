@@ -132,7 +132,7 @@ mod tests {
             index,
             is_key_frame: index == 0,
             width,
-            height,
+            height: height as u32,
             luma: vec![value; width as usize * height],
         }
     }
@@ -150,7 +150,7 @@ mod tests {
             index,
             is_key_frame: index == 0,
             width,
-            height,
+            height: height as u32,
             luma,
         }
     }
@@ -212,7 +212,7 @@ mod tests {
             index,
             is_key_frame: index == 0,
             width,
-            height,
+            height: height as u32,
             luma,
         }
     }

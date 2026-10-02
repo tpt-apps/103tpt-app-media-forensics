@@ -24,9 +24,9 @@
 
 use std::path::Path;
 
-use tpt_app_media_forensics_audio::{level_stats, Measurement};
+use tpt_app_media_forensics_audio::{find_silence, integrated_loudness, level_stats, Measurement};
 use tpt_app_media_forensics_container::probe::{detect_file, extension_matches};
-use tpt_app_media_forensics_container::{detect, read_samples_file, ContainerFormat};
+use tpt_app_media_forensics_container::{detect, ContainerFormat};
 use tpt_app_media_forensics_metadata::{MetadataEntry, MetadataTree, Scope};
 use tpt_app_media_forensics_model::{
     AcquisitionRecord, AnalysisId, AnalysisVersion, CacheKey, Case, Finding, MediaAsset, MediaTime,
@@ -138,114 +138,7 @@ impl AnalysisEngine {
             });
         }
 
-        // 4. Container inspection.
-        //
-        // Only the header is read here. Every structural check needs the `moov`
-        // box - the sample tables, codec descriptions, and timing - and never
-        // touches `mdat`, which on a long recording is nearly the whole file.
-        // Reading the whole asset to inspect a file this tool will be handed
-        // 40 GB masters of is what makes an examination impractical, so the
-        // media data stays on disk unless sample reading is genuinely needed.
-        let header =
-            tpt_app_media_forensics_container::read_header(source, 64 * 1024).map_err(|e| {
-                CoreError::io(
-                    "read source header",
-                    source.display().to_string(),
-                    std::io::Error::other(e),
-                )
-            })?;
-        let format = detect(&header);
-        let inspection = if format == ContainerFormat::IsoBmff {
-            match tpt_app_media_forensics_container::inspect_path(source) {
-                Ok(inspection) => Some(inspection),
-                Err(error) => {
-                    limitations.push(format!("container structure could not be read: {error}"));
-                    None
-                }
-            }
-        } else {
-            limitations.push(format!(
-                "container format {} has no demuxer integrated yet",
-                format.tag()
-            ));
-            None
-        };
-
-        // 5. Per-layer analysis.
-        let mut bundle = empty_bundle(asset.id);
-
-        if let Some(inspection) = &inspection {
-            bundle.container = Some(inspection.clone());
-
-            if let Some(info) = inspection.frame_info.iter().flatten().next() {
-                bundle.timestamps = vec![scan_presentation(
-                    &info.frame_times,
-                    self.profile.pts_tolerance,
-                )];
-            }
-        }
-
-        // GOP and duplicate detection both work at the packet layer.
-        if let Some(inspection) = &inspection {
-            if let Some(info) = inspection.frame_info.iter().flatten().next() {
-                bundle.gop = Some(gop::analyse(
-                    &info.keyframes,
-                    &info.frame_times,
-                    self.profile.gop_tolerance_frames,
-                ));
-            }
-            // Duplicate detection needs every sample's bytes, so it genuinely
-            // requires the media data. On a file too large to hold, it is
-            // skipped and the gap is stated rather than silently omitted.
-            let size = std::fs::metadata(source)
-                .map(|m| m.len())
-                .unwrap_or_default();
-            if size <= tpt_app_media_forensics_container::MAX_SAMPLED_BYTES {
-                match read_samples_file(source) {
-                    Ok(samples) => {
-                        let digests: Vec<tpt_app_media_forensics_video::duplicate::SampleDigest> =
-                            samples
-                                .iter()
-                                .map(|s| tpt_app_media_forensics_video::duplicate::SampleDigest {
-                                    digest: s.digest.clone(),
-                                    time: s.time,
-                                    is_key_frame: s.is_key_frame,
-                                })
-                                .collect();
-                        bundle.repeated_runs =
-                            find_repeated_runs(&digests, self.profile.min_duplicate_run);
-                    }
-                    Err(error) => limitations.push(format!(
-                        "sample reading failed, so duplicate detection was skipped: {error}"
-                    )),
-                }
-            } else {
-                limitations.push(format!(
-                    "file is {size} bytes, above the {} byte limit for sample-level duplicate detection; \
-                     structural analysis still covers it",
-                    tpt_app_media_forensics_container::MAX_SAMPLED_BYTES
-                ));
-            }
-        }
-
-        // Metadata lives in moov, which was already read for inspection, so this
-        // costs nothing extra and never touches the media data.
-        // 5b. Tier-2: pixel-level analysis (spec §16-§18).
-        //
-        // Runs only when the samples were already read and the decoder is
-        // pixel-exact. Every reason Tier-2 cannot run becomes a limitation, so a
-        // report never implies a measurement was made when it was not.
-        self.run_tier_two(source, &inspection, &mut bundle, &mut limitations);
-
-        bundle.metadata = bundle.container.as_ref().and_then(|_| {
-            tpt_app_media_forensics_container::read_moov(source)
-                .ok()
-                .and_then(|bytes| extract_metadata(&bytes))
-        });
-        if bundle.metadata.as_ref().is_none_or(MetadataTree::is_empty) {
-            limitations.push("no readable metadata atoms were found".to_owned());
-        }
-
+        let bundle = self.run_stages(source, asset.id, &mut limitations)?;
         // 6. Rules.
         let findings =
             self.rules
@@ -265,7 +158,7 @@ impl AnalysisEngine {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
-            stream_count: inspection.as_ref().map_or(0, |i| i.streams.len()),
+            stream_count: 0,
         })?;
 
         // 8. Record the run in the case database so `report` can rebuild this
@@ -285,6 +178,532 @@ impl AnalysisEngine {
             profile: self.profile.clone(),
         })
     }
+    /// Runs every per-layer analyser and returns the populated bundle.
+    ///
+    /// Split out of [`AnalysisEngine::analyse`] so the stages can be observed
+    /// directly. Two stages shipped that were fully implemented, documented, and
+    /// unit-tested, and that no test could catch because no test could see: nothing
+    /// called them, so the rules they fed could never fire. A stage you cannot
+    /// inspect is a stage you cannot prove is wired.
+    ///
+    /// This bypasses the cache and persistence on purpose: it is an observation
+    /// surface, not a second analysis path.
+    fn run_stages(
+        &self,
+        source: &Path,
+        asset_id: tpt_app_media_forensics_model::AssetId,
+        limitations: &mut Vec<String>,
+    ) -> Result<AnalysisBundle, CoreError> {
+        // 4. Container inspection.
+        //
+        // Only the header is read here, and only for the formats that support a
+        // partial read. An MP4's `moov` box holds the sample tables, codec
+        // descriptions, and timing, and `mdat` - which on a long recording is
+        // nearly the whole file - is never touched. Reading a whole 40 GB master
+        // to inspect a 2 KB `moov` is what makes an examination impractical, so
+        // the media data stays on disk unless sample reading is genuinely needed.
+        //
+        // Matroska has no equivalent: its `Tracks` element sits inside the
+        // `Segment`, and clusters carrying the frames follow it, so track
+        // enumeration and sample reading come from one whole-file pass. That is
+        // bounded rather than silent, and the bound is stated as a limitation.
+        let header =
+            tpt_app_media_forensics_container::read_header(source, 64 * 1024).map_err(|e| {
+                CoreError::io(
+                    "read source header",
+                    source.display().to_string(),
+                    std::io::Error::other(e),
+                )
+            })?;
+        let format = detect(&header);
+        let inspection = match format {
+            ContainerFormat::IsoBmff => read_container(
+                || tpt_app_media_forensics_container::inspect_path(source),
+                limitations,
+            ),
+            ContainerFormat::Matroska => {
+                if file_size(source) > tpt_app_media_forensics_container::MAX_INSPECTED_BYTES {
+                    limitations.push(format!(
+                        "the file is {} bytes, above the {} byte limit for whole-file Matroska \
+                         parsing, so no stream could be inspected",
+                        file_size(source),
+                        tpt_app_media_forensics_container::MAX_INSPECTED_BYTES
+                    ));
+                    None
+                } else {
+                    read_container(
+                        || tpt_app_media_forensics_container::inspect_matroska_file(source),
+                        limitations,
+                    )
+                }
+            }
+            other => {
+                limitations.push(format!(
+                    "container format {} has no demuxer integrated yet",
+                    other.tag()
+                ));
+                None
+            }
+        };
+
+        // Structural damage found by the scan below. Collected separately from
+        // `inspection.anomalies` because those are free-text strings attached to
+        // a parse, while these are typed and carry the byte offsets that make
+        // them actionable.
+        let mut structural_damage: Vec<tpt_app_media_forensics_container::StructuralDamage> =
+            Vec::new();
+
+        // 4b. Structural damage scan (spec §30).
+        //
+        // Deliberately separate from the demuxer. The demuxer returns the tracks
+        // it managed to read and reports success for everything before the point
+        // the bytes stopped making sense, so it has by construction lost the
+        // boundary — and "where does this file stop being trustworthy" is the
+        // question an examination actually turns on.
+        //
+        // Scanned from the bytes rather than the inspection result, so it runs
+        // even when the demuxer failed entirely: a file too damaged to yield
+        // any stream is precisely the file whose damage most needs recording.
+        // Reading the whole file is bounded by the same cap as inspection.
+        if format == ContainerFormat::IsoBmff {
+            let size = file_size(source);
+            if size <= tpt_app_media_forensics_container::MAX_INSPECTED_BYTES {
+                match std::fs::read(source) {
+                    Ok(bytes) => {
+                        for defect in tpt_app_media_forensics_container::scan_isobmff(&bytes) {
+                            structural_damage.push(defect);
+                        }
+                    }
+                    Err(error) => limitations.push(format!(
+                        "the file could not be read for a structural damage scan: {error}"
+                    )),
+                }
+            } else {
+                limitations.push(format!(
+                    "the file is {} bytes, above the {} byte limit for whole-file structural \
+                     scanning, so structural damage was not assessed",
+                    size,
+                    tpt_app_media_forensics_container::MAX_INSPECTED_BYTES
+                ));
+            }
+        }
+
+        // 5. Per-layer analysis.
+        let mut bundle = empty_bundle(asset_id);
+        // Samples are read once and reused: Tier-2 decodes from exactly the
+        // bytes duplicate detection hashed, so reading them twice would parse
+        // the file twice for no new information.
+        let mut samples_for_tier_two: Option<Vec<tpt_app_media_forensics_container::SampleRecord>> =
+            None;
+
+        if let Some(inspection) = &inspection {
+            bundle.container = Some(inspection.clone());
+
+            // Frame-level timing analysis reads the **video** stream. Reaching
+            // for whichever stream happened to be first meant an audio-only
+            // file had its audio frames treated as video frames, so
+            // `VIDEO.SINGLE_KEYFRAME` fired on an MP3 and GOP "structure" was
+            // reported for a track that has no concept of one.
+            if let Some(info) = inspection.first_video_frames() {
+                bundle.timestamps = vec![scan_presentation(
+                    &info.frame_times,
+                    self.profile.pts_tolerance,
+                )];
+            }
+        }
+
+        // GOP and duplicate detection both work at the packet layer.
+        if let Some(inspection) = &inspection {
+            if let Some(info) = inspection.first_video_frames() {
+                bundle.gop = Some(gop::analyse(
+                    &info.keyframes,
+                    &info.frame_times,
+                    self.profile.gop_tolerance_frames,
+                ));
+            }
+            // Duplicate detection needs every sample's bytes, so it genuinely
+            // requires the media data. On a file too large to hold, it is
+            // skipped and the gap is stated rather than silently omitted.
+            let size = file_size(source);
+            if size <= tpt_app_media_forensics_container::MAX_SAMPLED_BYTES {
+                // Sample reading is format-specific: the demuxer that
+                // enumerated the streams is the one that can read their
+                // samples. Dispatching on the detected format keeps the two
+                // paths from disagreeing about what a track contains.
+                let read = match format {
+                    ContainerFormat::Matroska => {
+                        tpt_app_media_forensics_container::read_matroska_samples_file(source)
+                    }
+                    _ => tpt_app_media_forensics_container::read_samples_file(source),
+                };
+                match read {
+                    Ok(samples) => {
+                        // Duplicate detection is a **video** measurement: a
+                        // repeated compressed video frame can mean a freeze or
+                        // an inserted still. Hashing every stream flattened
+                        // them into one sequence, so an audio track full of
+                        // identical silence packets raised
+                        // `VIDEO.DUPLICATE_FRAME_RUN` — a video finding derived
+                        // entirely from audio.
+                        let video_digests: Vec<
+                            tpt_app_media_forensics_video::duplicate::SampleDigest,
+                        > = samples
+                            .iter()
+                            .filter(|s| {
+                                inspection.streams.get(s.stream_index as usize).is_some_and(
+                                    |stream| {
+                                        stream.kind
+                                            == tpt_app_media_forensics_model::StreamKind::Video
+                                    },
+                                )
+                            })
+                            .map(|s| tpt_app_media_forensics_video::duplicate::SampleDigest {
+                                digest: s.digest.clone(),
+                                time: s.time,
+                                is_key_frame: s.is_key_frame,
+                            })
+                            .collect();
+                        if !video_digests.is_empty() {
+                            bundle.repeated_runs =
+                                find_repeated_runs(&video_digests, self.profile.min_duplicate_run);
+                        }
+                        // Tier-2 decodes from these same bytes, so they are
+                        // retained here instead of being re-read per codec.
+                        samples_for_tier_two = Some(samples);
+                    }
+                    Err(error) => limitations.push(format!(
+                        "sample reading failed, so duplicate detection was skipped: {error}"
+                    )),
+                }
+            } else {
+                limitations.push(format!(
+                    "file is {size} bytes, above the {} byte limit for sample-level duplicate detection; \
+                     structural analysis still covers it",
+                    tpt_app_media_forensics_container::MAX_SAMPLED_BYTES
+                ));
+            }
+        }
+
+        // 5c. Audio: decode a royalty-free track and measure it.
+        //
+        // The four audio rules read `audio_levels`, `silence`, and `loudness`.
+        // Until this stage existed they were never populated, so every audio
+        // rule was permanently dead no matter what the file contained.
+        self.run_audio(source, &inspection, &format, &mut bundle, limitations);
+
+        // 5c-ii. Sample index, for placing damage on a timeline (spec §31).
+        //
+        // Built from the samples already read for duplicate detection, so it
+        // costs no additional I/O. The anchor is the first `mdat`'s payload
+        // start, which is where a contiguous ISO-BMFF file's media data begins.
+        //
+        // When samples were not read — file above the sampling bound, or a read
+        // failure — the index stays empty and damage findings carry a byte
+        // offset with no timecode. That is stated rather than guessed: a
+        // timecode inferred from a sample table that was never read would be a
+        // fabrication dressed as a measurement.
+        if let Some(samples) = samples_for_tier_two.as_deref() {
+            let anchor = mdat_payload_offset(source).unwrap_or(0);
+            bundle.sample_index =
+                tpt_app_media_forensics_container::SampleIndex::build(samples, anchor);
+
+            // 5c-iii. Bitrate analysis (spec §28-§29).
+            //
+            // Built from the same samples, so it costs no additional I/O. Only
+            // video streams are measured: combining a video and an audio rate
+            // into one figure hides exactly the per-track variation the rule
+            // exists to surface, and an audio-only file gets no bitrate finding
+            // rather than a misleading one.
+            let video_samples: Vec<tpt_app_media_forensics_video::bitrate::BitrateSample> = samples
+                .iter()
+                .filter(|sample| {
+                    inspection
+                        .as_ref()
+                        .and_then(|i| i.streams.get(sample.stream_index as usize))
+                        .is_some_and(|stream| {
+                            stream.kind == tpt_app_media_forensics_model::StreamKind::Video
+                        })
+                })
+                .map(
+                    |sample| tpt_app_media_forensics_video::bitrate::BitrateSample {
+                        time: sample.time,
+                        size: sample.size as u64,
+                        is_key_frame: sample.is_key_frame,
+                    },
+                )
+                .collect();
+
+            if video_samples.len() >= 2 {
+                bundle.bitrate = Some(tpt_app_media_forensics_video::bitrate::analyse(
+                    &video_samples,
+                    self.profile.bitrate_window_frames,
+                    self.profile.bitrate_anomaly_ratio,
+                ));
+            }
+        }
+
+        // 5d. A/V synchronisation, when the file actually has both streams.
+        //
+        // `av_sync::analyse` is implemented and tested, but until this stage
+        // existed nothing called it, so `bundle.sync` stayed `None` and
+        // `TIMING.AV_SYNC_DRIFT` never fired on any file.
+        self.run_av_sync(&inspection, &mut bundle, limitations);
+
+        // Metadata lives in moov, which was already read for inspection, so this
+        // costs nothing extra and never touches the media data.
+        // 5b. Tier-2: pixel-level analysis (spec §16-§18).
+        //
+        // Runs only when the samples were already read and the decoder is
+        // pixel-exact. Every reason Tier-2 cannot run becomes a limitation, so a
+        // report never implies a measurement was made when it was not.
+        self.run_tier_two(&samples_for_tier_two, &inspection, &mut bundle, limitations);
+
+        // Metadata extraction reads ISO-BMFF atoms. A Matroska file carries its
+        // tags in a different element tree that this build does not parse, so
+        // the absence is stated rather than left to look like a file with no
+        // metadata at all — the two are different observations.
+        bundle.metadata = match format {
+            ContainerFormat::IsoBmff => tpt_app_media_forensics_container::read_moov(source)
+                .ok()
+                .and_then(|bytes| extract_metadata(&bytes)),
+            ContainerFormat::Matroska => {
+                limitations.push(
+                    "Matroska tags are not extracted by this build; only ISO-BMFF metadata \
+                     atoms are read"
+                        .to_owned(),
+                );
+                None
+            }
+            _ => None,
+        };
+        if bundle.metadata.as_ref().is_none_or(MetadataTree::is_empty) {
+            limitations.push("no readable metadata atoms were found".to_owned());
+        }
+
+        // Damage is attached to the bundle so rules can grade it. An empty
+        // vector means "scanned and found nothing", which is a measurement; a
+        // `None` would mean "never scanned", which is a gap. The distinction is
+        // the whole point of recording it here rather than logging it.
+        bundle.damage = structural_damage;
+
+        Ok(bundle)
+    }
+
+    /// Runs every per-layer analyser over `source` and returns the bundle.
+    ///
+    /// This is the observation surface the unwired-stage guard is built on. It
+    /// deliberately bypasses the cache and writes nothing to the case: it exists
+    /// so a test can ask "which analyses actually ran?" rather than inferring it
+    /// from findings, which cannot distinguish "the stage ran and found nothing"
+    /// from "the stage never ran".
+    ///
+    /// A source that cannot even be acquired yields an empty bundle and the
+    /// reason, rather than an error: the guard runs over a corpus and should not
+    /// abort because one fixture is unreadable.
+    #[must_use]
+    pub fn observe_stages(&self, source: &Path) -> (AnalysisBundle, Vec<String>) {
+        let asset = match acquisition::acquire_asset(source, MediaType::Container) {
+            Ok(asset) => asset,
+            Err(error) => {
+                return (
+                    empty_bundle(tpt_app_media_forensics_model::AssetId::new_derived(&[
+                        b"unreadable",
+                    ])),
+                    vec![format!("the source could not be acquired: {error}")],
+                );
+            }
+        };
+
+        let mut limitations = Vec::new();
+        match self.run_stages(source, asset.id, &mut limitations) {
+            Ok(bundle) => (bundle, limitations),
+            Err(error) => (
+                empty_bundle(asset.id),
+                vec![format!("analysis could not run: {error}")],
+            ),
+        }
+    }
+
+    /// Compares audio and video presentation timing when the file has both.
+    ///
+    /// A/V offset is only meaningful when both streams exist. A video-only or
+    /// audio-only file therefore produces no sync report and no limitation: the
+    /// measurement was never applicable, which is a different statement from
+    /// having been attempted and failed.
+    fn run_av_sync(
+        &self,
+        inspection: &Option<tpt_app_media_forensics_container::ContainerInspection>,
+        bundle: &mut AnalysisBundle,
+        limitations: &mut Vec<String>,
+    ) {
+        use tpt_app_media_forensics_model::StreamKind;
+        use tpt_app_media_forensics_timing::av_sync::{analyse, AudioSamples, VideoSamples};
+
+        let Some(inspection) = inspection else {
+            return;
+        };
+
+        // Both tracks must be located by kind. Taking the first two streams
+        // would compare audio against video for most files and audio against
+        // audio for the rest, and the second case yields a confident,
+        // meaningless zero offset.
+        let frames_of = |kind: StreamKind| -> Option<Vec<_>> {
+            let position = inspection.streams.iter().position(|s| s.kind == kind)?;
+            inspection
+                .frame_info
+                .get(position)
+                .and_then(|info| info.as_ref())
+                .map(|info| info.frame_times.clone())
+        };
+
+        let (Some(video), Some(audio)) =
+            (frames_of(StreamKind::Video), frames_of(StreamKind::Audio))
+        else {
+            return;
+        };
+
+        match analyse(
+            &VideoSamples { timestamps: video },
+            &AudioSamples { timestamps: audio },
+        ) {
+            Ok(report) => bundle.sync = Some(report),
+            // Neither an offset nor a drift can come from a single point.
+            // Saying so beats reporting a zero offset that was never measured.
+            Err(error) => {
+                limitations.push(format!(
+                    "A/V synchronisation could not be measured: {error}"
+                ));
+            }
+        }
+    }
+
+    /// Runs audio analysis, recording why it was skipped if it was.
+    ///
+    /// Only royalty-free codecs are decoded. A patent-encumbered track is
+    /// reported as *not decoded by this build*, which is a different statement
+    /// from "the audio was clean" — and the difference matters, because the
+    /// audio rules would otherwise silently contribute nothing while the report
+    /// reads as though they had run and found nothing.
+    ///
+    /// Exactly one track is measured. A file with several audio tracks would
+    /// need a choice of which is primary, and picking one silently would make
+    /// the result depend on container order. That is stated instead.
+    fn run_audio(
+        &self,
+        source: &Path,
+        inspection: &Option<tpt_app_media_forensics_container::ContainerInspection>,
+        format: &ContainerFormat,
+        bundle: &mut AnalysisBundle,
+        limitations: &mut Vec<String>,
+    ) {
+        use tpt_app_media_forensics_audio::is_audio_decodable;
+
+        let Some(inspection) = inspection else {
+            return;
+        };
+        let tracks: Vec<_> = inspection
+            .streams
+            .iter()
+            .filter(|s| s.kind == tpt_app_media_forensics_model::StreamKind::Audio)
+            .collect();
+
+        if tracks.is_empty() {
+            return;
+        }
+        if tracks.len() > 1 {
+            limitations.push(format!(
+                "the file carries {} audio tracks; only the first (index {}) was decoded and \
+                 measured, so findings describe that track alone",
+                tracks.len(),
+                tracks[0].index
+            ));
+        }
+
+        let track = tracks[0];
+        if !is_audio_decodable(&track.codec.name) {
+            limitations.push(format!(
+                "the audio track is `{}`, which this build does not decode (only royalty-free \
+                 Opus and Vorbis are). Its declared properties are reported; its signal was \
+                 not measured, so no audio finding applies to it",
+                track.codec.name
+            ));
+            return;
+        }
+
+        // Matroska audio arrives as demuxed access units, not as a bare Ogg
+        // stream. A WebM file is Matroska, and handing its bytes to an Ogg
+        // reader fails on the capture pattern — the two formats share a
+        // lineage and nothing else.
+        let limits = tpt_app_media_forensics_audio::AudioDecodeLimits::new(2);
+        let decoded = match format {
+            ContainerFormat::Matroska => {
+                let samples =
+                    match tpt_app_media_forensics_container::read_matroska_samples_file(source) {
+                        Ok(samples) => samples,
+                        Err(error) => {
+                            limitations.push(format!("the audio track could not be read: {error}"));
+                            return;
+                        }
+                    };
+                let payloads: Vec<Vec<u8>> = samples
+                    .iter()
+                    .filter(|s| s.stream_index == track.index)
+                    .map(|s| s.data.clone())
+                    .collect();
+                if payloads.is_empty() {
+                    limitations.push(
+                        "the audio track declared no samples, so it was not measured".to_owned(),
+                    );
+                    return;
+                }
+                // Matroska carries Opus in the same channel layout Opus itself
+                // uses, so the track's declared channel count is the right one
+                // to decode at.
+                let channels = track.audio.as_ref().map_or(1, |a| a.channel_count().max(1));
+                tpt_app_media_forensics_audio::decode_opus_packets(&payloads, channels, limits)
+            }
+            _ => {
+                limitations.push(
+                    "audio decoding covers Opus and Vorbis; audio inside MP4 is identified but \
+                     not decoded by this build"
+                        .to_owned(),
+                );
+                return;
+            }
+        };
+
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                limitations.push(format!("the audio track could not be decoded: {error}"));
+                return;
+            }
+        };
+
+        if decoded.truncated {
+            limitations.push(
+                "audio decoding stopped at the frame limit; the audio findings below describe \
+                 a prefix of the track, not the whole of it"
+                    .to_owned(),
+            );
+        }
+
+        match measure_audio(
+            &decoded.pcm,
+            decoded.channels,
+            decoded.sample_rate,
+            &self.profile,
+        ) {
+            Some(measured) => {
+                bundle.audio_levels = Some(measured.levels);
+                bundle.silence = measured.silence;
+                bundle.loudness = measured.loudness;
+            }
+            None => limitations
+                .push("the audio track decoded to no samples, so it was not measured".to_owned()),
+        }
+    }
+
     /// Runs pixel-level analysis, recording why it was skipped if it was.
     ///
     /// Tier-2 needs the encoded samples, which are only in memory when the file
@@ -293,13 +712,13 @@ impl AnalysisEngine {
     /// omits a measurement without saying so would read as though none was due.
     fn run_tier_two(
         &self,
-        source: &Path,
-        inspection: &Option<tpt_app_media_forensics_container::Mp4Inspection>,
+        samples: &Option<Vec<tpt_app_media_forensics_container::SampleRecord>>,
+        inspection: &Option<tpt_app_media_forensics_container::ContainerInspection>,
         bundle: &mut AnalysisBundle,
         limitations: &mut Vec<String>,
     ) {
         use tpt_app_media_forensics_video::{
-            is_h264, near_duplicate, scene, DecodeLimits, DecodeSession,
+            is_decodable, near_duplicate, scene, DecodeLimits, DecodeSession,
         };
 
         let Some(inspection) = inspection else {
@@ -317,20 +736,20 @@ impl AnalysisEngine {
             return;
         };
 
-        if !is_h264(&stream.codec.name) {
+        if !is_decodable(&stream.codec.name) {
             limitations.push(format!(
-                "Tier-2 pixel analysis was not run: codec `{}` has no integrated decoder",
+                "Tier-2 pixel analysis was not run: codec `{}` has no integrated decoder \
+                 (only royalty-free VP9 and AV1 are decoded)",
                 stream.codec.name
             ));
             return;
         }
 
-        let samples = match tpt_app_media_forensics_container::read_samples_file(source) {
-            Ok(samples) => samples,
-            Err(error) => {
-                limitations.push(format!("Tier-2 pixel analysis was not run: {error}"));
-                return;
-            }
+        let Some(samples) = samples else {
+            limitations.push(
+                "Tier-2 pixel analysis was not run: the encoded samples were not read".to_owned(),
+            );
+            return;
         };
 
         let packets: Vec<(Vec<u8>, bool)> = samples
@@ -598,6 +1017,92 @@ pub fn detect_source(path: &Path) -> Result<ContainerFormat, CoreError> {
         .map_err(|e| CoreError::io("read source header", path.display().to_string(), e))
 }
 
+/// A file's size in bytes, or 0 when it cannot be stat'd.
+///
+/// A stat failure reads as zero so that callers treat the file as within every
+/// bound and let the subsequent read produce the real, specific error. Guessing
+/// a large size instead would report a size limitation for a file whose actual
+/// problem is that it could not be opened.
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or_default()
+}
+
+/// Byte offset where the first `mdat`'s payload begins.
+///
+/// This is the anchor the sample index accumulates from, so it must come from
+/// the file's own layout rather than a constant: an MP4 may place `mdat` before
+/// or after `moov`, and an anchor that assumed the usual order would shift every
+/// sample position by the size of whatever precedes it.
+///
+/// Returns `None` when the file cannot be read or holds no `mdat`. The caller
+/// then leaves the index empty rather than anchoring at zero, because a zero
+/// anchor silently produces plausible-looking but wrong offsets — the worst
+/// failure mode for a value a report will present as a location.
+fn mdat_payload_offset(path: &Path) -> Option<u64> {
+    use tpt_app_media_forensics_container::{read_header, MAX_INSPECTED_BYTES};
+
+    if file_size(path) > MAX_INSPECTED_BYTES {
+        return None;
+    }
+    let header = read_header(path, 64 * 1024).ok()?;
+
+    let mut offset = 0u64;
+    let total = header.len() as u64;
+    while offset.saturating_add(8) <= total {
+        let at = offset as usize;
+        let declared = u64::from(u32::from_be_bytes(
+            header[at..at + 4].try_into().unwrap_or([0; 4]),
+        ));
+        let box_type = &header[at + 4..at + 8];
+
+        if box_type == b"mdat" {
+            // Size 1 means a 64-bit size follows the type field; size 0 means
+            // the box runs to end of file. In every case the payload starts
+            // after the header, whose length is what actually matters here.
+            let header_len = if declared == 1 { 16 } else { 8 };
+            return Some(offset.saturating_add(header_len));
+        }
+
+        // Stop at `moov`: media data conventionally follows it, and walking
+        // into `mdat` payload looking for another `mdat` would find sample bytes.
+        if box_type == b"moov" {
+            return None;
+        }
+
+        let advance = if declared == 0 {
+            total
+        } else {
+            declared.max(8)
+        };
+        if advance <= offset {
+            break;
+        }
+        offset = offset.saturating_add(advance);
+    }
+    None
+}
+
+/// Runs one container inspection, recording failure as a limitation.
+///
+/// A file that cannot be inspected must still produce a report: the reason is
+/// an observation about the evidence, and refusing the whole examination would
+/// hide the container-level findings that did parse.
+fn read_container(
+    inspect: impl FnOnce() -> Result<
+        tpt_app_media_forensics_container::ContainerInspection,
+        tpt_app_media_forensics_container::ContainerError,
+    >,
+    limitations: &mut Vec<String>,
+) -> Option<tpt_app_media_forensics_container::ContainerInspection> {
+    match inspect() {
+        Ok(inspection) => Some(inspection),
+        Err(error) => {
+            limitations.push(format!("container structure could not be read: {error}"));
+            None
+        }
+    }
+}
+
 /// Reports whether a file's extension matches its detected container.
 ///
 /// # Errors
@@ -609,24 +1114,41 @@ pub fn extension_matches_source(path: &Path) -> Result<bool, CoreError> {
 
 /// Computes audio measurements for a decoded PCM buffer.
 ///
-/// # Errors
+/// Returns levels, silence regions, and integrated loudness. Silence is measured
+/// here rather than left to the caller so that the three measurements always
+/// come from the same PCM buffer: measuring silence against a different slice
+/// than the levels would let a report pair a level with a silence region that
+/// does not describe the same audio.
 ///
-/// Never; returns the levels, or `None` when there are no samples.
+/// Returns `None` only when there are no samples, which is "there is no audio"
+/// rather than "the audio is silent".
+#[must_use]
 pub fn measure_audio(
     pcm: &[f32],
     channels: u16,
     sample_rate: u32,
-) -> Option<(
-    tpt_app_media_forensics_audio::LevelStats,
-    Option<Measurement>,
-)> {
-    if pcm.is_empty() {
+    profile: &RuleProfile,
+) -> Option<AudioMeasurements> {
+    if pcm.is_empty() || channels == 0 {
         return None;
     }
-    let levels = level_stats(pcm);
-    let loudness =
-        tpt_app_media_forensics_audio::integrated_loudness(pcm, channels, sample_rate).ok();
-    Some((levels, loudness))
+    let silence = find_silence(pcm, profile.silence_threshold, profile.min_silence_frames);
+    Some(AudioMeasurements {
+        levels: level_stats(pcm),
+        silence,
+        loudness: integrated_loudness(pcm, channels, sample_rate).ok(),
+    })
+}
+
+/// The audio measurements the rules consume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioMeasurements {
+    /// Peak, RMS, and mean of the decoded signal.
+    pub levels: tpt_app_media_forensics_audio::LevelStats,
+    /// Sustained regions below the profile's silence threshold.
+    pub silence: Vec<tpt_app_media_forensics_audio::SilenceRegion>,
+    /// Integrated loudness, when it could be measured correctly.
+    pub loudness: Option<Measurement>,
 }
 
 /// The time at which an analysis started, used only for reporting.

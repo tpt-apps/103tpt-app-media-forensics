@@ -93,8 +93,8 @@ analyzer a rule consumes.
 
 ## The built-in rule set
 
-Twenty-one rules ship in Phase 1. The engine evaluates them in sorted rule-ID
-order regardless of registration order, so the set cannot drift.
+Twenty-six rules ship in Phase 1. The engine evaluates them in sorted
+rule-ID order regardless of registration order, so the set cannot drift.
 
 ```text
 CONTAINER.PARSE_ANOMALY
@@ -103,11 +103,16 @@ CONTAINER.STREAM_DURATION_MISSING
 CONTAINER.STREAM_START_OFFSET
 CONTAINER.MALFORMED_STRUCTURE
 CONTAINER.NO_USABLE_STREAMS
+CONTAINER.STRUCTURAL_DEFECT
+CONTAINER.TRUNCATED_MEDIA
 VIDEO.ALL_FRAMES_KEYFRAMES
 VIDEO.SINGLE_KEYFRAME
 VIDEO.FRAME_RATE_CHANGE
 VIDEO.GOP_LENGTH_CHANGE
+VIDEO.BITRATE_DROP
 VIDEO.DUPLICATE_FRAME_RUN
+VIDEO.SCENE_CHANGE
+VIDEO.NEAR_DUPLICATE_FRAME
 AUDIO.CLIPPING
 AUDIO.DC_OFFSET
 AUDIO.SILENCE_REGION
@@ -119,6 +124,9 @@ METADATA.TIMESTAMP_CONFLICT
 METADATA.DECLARED_VS_MEASURED_MISMATCH
 METADATA.MISSING_CREATION_TIME
 ```
+
+A test asserts this list matches `builtin_rules()`, so the count in this
+document cannot drift from the code the way a hand-maintained list would.
 
 ### Severity and confidence are not interchangeable
 

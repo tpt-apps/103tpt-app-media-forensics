@@ -14,9 +14,13 @@
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod bitrate;
+
+pub use bitrate::{analyse as analyse_bitrate, BitrateAnomaly, BitrateReport, BitrateSample};
+
 pub mod decode;
 
-pub use decode::{is_h264, DecodeError, DecodeLimits, DecodeSession, DecodedFrame};
+pub use decode::{is_decodable, DecodeError, DecodeLimits, DecodeSession, DecodedFrame};
 
 pub mod near_duplicate;
 

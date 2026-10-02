@@ -228,8 +228,19 @@ pub struct StreamTiming {
     pub timebase: Timebase,
     /// Declared stream start time.
     pub start_time: MediaTime,
-    /// Declared stream duration.
+    /// Duration the container **declares** for this stream, from its `mdhd`.
     pub duration: Option<MediaTime>,
+    /// Duration the container's **sample tables** actually add up to.
+    ///
+    /// Kept separate from `duration` because they are different claims and
+    /// disagreeing is the observation (spec §26). A container whose header says
+    /// one length and whose sample table sums to another has had its headers
+    /// rewritten without its media data being rewritten to match — which is
+    /// what a partial re-mux, a splice, or a header-only edit leaves behind.
+    ///
+    /// `None` when the sample table yields no usable total, which is "could not
+    /// be measured" rather than "agrees with the declaration".
+    pub measured_duration: Option<MediaTime>,
     /// Container edit-list offset applied to this stream, when present.
     pub edit_list_offset: Option<MediaTime>,
 }
@@ -296,6 +307,7 @@ mod tests {
                 timebase: Timebase::from_ticks_per_second(30_000),
                 start_time: MediaTime::ZERO,
                 duration: None,
+                measured_duration: None,
                 edit_list_offset: None,
             },
             video: Some(VideoFormat {

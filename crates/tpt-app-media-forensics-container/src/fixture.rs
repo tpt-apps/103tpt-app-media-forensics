@@ -76,9 +76,87 @@ pub struct TrackSpec {
     /// More than one entry models a track whose cadence changes, which is a
     /// forensic condition rather than an error.
     pub timing: Vec<(u32, u32)>,
+    /// Overrides the duration written into `mdhd`, in timescale units.
+    ///
+    /// `None` writes the value a correct muxer would: the sum of the `stts`
+    /// deltas. Setting it to anything else produces a container whose header
+    /// claims a length its own sample table does not support, which is the
+    /// condition `METADATA.DECLARED_VS_MEASURED_MISMATCH` exists to catch. No
+    /// real muxer would write this; a hand-edited or partially re-muxed file
+    /// would, and without a fixture for it the rule could only ever be tested
+    /// by asserting that it finds nothing.
+    pub declared_duration: Option<u64>,
+    /// A half-open range of frames whose samples are made byte-identical.
+    ///
+    /// `None` — the default, and what a normal file looks like — gives every
+    /// sample its own payload. Setting a range builds a file with genuinely
+    /// repeated frames, which is what `VIDEO.DUPLICATE_FRAME_RUN` exists to
+    /// report.
+    ///
+    /// This field exists because the fixtures used to store an all-zero
+    /// `mdat`. Every sample then hashed the same, so *every* fixture was a
+    /// 60-frame duplicate run and the rule fired on files meant to be clean.
+    /// That made a detection indistinguishable from noise, and hid the one
+    /// fixture needed to exercise the rule at all.
+    pub repeated_frames: Option<(u32, u32)>,
+
+    /// A half-open frame range whose samples carry a much smaller payload.
+    ///
+    /// `None` — the default — gives every sample the same 100 bytes, which is
+    /// what makes an ordinary fixture hold a steady rate.
+    ///
+    /// This field exists because every sample in every fixture was the same
+    /// size, so the bitrate was uniform across the whole corpus and
+    /// `VIDEO.BITRATE_DROP` could not fire on any file. That is the same defect
+    /// `repeated_frames` was added for, one analysis layer over: a rule whose
+    /// trigger condition no fixture produces can only ever be tested by
+    /// asserting that it finds nothing, which is indistinguishable from a rule
+    /// that is correct and silent.
+    pub reduced_payload_frames: Option<(u32, u32)>,
 }
 
 impl TrackSpec {
+    /// The stored bytes for sample `index`.
+    ///
+    /// Samples inside `repeated_frames` share a payload; all others get one of
+    /// their own. The pattern is seeded per sample so two distinct samples
+    /// cannot collide: `37` is coprime with `251`, so distinct seeds below 251
+    /// give distinct leading bytes.
+    fn sample_payload(&self, index: u32) -> Vec<u8> {
+        // Eight against a hundred: a 12x drop, comfortably past the default
+        // profile's 0.5 threshold and past anything a steady encoder produces on
+        // ordinary motion.
+        const REDUCED_SAMPLE_BYTES: usize = 8;
+        const SAMPLE_BYTES: usize = 100;
+
+        // A reduced-payload frame models content that compresses far more
+        // easily than its neighbours — a still shot, or a region encoded by a
+        // different pass.
+        if let Some((start, count)) = self.reduced_payload_frames {
+            if index >= start && index < start.saturating_add(count) {
+                return vec![0x5A; REDUCED_SAMPLE_BYTES];
+            }
+        }
+
+        let seed = match self.repeated_frames {
+            Some((start, count)) if index >= start && index < start.saturating_add(count) => start,
+            _ => index,
+        };
+        (0..SAMPLE_BYTES)
+            .map(|i| ((i * 11 + 7 + seed as usize * 37) % 251) as u8)
+            .collect()
+    }
+
+    /// Returns the duration `mdhd` should declare, honouring any override.
+    fn declared_duration_ticks(&self) -> u64 {
+        self.declared_duration.unwrap_or_else(|| {
+            self.timing
+                .iter()
+                .map(|(count, delta)| u64::from(*count) * u64::from(*delta))
+                .sum()
+        })
+    }
+
     /// A 25 fps video track of `frames` frames.
     #[must_use]
     pub fn video_25fps(width: u16, height: u16, frames: u32) -> Self {
@@ -88,6 +166,9 @@ impl TrackSpec {
             height,
             timescale: 25,
             timing: vec![(frames, 1)],
+            declared_duration: None,
+            repeated_frames: None,
+            reduced_payload_frames: None,
         }
     }
 
@@ -100,6 +181,9 @@ impl TrackSpec {
             height: 0,
             timescale: 48_000,
             timing: vec![(frames, 1)],
+            declared_duration: None,
+            repeated_frames: None,
+            reduced_payload_frames: None,
         }
     }
 
@@ -135,11 +219,133 @@ impl TrackSpec {
 /// `u32::MAX` by construction because the payload is built in memory.
 #[must_use]
 pub fn build_mp4(track: &TrackSpec) -> Vec<u8> {
-    build_mp4_inner(track, None)
+    build_mp4_multi(&[(track, TrackExtras::default())])
 }
 
-/// Shared MP4 builder, optionally writing an `stss` sync-sample table.
-fn build_mp4_inner(track: &TrackSpec, keyframes: Option<&[u32]>) -> Vec<u8> {
+/// Builds an MP4 whose video track repeats frames `start..start + count`.
+///
+/// Every sample in that range is byte-identical, which is what a frozen frame or
+/// an inserted still looks like to compressed-sample comparison.
+#[must_use]
+pub fn build_mp4_with_repeated_frames(start: u32, count: u32) -> Vec<u8> {
+    let mut track = TrackSpec::video_25fps(320, 240, 60);
+    track.repeated_frames = Some((start, count));
+    build_mp4(&track)
+}
+
+/// Builds an MP4 whose samples drop sharply in size over `start..start + count`.
+///
+/// The shape spec §29 describes: an ordinary file that suddenly compresses far
+/// more easily over part of its length. The rest of the track keeps the standard
+/// payload so the file has a genuine average to depart from — without that, a
+/// uniformly small file has no anomaly to report, and the rule would be
+/// untestable.
+///
+/// Built by shrinking sample payloads rather than by declaring a different
+/// bitrate, because the measurement is made from the sample table: a container
+/// that merely *claims* a low bitrate while its samples stay large would not
+/// produce the observation this fixture exists to create.
+#[must_use]
+pub fn build_mp4_with_bitrate_drop(start: u32, count: u32) -> Vec<u8> {
+    let mut track = TrackSpec::video_25fps(320, 240, 120);
+    track.reduced_payload_frames = Some((start, count));
+    build_mp4(&track)
+}
+
+/// Builds an MP4 carrying a video track and an audio track.
+///
+/// `audio_start_delay_ms` shifts the audio track's edit list so the two streams
+/// are measurably offset. Zero gives a synchronised pair.
+#[must_use]
+pub fn build_mp4_av(video: &TrackSpec, audio: &TrackSpec, audio_start_delay_ms: u32) -> Vec<u8> {
+    build_mp4_multi(&[
+        (video, TrackExtras::default()),
+        (
+            audio,
+            TrackExtras {
+                edit_delay_ms: audio_start_delay_ms,
+                ..TrackExtras::default()
+            },
+        ),
+    ])
+}
+
+/// Per-track options most callers never need to name.
+#[derive(Debug, Clone, Copy, Default)]
+struct TrackExtras<'a> {
+    /// Sync-sample table; `None` omits `stss`, which per the specification means
+    /// every sample is a sync sample.
+    keyframes: Option<&'a [u32]>,
+    /// How far this track's edit list delays its start, in milliseconds.
+    edit_delay_ms: u32,
+}
+
+/// The `ftyp` body, hoisted because its length sets where sample data begins and
+/// must not be counted in two places that could drift apart.
+const FTYP_BODY: &[u8] = b"isom\x00\x00\x02\x00isomiso2avc1mp41";
+
+/// Builds a file carrying every given track, in order.
+///
+/// One pass over the layout rather than a splice. Splicing a second track into a
+/// finished single-track file produced two silent defects in a row: the audio
+/// track's `mdat` was never copied, so its chunk offset pointed into the video's
+/// data, and growing `moov` moved the bytes the video's offset pointed at.
+fn build_mp4_multi(tracks: &[(&TrackSpec, TrackExtras<'_>)]) -> Vec<u8> {
+    let mut mvhd = vec![0u8; 4];
+    mvhd.extend_from_slice(&u32be(0));
+    mvhd.extend_from_slice(&u32be(0));
+    mvhd.extend_from_slice(&u32be(1000));
+    mvhd.extend_from_slice(&u32be(0));
+    mvhd.extend_from_slice(&[0u8; 80]);
+    let mvhd_box = mp4_box(b"mvhd", &mvhd);
+
+    let mut built: Vec<(Vec<u8>, usize)> = tracks
+        .iter()
+        .enumerate()
+        .map(|(index, (track, extras))| build_trak(track, *extras, index as u32 + 1))
+        .collect();
+
+    let moov_len = built.iter().map(|(trak, _)| trak.len()).sum::<usize>() + mvhd_box.len() + 8;
+
+    // Sample data, laid out track by track in declaration order. `mdat` is a
+    // single box for every track: a chunk beyond the `mdat` it was sized
+    // against has no bytes left to read, and the demuxer does not survive that.
+    let mut media = Vec::new();
+    let mut starts = Vec::new();
+    for (track, _) in tracks {
+        starts.push(media.len());
+        for index in 0..track.sample_count() {
+            media.extend_from_slice(&track.sample_payload(index));
+        }
+    }
+
+    // ftyp box, moov box, then the mdat header.
+    let first_sample = FTYP_BODY.len() + 8 + moov_len + 8;
+    for ((trak, value_at), start) in built.iter_mut().zip(starts) {
+        let offset = u32::try_from(first_sample + start).unwrap_or(u32::MAX);
+        trak[*value_at..*value_at + 4].copy_from_slice(&u32be(offset));
+    }
+
+    let mut out = mp4_box(b"ftyp", FTYP_BODY);
+    out.extend_from_slice(&u32::try_from(moov_len).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(b"moov");
+    out.extend_from_slice(&mvhd_box);
+    for (trak, _) in &built {
+        out.extend_from_slice(trak);
+    }
+    out.extend_from_slice(&mp4_box(b"mdat", &media));
+    out
+}
+
+/// Builds one `trak`, and reports where its chunk-offset value sits inside it.
+///
+/// The position is *recorded while building*, never found by searching the
+/// result afterwards. Every earlier version located `stco` by walking the bytes,
+/// and each walk failed differently: one scanned only the top level and so
+/// silently found nothing, and another read the entry count from the wrong word.
+/// Both produced a file that looked valid and was not. Recording the offset as
+/// the boxes are assembled removes the possibility rather than managing it.
+fn build_trak(track: &TrackSpec, extras: TrackExtras<'_>, track_id: u32) -> (Vec<u8>, usize) {
     let sample_count = track.sample_count();
     let total_duration: u64 = track
         .timing
@@ -147,29 +353,62 @@ fn build_mp4_inner(track: &TrackSpec, keyframes: Option<&[u32]>) -> Vec<u8> {
         .map(|(count, delta)| u64::from(*count) * u64::from(*delta))
         .sum();
 
-    let mut stts_payload = vec![0u8; 4];
-    stts_payload.extend_from_slice(&u32be(track.timing.len() as u32));
+    let mut stbl = mp4_box(
+        b"stsd",
+        &stsd(&track.sample_entry_fourcc(), track.width, track.height),
+    );
+
+    let mut stts = vec![0u8; 4];
+    stts.extend_from_slice(&u32be(track.timing.len() as u32));
     for (count, delta) in &track.timing {
-        stts_payload.extend_from_slice(&u32be(*count));
-        stts_payload.extend_from_slice(&u32be(*delta));
+        stts.extend_from_slice(&u32be(*count));
+        stts.extend_from_slice(&u32be(*delta));
     }
+    stbl.extend_from_slice(&mp4_box(b"stts", &stts));
 
-    let mut stsz_payload = vec![0u8; 4];
-    stsz_payload.extend_from_slice(&u32be(0)); // sample_size (0 = variable)
-    stsz_payload.extend_from_slice(&u32be(sample_count));
-    for _ in 0..sample_count {
-        stsz_payload.extend_from_slice(&u32be(100));
+    if let Some(frames) = extras.keyframes {
+        stbl.extend_from_slice(&mp4_box(b"stss", &stss(frames)));
     }
+    stbl.extend_from_slice(&mp4_box(b"stsc", &stsc(sample_count)));
 
-    let mut stco_payload = vec![0u8; 4];
-    stco_payload.extend_from_slice(&u32be(1)); // entry_count
-    stco_payload.extend_from_slice(&u32be(0)); // chunk offset
+    let mut stsz = vec![0u8; 4];
+    stsz.extend_from_slice(&u32be(0)); // sample_size (0 = variable)
+    stsz.extend_from_slice(&u32be(sample_count));
+    // Each entry must be the size of the payload actually written. Hardcoding
+    // one constant here would make `stsz` disagree with `mdat` — a container
+    // that declares every sample as the same size regardless of its contents.
+    //
+    // That defect is invisible until an analysis reads sample *sizes* rather than
+    // sample *count*, which is exactly what the bitrate analysis does: the
+    // fixture would have carried a uniform declared rate while its payload
+    // varied, and the rule would have been tested against a lie.
+    for index in 0..sample_count {
+        stsz.extend_from_slice(&u32be(track.sample_payload(index).len() as u32));
+    }
+    stbl.extend_from_slice(&mp4_box(b"stsz", &stsz));
+
+    // `stco` goes last in `stbl`. 16 accounts for its 8-byte box header and the
+    // 8 bytes of payload before the first offset value.
+    let value_in_stbl = stbl.len() + 16;
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&u32be(1)); // entry_count
+    stco.extend_from_slice(&u32be(0)); // patched by the caller
+    stbl.extend_from_slice(&mp4_box(b"stco", &stco));
+    let stbl_box = mp4_box(b"stbl", &stbl);
+
+    let mut minf = mp4_box(b"vmhd", &[0u8; 12]);
+    let stbl_at = minf.len();
+    minf.extend_from_slice(&stbl_box);
+    let value_in_minf = stbl_at + 8 + value_in_stbl;
+    let minf_box = mp4_box(b"minf", &minf);
 
     let mut mdhd = vec![0u8; 4];
-    mdhd.extend_from_slice(&u32be(0));
-    mdhd.extend_from_slice(&u32be(0));
+    mdhd.extend_from_slice(&u32be(0)); // creation time
+    mdhd.extend_from_slice(&u32be(0)); // modification time
     mdhd.extend_from_slice(&u32be(track.timescale));
-    mdhd.extend_from_slice(&u32be(total_duration.min(u64::from(u32::MAX)) as u32));
+    mdhd.extend_from_slice(&u32be(
+        track.declared_duration_ticks().min(u64::from(u32::MAX)) as u32,
+    ));
     mdhd.extend_from_slice(&u32be(0x55C4)); // language 'und'
     mdhd.extend_from_slice(&u16be(0));
 
@@ -179,17 +418,16 @@ fn build_mp4_inner(track: &TrackSpec, keyframes: Option<&[u32]>) -> Vec<u8> {
     hdlr.extend_from_slice(&[0u8; 12]);
     hdlr.extend_from_slice(b"VideoHandler\0");
 
-    let mut mvhd = vec![0u8; 4];
-    mvhd.extend_from_slice(&u32be(0));
-    mvhd.extend_from_slice(&u32be(0));
-    mvhd.extend_from_slice(&u32be(1000));
-    mvhd.extend_from_slice(&u32be(0));
-    mvhd.extend_from_slice(&[0u8; 80]);
+    let mut mdia = mp4_box(b"mdhd", &mdhd);
+    mdia.extend_from_slice(&mp4_box(b"hdlr", &hdlr));
+    let minf_at = mdia.len();
+    mdia.extend_from_slice(&minf_box);
+    let value_in_mdia = minf_at + 8 + value_in_minf;
 
     let mut tkhd = vec![0u8; 4];
     tkhd.extend_from_slice(&u32be(0));
     tkhd.extend_from_slice(&u32be(0));
-    tkhd.extend_from_slice(&u32be(1));
+    tkhd.extend_from_slice(&u32be(track_id));
     tkhd.extend_from_slice(&u32be(0));
     tkhd.extend_from_slice(&u32be(total_duration.min(u64::from(u32::MAX)) as u32));
     tkhd.extend_from_slice(&[0u8; 8]);
@@ -201,58 +439,110 @@ fn build_mp4_inner(track: &TrackSpec, keyframes: Option<&[u32]>) -> Vec<u8> {
     tkhd.extend_from_slice(&u32be(u32::from(track.width) << 16));
     tkhd.extend_from_slice(&u32be(u32::from(track.height) << 16));
 
-    let stbl = {
-        let boxes = mp4_box(
-            b"stsd",
-            &stsd(&track.sample_entry_fourcc(), track.width, track.height),
-        );
-        let mut boxes = boxes;
-        boxes.extend_from_slice(&mp4_box(b"stts", &stts_payload));
-        if let Some(frames) = keyframes {
-            boxes.extend_from_slice(&mp4_box(b"stss", &stss(frames)));
+    // `trak`'s own box header is added last, and the recorded position moves with
+    // it. Omitting it left the file with `tkhd` and `mdia` sitting directly in
+    // `moov` — which parses as a file that declares no tracks at all, and looks
+    // entirely plausible in a byte dump.
+    let mut payload = mp4_box(b"tkhd", &tkhd);
+    if extras.edit_delay_ms > 0 {
+        payload.extend_from_slice(&edit_list(track, extras.edit_delay_ms));
+    }
+    let mdia_at = payload.len();
+    payload.extend_from_slice(&mp4_box(b"mdia", &mdia));
+
+    (mp4_box(b"trak", &payload), mdia_at + 8 + value_in_mdia + 8)
+}
+
+/// An `elst` delaying this track's start.
+///
+/// How MP4 says "this track begins later". Without one, both tracks start at
+/// zero and there is nothing for A/V analysis to measure — which would let the
+/// fixture pass vacuously.
+fn edit_list(track: &TrackSpec, delay_ms: u32) -> Vec<u8> {
+    let delay = (u64::from(delay_ms) * u64::from(track.timescale.max(1)) / 1_000) as u32;
+    let mut entry = vec![0u8; 4];
+    entry.extend_from_slice(&1u32.to_be_bytes()); // segment_count
+    entry.extend_from_slice(&delay.to_be_bytes()); // segment_duration
+    entry.extend_from_slice(&1i32.to_be_bytes()); // media_time
+    entry.extend_from_slice(&1.0f32.to_be_bytes()); // media_rate
+
+    let mut body = vec![0u8; 4]; // version + flags
+    body.extend_from_slice(&mp4_box(b"elst", &entry));
+    mp4_box(b"edts", &body)
+}
+
+/// Builds a Matroska / WebM document around supplied block payloads.
+///
+/// Exposed from the fixture module rather than kept inside a test's `mod tests`,
+/// because several crates need to build one: this crate's own Matroska tests,
+/// the CLI's, and the video crate's end-to-end AV1 test. Three hand-written
+/// copies of an EBML writer would drift, and a drifted copy is exactly how a
+/// "valid" fixture silently stops exercising the demuxer.
+///
+/// `blocks` are `(relative timestamp in ms, is_keyframe, payload)`. One track is
+/// declared with `codec_id` and `track_type` (`1` video, `2` audio). The cluster
+/// timestamp is zero and each block carries an absolute offset, which keeps the
+/// builder free of per-cluster arithmetic.
+#[must_use]
+pub fn build_webm(codec_id: &str, track_type: u8, blocks: &[(u16, bool, Vec<u8>)]) -> Vec<u8> {
+    let mut track_entry = vec![0xD7, 0x81, 1, 0x83, 0x81, track_type, 0x86];
+    track_entry.extend(ebml_size(codec_id.len()));
+    track_entry.extend_from_slice(codec_id.as_bytes());
+
+    let mut tracks_body = vec![0xAE];
+    tracks_body.extend(ebml_size(track_entry.len()));
+    tracks_body.extend_from_slice(&track_entry);
+
+    let mut cluster = vec![0xE7, 0x81, 0x00];
+    for (rel_ts, is_key, payload) in blocks {
+        let mut block = vec![0x81]; // track number 1
+        block.extend_from_slice(&rel_ts.to_be_bytes());
+        block.push(if *is_key { 0x80 } else { 0x00 });
+        block.extend_from_slice(payload);
+        cluster.push(0xA3); // SimpleBlock
+        cluster.extend(ebml_size(block.len()));
+        cluster.extend_from_slice(&block);
+    }
+
+    let mut segment = vec![0x16, 0x54, 0xAE, 0x6B];
+    segment.extend(ebml_size(tracks_body.len()));
+    segment.extend_from_slice(&tracks_body);
+    segment.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75]);
+    segment.extend(ebml_size(cluster.len()));
+    segment.extend_from_slice(&cluster);
+
+    let mut doc = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x18, 0x53, 0x80, 0x67];
+    doc.extend(ebml_size(segment.len()));
+    doc.extend_from_slice(&segment);
+    doc
+}
+
+/// Encodes an EBML variable-length size integer for `value`.
+///
+/// The width is the narrowest that can hold `value`, chosen so that the leading
+/// bit of the first byte marks the length. The marker must be stripped by the
+/// reader, and a value of all ones in the chosen width means "unknown size",
+/// so that one value is unreachable at each width.
+///
+/// This exists because a single-byte `0x80 | len` is only valid below 127. That
+/// is fine for a stub fixture and silently wrong for a real one: at 128 bytes
+/// it produces `0x80`, which a reader parses as *unknown size* and swallows
+/// the rest of the file. Real encoded video passes 127 bytes in its first
+/// cluster almost immediately, so the shortcut corrupts exactly the fixtures
+/// that matter.
+fn ebml_size(value: usize) -> Vec<u8> {
+    for width in 1..=8usize {
+        let max = (1usize << (7 * width)) - 1;
+        // Skip the all-ones value, which encodes "unknown size".
+        if value < max - 1 {
+            let marker = 1u32 << (7 * width);
+            let encoded = value as u32 | marker;
+            return encoded.to_be_bytes()[4 - width..].to_vec();
         }
-        boxes.extend_from_slice(&mp4_box(b"stsc", &stsc(sample_count)));
-        boxes.extend_from_slice(&mp4_box(b"stsz", &stsz_payload));
-        boxes.extend_from_slice(&mp4_box(b"stco", &stco_payload));
-        mp4_box(b"stbl", &boxes)
-    };
-
-    let minf = {
-        let mut inner = mp4_box(b"vmhd", &[0u8; 12]);
-        inner.extend_from_slice(&stbl);
-        mp4_box(b"minf", &inner)
-    };
-
-    let mdia = {
-        let mut inner = mp4_box(b"mdhd", &mdhd);
-        inner.extend_from_slice(&mp4_box(b"hdlr", &hdlr));
-        inner.extend_from_slice(&minf);
-        mp4_box(b"mdia", &inner)
-    };
-
-    let trak = {
-        let mut inner = mp4_box(b"tkhd", &tkhd);
-        inner.extend_from_slice(&mdia);
-        mp4_box(b"trak", &inner)
-    };
-
-    let moov = {
-        let mut inner = mp4_box(b"mvhd", &mvhd);
-        inner.extend_from_slice(&trak);
-        mp4_box(b"moov", &inner)
-    };
-
-    // The media data must actually hold every declared sample, or a demuxer
-    // walks off the end of `mdat` and reports fewer packets than the sample
-    // tables declare — which would make a fixture-dependent test look like an
-    // engine bug.
-    let sample_payload_bytes: usize = 100;
-    let media_len = (sample_count as usize).saturating_mul(sample_payload_bytes);
-
-    let mut file = mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2avc1mp41");
-    file.extend_from_slice(&moov);
-    file.extend_from_slice(&mp4_box(b"mdat", &vec![0u8; media_len]));
-    file
+    }
+    // Unreachable for any fixture this crate builds; stated rather than
+    // silently truncating.
+    panic!("EBML element of {value} bytes exceeds the 8-byte size field");
 }
 
 /// Builds an MP4 containing only the header and media data, with no `moov`.
@@ -325,13 +615,19 @@ pub fn gop_change_keyframes(
 /// Builds an MP4 with an explicit sync-sample table.
 #[must_use]
 pub fn build_mp4_with_keyframes(track: &TrackSpec, keyframes: &[u32]) -> Vec<u8> {
-    build_mp4_inner(track, Some(keyframes))
+    build_mp4_multi(&[(
+        track,
+        TrackExtras {
+            keyframes: Some(keyframes),
+            ..TrackExtras::default()
+        },
+    )])
 }
 
 /// Builds an MP4 with no `stss` box, meaning every sample is a sync sample.
 #[must_use]
 pub fn build_mp4_without_stss(track: &TrackSpec) -> Vec<u8> {
-    build_mp4_inner(track, None)
+    build_mp4(track)
 }
 
 /// Builds a full-box atom carrying a null-terminated string (e.g. `©nam`).
@@ -461,6 +757,165 @@ fn find_box(bytes: &[u8], kind: &[u8; 4]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_mp4_av_yields_two_independent_tracks() {
+        // The A/V fixture is only useful if it really carries two tracks, each
+        // with its own sample tables. A builder that silently produced one
+        // would make every A/V assertion below pass vacuously.
+        let file = build_mp4_av(
+            &TrackSpec::video_25fps(640, 480, 50),
+            &TrackSpec::audio_48khz(100),
+            0,
+        );
+        let inspection = crate::mp4::inspect_bytes(file).expect("two-track file parses");
+        assert_eq!(inspection.streams.len(), 2, "{:?}", inspection.anomalies);
+        assert_eq!(inspection.streams[0].kind.tag(), "video");
+        assert_eq!(inspection.streams[1].kind.tag(), "audio");
+        // Each track must carry frame timing, or A/V sync has nothing to compare.
+        assert!(
+            inspection.frame_info[0].is_some(),
+            "video frame_info missing"
+        );
+        assert!(
+            inspection.frame_info[1].is_some(),
+            "audio frame_info missing"
+        );
+    }
+
+    #[test]
+    fn an_edit_list_does_not_cost_the_track() {
+        // Regression. Adding an `elst` used to grow the inner `mdia` box while
+        // leaving the enclosing `trak`'s declared size alone, so the demuxer
+        // stopped reading at the end of that stale size and reported one stream
+        // instead of two — with no anomaly recorded, so nothing looked wrong.
+        // An edit list that silently deletes a track is worse than no edit list.
+        for delay in [0u32, 40] {
+            let f = build_mp4_av(
+                &TrackSpec::video_25fps(320, 240, 25),
+                &TrackSpec::audio_48khz(500),
+                delay,
+            );
+            let i = crate::mp4::inspect_bytes(f).expect("parses");
+            assert_eq!(i.streams.len(), 2, "delay={delay} lost a track");
+        }
+    }
+
+    #[test]
+    fn build_mp4_av_is_deterministic() {
+        let a = build_mp4_av(
+            &TrackSpec::video_25fps(320, 240, 25),
+            &TrackSpec::audio_48khz(50),
+            40,
+        );
+        let b = build_mp4_av(
+            &TrackSpec::video_25fps(320, 240, 25),
+            &TrackSpec::audio_48khz(50),
+            40,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_audio_delay_reaches_the_edit_list() {
+        // Without a non-zero edit list the two tracks both start at zero and
+        // there is no offset to measure.
+        let file = build_mp4_av(
+            &TrackSpec::video_25fps(320, 240, 25),
+            &TrackSpec::audio_48khz(50),
+            120,
+        );
+        let text = String::from_utf8_lossy(&file);
+        assert!(
+            text.contains("elst"),
+            "a delayed audio track must carry an edit list"
+        );
+    }
+
+    #[test]
+    fn build_webm_produces_a_demuxable_document() {
+        let bytes = build_webm(
+            "V_AV1",
+            1,
+            &[(0, true, vec![1, 2, 3]), (33, false, vec![4, 5])],
+        );
+        let inspection = crate::mkv::inspect_bytes(bytes).expect("the builder's output must parse");
+        assert_eq!(inspection.format, crate::ContainerFormat::Matroska);
+        assert_eq!(inspection.streams.len(), 1);
+        assert_eq!(inspection.streams[0].codec.name, "av01");
+        let samples = crate::mkv::read_samples(build_webm("V_AV1", 1, &[(0, true, vec![1, 2, 3])]))
+            .expect("samples read");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn build_webm_handles_payloads_larger_than_a_single_byte_size_field() {
+        // Regression. The builder once wrote every element size as one byte,
+        // `0x80 | len`. That is only valid below 127: at 128 it emits `0x80`,
+        // which a reader decodes as *unknown size* and therefore swallows the
+        // remainder of the file. Stub fixtures never reached the threshold,
+        // so only real encoded video exposed it — and when it did, the file
+        // simply parsed as an empty track with no error anywhere.
+        //
+        // These sizes straddle every width boundary a real file crosses.
+        for payload_len in [1usize, 126, 127, 128, 300, 16_000, 20_000] {
+            let payload = vec![0xABu8; payload_len];
+            let bytes = build_webm("V_AV1", 1, &[(0, true, payload.clone())]);
+            let samples =
+                crate::mkv::read_samples(bytes).unwrap_or_else(|e| panic!("{payload_len}: {e}"));
+            assert_eq!(
+                samples.len(),
+                1,
+                "a {payload_len}-byte payload produced {} samples",
+                samples.len()
+            );
+            assert_eq!(
+                samples[0].data.len(),
+                payload_len,
+                "a {payload_len}-byte payload was truncated to {}",
+                samples[0].data.len()
+            );
+        }
+    }
+
+    #[test]
+    fn ebml_size_round_trips_through_the_demuxer() {
+        // Directly exercises the encoder across its width boundaries.
+        for value in [0usize, 1, 126, 127, 128, 16_382, 16_383, 16_384] {
+            let encoded = ebml_size(value);
+            // The leading marker bit position determines the width a reader
+            // infers; recompute the value the way the demuxer does.
+            let first = encoded[0];
+            let width = first.leading_zeros() as usize + 1;
+            assert_eq!(
+                width,
+                encoded.len(),
+                "value {value}: marker disagrees with width"
+            );
+            let mut recovered = u64::from(first & (0xFF >> width));
+            for &b in &encoded[1..] {
+                recovered = (recovered << 8) | u64::from(b);
+            }
+            assert_eq!(recovered, value as u64, "value {value} did not round trip");
+        }
+    }
+
+    #[test]
+    fn build_webm_is_deterministic() {
+        // Spec §77: a fixture must regenerate byte-identically everywhere.
+        let a = build_webm("V_VP9", 1, &[(0, true, vec![9])]);
+        let b = build_webm("V_VP9", 1, &[(0, true, vec![9])]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn build_webm_with_no_blocks_still_parses() {
+        let bytes = build_webm("V_VP9", 1, &[]);
+        let inspection = crate::mkv::inspect_bytes(bytes).expect("an empty cluster must parse");
+        assert_eq!(inspection.streams.len(), 1);
+        assert!(inspection.frame_info[0].is_none());
+    }
 
     #[test]
     fn generated_file_has_an_ftyp_signature() {

@@ -14,35 +14,71 @@ It is not a media player, and it is not an AI deepfake detector.
 
 ## Status
 
-**Phase 0 — foundation.** The workspace, domain model, and documentation
-skeleton are in place and building. The analysis engine is not yet implemented;
-see [`todo.md`](todo.md) for the full plan and
+**Phase 1 — MVP, in progress.** The engine is implemented and working end to
+end: acquisition, container inspection, GOP/duplicate/timestamp/metadata
+analysis, structural damage detection, 26 built-in rules, case persistence, and
+PDF/HTML/JSON/CSV reports.
+MP4 and Matroska/WebM containers are analysed. Opus is decoded from bare Ogg
+streams and from demuxed packets inside a container; **Vorbis is decoded from
+bare Ogg streams only**, so a Vorbis track in a `.webm` is identified and
+reported but not measured.
+
+See [`todo.md`](todo.md) for the full plan and
 [`docs/architecture.md`](docs/architecture.md) for the design.
 
 ```text
 build   passing
-tests   passing
+tests   535 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
 
+### What this build will not do
+
+Stated up front, because a tool that quietly omits a measurement is worse than
+one that names the gap:
+
+- **It does not decode H.264, HEVC, or AAC.** Those are patent-encumbered.
+  Their tracks are identified and their declared properties reported; no sample
+  is ever decoded. Tier-2 pixel analysis covers VP9 and AV1 only.
+- **It does not invent a number it did not measure.** The Matroska reader
+  exposes no picture geometry, so WebM video streams report no resolution
+  rather than a guessed one.
+- **It does not assert causes.** A GOP change is reported as a GOP change.
+  A reviewer's conclusion is recorded separately and never overwrites the
+  observation.
+
 ## What it does
 
 - **Container inspection** — boxes, streams, timebase, duration consistency,
-  malformed structures, trailing data
-- **Video analysis** — structure, GOP layout, frame statistics, duplicate and
-  near-duplicate detection, scene changes, colour and HDR signalling
+  malformed structures, truncation, trailing data
+- **Error timeline** — structural damage located by byte offset and placed at a
+  media time, so a finding says *where* the file stops being sound
+- **Video analysis** — structure, GOP layout, duplicate and near-duplicate
+  detection, scene changes, bitrate and compression anomalies
 - **Audio analysis** — channels, silence, clipping, DC offset, dynamic range,
-  loudness, spectrum
+  loudness
 - **Timestamp forensics** — PTS/DTS monotonicity, gaps, overlaps, edit lists,
   A/V offset and drift
 - **Metadata analysis** — structured extraction plus consistency cross-checks
-- **Evidence preservation** — SHA-256 and BLAKE3 at acquisition; derived
-  artefacts stored with hashes and provenance
+- **Evidence preservation** — SHA-256 and BLAKE3 at acquisition, computed in one
+  pass; derived artefacts stored with hashes and provenance
 - **Rule-driven findings** — severity, confidence, timeline placement, and an
   explanation of what was observed and what it does not establish
-- **Comparison** — two or more assets in one case, against a reference master
 - **Reports** — PDF, HTML, JSON, CSV, all reproducible
+
+### Planned, not built
+
+Named here so the gap is visible rather than inferred from silence. None of these
+is implemented, and `crates/...-core/tests/readme_claims.rs` fails if any of them
+reappears in the list above.
+
+| Capability | Spec | State |
+|---|---|---|
+| Comparing two or more assets against a reference master | §38–40 | not started |
+| Colour primaries, transfer, matrix, and HDR10 static metadata | §14, §45–46 | model types exist and are serialised; no reader populates them, so every field is empty |
+| Spectral / FFT audio analysis | §21–22 | not started |
+| A corrupt-media corpus held on disk | §76 | directories are empty; every damaged file today is built in code by a fixture |
 
 ## Three principles
 
@@ -64,12 +100,14 @@ runs over the same input produce identical output.
 ```text
 Cargo.toml          workspace root
 docs/               architecture, evidence, analysis, findings, reports, rules
-rules/              rule definitions by domain
-fixtures/           test media, including the corrupt-media corpus
+rules/              empty per-domain placeholders; the rules themselves live in
+                    crates/...-rules/src/builtin.rs
+fixtures/           empty placeholders; damaged files are built in code by
+                    ...-container/src/fixture.rs, not held as files
 tests/              integration tests
 crates/
   ...-model/        domain types: cases, assets, hashes, findings, evidence
-  ...-container/    container and stream inspection
+  ...-container/    container and stream inspection, and the file builders
   ...-video/        video analysis
   ...-audio/        audio analysis
   ...-timing/       timestamp forensics and A/V sync
