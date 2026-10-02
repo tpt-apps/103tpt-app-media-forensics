@@ -1,5 +1,3 @@
-//! The guard against unwired analysis stages.
-//!
 //! # The failure this exists to prevent
 //!
 //! Two analysis stages shipped that were fully implemented, documented, and
@@ -27,11 +25,19 @@
 //! message names which rules are affected.
 
 use tpt_app_media_forensics_container::{
-    build_mp4, build_mp4_av, build_mp4_with_bitrate_drop, build_mp4_with_repeated_frames,
-    build_webm, TrackSpec,
+    build_mp4, build_mp4_av, build_mp4_empty_moov, build_mp4_stsd_gop_change,
+    build_mp4_with_bitrate_drop, build_mp4_with_colour, build_mp4_with_declared_track_mismatch,
+    build_mp4_with_frame_rate_change, build_mp4_with_hdr_signalling_only, build_mp4_with_keyframes,
+    build_mp4_with_reordered_frames, build_mp4_with_repeated_frames,
+    build_mp4_with_wrong_declared_duration, build_webm, build_webm_without_duration, TrackSpec,
 };
+use tpt_app_media_forensics_core::case_dir::CaseDirectory;
 use tpt_app_media_forensics_core::AnalysisEngine;
+use tpt_app_media_forensics_model::Case;
 use tpt_app_media_forensics_rules::{builtin_rules, BundleInput, RuleProfile};
+// Needed by `webm_with_opus`, which is a free function rather than part of the
+// corpus body — hence here rather than inside `corpus`.
+use tpt_av_cadence_core::Encoder as _;
 
 /// Inputs this build knowingly cannot populate.
 ///
@@ -46,10 +52,101 @@ use tpt_app_media_forensics_rules::{builtin_rules, BundleInput, RuleProfile};
 /// record a limitation, which is why removing the entry was the point.
 const KNOWN_UNREACHABLE: &[(BundleInput, &[&str], &str)] = &[];
 
+/// One second of a 440 Hz tone at `amplitude`.
+fn tone(amplitude: f32) -> Vec<f32> {
+    (0..48_000)
+        .map(|i| {
+            (std::f64::consts::TAU * 440.0 * (f64::from(i)) / 48_000.0).sin() as f32 * amplitude
+        })
+        .collect()
+}
+
+/// A 440 Hz tone for half a second, then digital silence.
+///
+/// The tone gives the encoder something to work with before the silence begins.
+/// An all-zero signal tends to be coded as one silent frame, which would leave
+/// `AUDIO.SILENCE_REGION` with nothing but silence to find.
+fn tone_then_silence() -> Vec<f32> {
+    let mut samples = tone(0.8);
+    samples[24_000..].fill(0.0);
+    samples
+}
+
+/// A square wave: the signal that actually clips.
+///
+/// A sine at full scale spends most of its time well below its peak, so it is a
+/// poor way to reach a peak threshold — every sample has to be pushed over by
+/// decoder ringing. A square wave sits at its extreme for half of every cycle.
+fn square_wave(amplitude: f32) -> Vec<f32> {
+    (0..48_000)
+        .map(|i| if i % 100 < 50 { amplitude } else { -amplitude })
+        .collect()
+}
+
+/// A sine with a constant `offset` added to every sample.
+///
+/// A DC offset is a constant bias across the whole waveform, so the mean of the
+/// signal *is* that bias. The tone underneath keeps the file from being pure
+/// silence, which a decoder may legitimately collapse to zero.
+fn biased_tone(offset: f32) -> Vec<f32> {
+    tone(0.3).into_iter().map(|s| s + offset).collect()
+}
+
+/// Encodes `samples` as Opus and wraps the result in a WebM file.
+///
+/// The round trip is real in both directions — a real encoder, real Ogg pages,
+/// real container — because the rules this serves read *decoded* levels. A stub
+/// payload would parse as an audio track and then decode to nothing, which is a
+/// different thing from the analysers running over real samples.
+///
+/// Every audio fixture goes through this helper, so the amplitude extremes below
+/// differ only in signal and never in how they were packaged. A fixture that
+/// reached its threshold because of its container rather than its samples would
+/// be measuring the wrong thing.
+fn webm_with_opus(dir: &std::path::Path, samples: &[f32]) -> Vec<u8> {
+    let opus_dir = dir.join("opus");
+    std::fs::create_dir_all(&opus_dir).expect("creates opus dir");
+    let opus_path = opus_dir.join("fixture.opus");
+    let mut encoder = tpt_av_cadence_opus::OggOpusEncoder::new(
+        std::fs::File::create(&opus_path).expect("creates sink"),
+        48_000,
+        1,
+        96_000,
+    )
+    .expect("opens encoder");
+    encoder.encode(samples).expect("encodes");
+    encoder.finish().expect("finishes");
+
+    let ogg = std::fs::read(&opus_path).expect("reads opus");
+    let mut packets = Vec::new();
+    {
+        use tpt_av_cadence_core::BufferedSource;
+        use tpt_av_cadence_ogg::PageReader;
+        let mut reader = PageReader::new(
+            BufferedSource::new(Box::new(std::io::Cursor::new(ogg)), 32 * 1024),
+            1 << 20,
+        );
+        let mut scratch = vec![0u8; 1 << 20];
+        while let Some((n, _)) = reader.next_packet(&mut scratch).expect("ogg reads") {
+            let packet = &scratch[..n];
+            // `OpusHead`/`OpusTags` are headers, not audio.
+            if packet.starts_with(b"OpusHead") || packet.starts_with(b"OpusTags") {
+                continue;
+            }
+            packets.push(packet.to_vec());
+        }
+    }
+    let blocks: Vec<(u16, bool, Vec<u8>)> = packets
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (u16::try_from(i * 20).unwrap_or(u16::MAX), true, p.clone()))
+        .collect();
+    build_webm("A_OPUS", 2, &blocks)
+}
+
+/// Builds a corpus of fixtures written to `dir`, and returns their paths.
 /// Builds a corpus of fixtures written to `dir`, and returns their paths.
 fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    use tpt_av_cadence_core::Encoder as _;
-
     let mut written = Vec::new();
     let mut put = |name: &str, bytes: &[u8]| {
         let path = dir.join(name);
@@ -71,6 +168,18 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         &build_mp4_with_repeated_frames(10, 15),
     );
 
+    // Colour: an HDR-signalled file carrying no mastering-display or
+    // content-light metadata. Only `VIDEO.HDR_METADATA_MISSING` can be reached
+    // by it, and it needs a `colr` box written into the sample entry — which no
+    // other fixture has.
+    put(
+        "hdr-signalling-only.mp4",
+        &build_mp4_with_hdr_signalling_only(),
+    );
+    // And a complete BT.709 file, so the colour rules are also checked against a
+    // file that declares colour and has nothing missing.
+    put("sdr-colour.mp4", &build_mp4_with_colour());
+
     // Metadata: a track carrying text atoms.
     put(
         "metadata.mp4",
@@ -90,53 +199,59 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     );
 
     // Audio levels, silence, and loudness: real Opus, tone then silence.
-    let tone_then_silence: Vec<f32> = (0..48_000)
+    put("audio.webm", &webm_with_opus(dir, &tone_then_silence()));
+
+    // A WebM file that genuinely omits `Segment > Info > Duration`.
+    //
+    // Every other WebM fixture declares one, as real muxers do. This is the file
+    // `CONTAINER.STREAM_DURATION_MISSING` is actually for, and it could not exist
+    // in the corpus before: the builder wrote no duration at all, so the rule
+    // fired on all five WebM fixtures. That was a correct finding about an
+    // unusual fixture, and it meant the rule was never observed on a file that
+    // omitted duration *by design*.
+    //
+    // Carries several distinct blocks with differing payloads so it reaches no
+    // *other* condition: one block would be trivially a single-keyframe track, and
+    // identical payloads would be a duplicate-frame run. A fixture testing one
+    // condition must not incidentally test another, or the corpus stops being
+    // able to tell which finding came from which defect.
+    let blocks: Vec<(u16, bool, Vec<u8>)> = (0..8u16)
         .map(|i| {
-            if i < 24_000 {
-                (std::f64::consts::TAU * 440.0 * (i as f64) / 48_000.0).sin() as f32 * 0.8
-            } else {
-                0.0
-            }
+            let mut payload = vec![0u8; 32];
+            payload[0] = i as u8;
+            payload[1] = (i as u8).wrapping_mul(7);
+            (i * 40, i % 4 == 0, payload)
         })
         .collect();
-    let opus_dir = dir.join("opus");
-    std::fs::create_dir_all(&opus_dir).expect("creates opus dir");
-    let opus_path = opus_dir.join("a.opus");
-    let mut encoder = tpt_av_cadence_opus::OggOpusEncoder::new(
-        std::fs::File::create(&opus_path).expect("creates sink"),
-        48_000,
-        1,
-        96_000,
-    )
-    .expect("opens encoder");
-    encoder.encode(&tone_then_silence).expect("encodes");
-    encoder.finish().expect("finishes");
+    put(
+        "no-duration.webm",
+        &build_webm_without_duration("V_VP9", 1, &blocks),
+    );
 
-    let ogg = std::fs::read(&opus_path).expect("reads opus");
-    let mut packets = Vec::new();
-    {
-        use tpt_av_cadence_core::BufferedSource;
-        use tpt_av_cadence_ogg::PageReader;
-        let mut reader = PageReader::new(
-            BufferedSource::new(Box::new(std::io::Cursor::new(ogg.clone())), 32 * 1024),
-            1 << 20,
-        );
-        let mut scratch = vec![0u8; 1 << 20];
-        while let Some((n, _)) = reader.next_packet(&mut scratch).expect("ogg reads") {
-            let packet = &scratch[..n];
-            // `OpusHead`/`OpusTags` are headers, not audio.
-            if packet.starts_with(b"OpusHead") || packet.starts_with(b"OpusTags") {
-                continue;
-            }
-            packets.push(packet.to_vec());
-        }
-    }
-    let blocks: Vec<(u16, bool, Vec<u8>)> = packets
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (u16::try_from(i * 20).unwrap_or(u16::MAX), true, p.clone()))
-        .collect();
-    put("audio.webm", &build_webm("A_OPUS", 2, &blocks));
+    // The three amplitude extremes the audio rules read.
+    //
+    // `audio.webm` is a tone at 0.8 followed by digital silence, so it exercises
+    // `AUDIO.SILENCE_REGION` and leaves `AUDIO.CLIPPING`, `AUDIO.DC_OFFSET`, and
+    // `AUDIO.INAUDIBLE` silent: 0.8 is below the 0.999 clipping threshold, a sine
+    // has a mean of zero, and 0.8 is far above the -70 LUFS floor. Those three
+    // were on the unexercised list for that reason alone — not because the
+    // analysis was missing, but because no file reached the thresholds.
+    //
+    // Each signal is pushed well past its threshold rather than to it. Opus is
+    // lossy and does not reproduce an input sample-for-sample, so a value sitting
+    // exactly on a threshold would be a coin flip after encoding.
+    put(
+        "audio-clipped.webm",
+        &webm_with_opus(dir, &square_wave(1.0)),
+    );
+    put(
+        "audio-dc-offset.webm",
+        &webm_with_opus(dir, &biased_tone(0.2)),
+    );
+    // Amplitude 1e-4 is roughly -80 dBFS: far below the -70 LUFS floor, and well
+    // clear of digital silence, so the file carries real audio that happens to be
+    // too quiet to hear. That is the case `AUDIO.INAUDIBLE` names.
+    put("audio-inaudible.webm", &webm_with_opus(dir, &tone(1.0e-4)));
 
     // Tier-2: real AV1 in a real WebM container, which is the only way to reach
     // the scene-change and near-duplicate analysers. Stub payloads parse as a
@@ -169,6 +284,76 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     // as *interesting*. A rule can be reachable, wired, declared, documented, and
     // still be unfireable on every file the project owns.
     put("bitrate-drop.mp4", &build_mp4_with_bitrate_drop(60, 40));
+
+    // Structural defects that are *declared* rather than inflicted. Each of
+    // these reaches a rule that `truncated.mp4` alone does not: that one damages
+    // the bytes, these damage the tables that describe them.
+    put("empty-moov.mp4", &build_mp4_empty_moov());
+    put("gop-change.mp4", &build_mp4_stsd_gop_change());
+    put(
+        "single-keyframe.mp4",
+        &build_mp4_with_keyframes(&TrackSpec::video_25fps(320, 240, 60), &[0]),
+    );
+    put(
+        "all-keyframes.mp4",
+        &tpt_app_media_forensics_container::fixture::build_mp4_without_stss(
+            &TrackSpec::video_25fps(320, 240, 60),
+        ),
+    );
+
+    // Bytes the container does not account for.
+    //
+    // `truncated.mp4` produces a `Truncated` defect, which
+    // `CONTAINER.STRUCTURAL_DEFECT` deliberately excludes: it reports only
+    // *missing* media there, because the declared content may still be intact.
+    // This fixture is the complement — data present that nothing describes — and
+    // is what reaches the structural rule.
+    //
+    // Built inline rather than through a fixture builder because the defect is
+    // the surplus: a builder would have to assert how much to append to be
+    // *wrong*, which is the opposite of what a fixture should encode.
+    let mut trailing = build_mp4(&TrackSpec::video_25fps(320, 240, 30));
+    trailing.extend_from_slice(b"payload a real muxer never writes");
+    put("trailing-data.mp4", &trailing);
+
+    // A cadence change mid-track, which is both a frame-rate change and a gap in
+    // presentation timestamps. One fixture, two rules: doubling the frame
+    // duration necessarily leaves the later samples further apart in time.
+    put(
+        "frame-rate-change.mp4",
+        &build_mp4_with_frame_rate_change(30, 30),
+    );
+
+    // An `mdhd` duration the `stts` table does not support.
+    //
+    // `declared_duration` on `TrackSpec` already existed for exactly this, and
+    // the container's own unit tests use it. It had no corpus entry for the same
+    // reason the builders above did: it was reachable but never exercised
+    // end to end.
+    put(
+        "wrong-duration.mp4",
+        &build_mp4_with_wrong_declared_duration(),
+    );
+
+    // A header claiming three tracks, with one `trak` box in the file.
+    //
+    // This is the only fixture that can reach `CONTAINER.DECLARED_TRACK_MISMATCH`.
+    // The rule compares what the container declared against what was recovered,
+    // and until `declared_track_count` was read from the boxes instead of from
+    // the demuxer's own track list, the two sides were the same number by
+    // construction — unfireable on any file, not merely unexercised.
+    put(
+        "track-mismatch.mp4",
+        &build_mp4_with_declared_track_mismatch(4),
+    );
+
+    // A track whose presentation order differs from its decode order, via `ctts`.
+    //
+    // The last rule in the corpus to gain a file, and the one that needed the most
+    // to get there: timestamps were previously decode time, which `stts` builds
+    // from unsigned deltas and is therefore monotonic by construction. Reading
+    // composition offsets is what makes presentation order observable at all.
+    put("reordered.mp4", &build_mp4_with_reordered_frames(40));
 
     written
 }
@@ -643,12 +828,17 @@ fn every_bundle_field_has_an_input_a_rule_can_declare() {
     );
 }
 
-/// Rules no fixture in the corpus triggers *end to end*.
+/// Rules that no fixture triggers end to end, and which no fixture can.
 ///
-/// Not "untested". Every rule here is exercised by `-rules/tests/new_rules.rs`
-/// against a hand-assembled `AnalysisBundle`, and `required_inputs` is declared
-/// and checked by the guards above. What none of them has is a file: every test
-/// builds the state its rule reads rather than deriving it from bytes on disk.
+/// **Currently empty** — every rule fires from a file this project owns. See
+/// [`NO_END_TO_END_FIXTURE`] for the route there, and keep the mechanism rather
+/// than the constant: a new rule that cannot fire will fail the guard below.
+///
+/// Not "untested". Every rule listed here is exercised by
+/// `-rules/tests/new_rules.rs` against a hand-assembled `AnalysisBundle`, and
+/// `required_inputs` is declared and checked by the guards above. What none of
+/// them has is a file: every test builds the state its rule reads rather than
+/// deriving it from bytes on disk.
 ///
 /// That is a narrower gap than it looks, and the difference matters. A
 /// hand-built bundle can drift from what the pipeline actually produces, and
@@ -656,27 +846,33 @@ fn every_bundle_field_has_an_input_a_rule_can_declare() {
 /// unwired stage is caught — but they cannot catch a stage that is wired and
 /// populates a slightly different shape.
 ///
-/// Recorded rather than fixed, because closing it means roughly fifteen new
-/// fixtures, each built to trip one rule. The list is here so that cost is
-/// visible and so that a *newly* unfireable rule fails this test rather than
-/// joining the list quietly.
-const NO_END_TO_END_FIXTURE: &[&str] = &[
-    "AUDIO.CLIPPING",
-    "AUDIO.DC_OFFSET",
-    "AUDIO.INAUDIBLE",
-    "CONTAINER.DECLARED_TRACK_MISMATCH",
-    "CONTAINER.MALFORMED_STRUCTURE",
-    "CONTAINER.NO_USABLE_STREAMS",
-    "CONTAINER.PARSE_ANOMALY",
-    "CONTAINER.STREAM_START_OFFSET",
-    "CONTAINER.STRUCTURAL_DEFECT",
-    "METADATA.DECLARED_VS_MEASURED_MISMATCH",
-    "TIMING.NON_MONOTONIC_PTS",
-    "TIMING.TIMESTAMP_GAP",
-    "VIDEO.FRAME_RATE_CHANGE",
-    "VIDEO.GOP_LENGTH_CHANGE",
-    "VIDEO.SINGLE_KEYFRAME",
-];
+/// The list is here so that a *newly* unfireable rule fails this test rather
+/// than joining it quietly.
+///
+/// # Now empty
+///
+/// Every rule fires end to end from a file this project owns. It began at
+/// fifteen, and the route there was worth recording:
+///
+/// - **Ten** were builders that already existed and had never been written to
+///   disk, or signals the corpus's existing Opus path could already produce. No
+///   new analysis.
+/// - **Two** (`CONTAINER.DECLARED_TRACK_MISMATCH`, `TIMING.NON_MONOTONIC_PTS`)
+///   turned out not to be fixture problems at all. Both could not fire on *any*
+///   file, which is a materially different claim from "not yet exercised":
+///   `declared_track_count` came from the demuxer's own track list and so equalled
+///   `streams.len()` by construction, and frame timestamps were decode time, which
+///   `stts` builds from unsigned deltas and is therefore monotonic by
+///   construction. Both needed a *reader* — `mvhd`, then `ctts` — rather than a
+///   fixture.
+/// - **Three** (`CONTAINER.STRUCTURAL_DEFECT` and friends) needed fixtures that
+///   reach a different condition from the one already present, not louder
+///   instances of it.
+///
+/// An entry added to this list should say which of those three shapes it is.
+/// "No fixture yet" and "no fixture could exist" call for different work, and
+/// conflating them is how a rule stays unfireable while looking merely untested.
+const NO_END_TO_END_FIXTURE: &[&str] = &[];
 
 #[test]
 fn every_rule_fires_end_to_end_or_is_recorded_as_unexercised() {
@@ -792,4 +988,355 @@ fn every_rule_declares_at_least_what_it_needs() {
          under-declares its inputs — which is the hole this whole mechanism has.",
         unused.iter().map(|i| i.tag()).collect::<Vec<_>>()
     );
+}
+#[test]
+fn a_file_yielding_several_findings_from_one_rule_stores_without_a_key_collision() {
+    // Regression guard for a crash that sat in the engine for a long time.
+    //
+    // `findings` has a primary key on `(analysis_id, id)`, and any rule producing
+    // two findings at the same timeline position derived the *same* ID, because
+    // the ID was built from rule ID and locator alone. The second insert then
+    // aborted the entire analysis with a UNIQUE constraint failure: no findings
+    // were stored, and the analyst was told the file could not be read.
+    //
+    // It surfaced only once a fixture produced two `TIMING.TIMESTAMP_GAP`
+    // findings, which is to say: only when the corpus was finally good enough to
+    // reach the bug. Every earlier fixture happened to produce at most one
+    // finding per rule per position, so nothing caught it — and the corpus work
+    // that uncovered it is why this test sits next to the other end-to-end
+    // guards rather than in the engine's own tests.
+    //
+    // Driven through `analyse` rather than the rule engine alone, because the
+    // failure was in persistence. A test that stopped at the rules would have
+    // seen a plausible-looking list of findings and passed.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("multi-finding.mp4");
+    // Doubling the frame duration partway through leaves a gap at every
+    // subsequent sample, so the timing rules fire repeatedly.
+    std::fs::write(&source, build_mp4_with_frame_rate_change(30, 30)).expect("writes source");
+
+    let case_dir = dir.path().join("case.tptcase");
+    CaseDirectory::create(&case_dir, &Case::new("Collision", None)).expect("creates case");
+    let case_dir = CaseDirectory::open(&case_dir).expect("opens case");
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analysis persists findings without a key collision");
+
+    assert!(
+        outcome.findings.len() > 2,
+        "this fixture must produce several findings from one rule, or it proves nothing"
+    );
+
+    let mut ids: Vec<String> = outcome.findings.iter().map(|f| f.id.to_string()).collect();
+    let total = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        total,
+        "{} of {total} findings share an ID; the second insert fails the whole analysis",
+        total - ids.len()
+    );
+}
+
+#[test]
+fn b_frame_reordering_alone_is_not_a_frame_rate_change() {
+    // `VIDEO.FRAME_RATE_CHANGE` measures the spacing between presentation times.
+    // Those are in *decode* order, so any file with B-frames has unevenly spaced
+    // presentation times even when the frame rate never changes.
+    //
+    // Before the fix this reported a frame-rate change on `reordered.mp4` — a file
+    // whose frame rate is constant for its whole length. Since essentially every
+    // real encoded video file uses B-frames, the rule would have fired on nearly
+    // all real media, which is the loudest possible way for a forensic rule to be
+    // wrong: it trains an analyst to ignore it.
+    //
+    // Sorting the presentation timeline before measuring is what separates the
+    // two cases. A reordered-but-constant track becomes uniform; a genuine rate
+    // change stays uneven.
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    let reordered = dir.path().join("reordered.mp4");
+    std::fs::write(&reordered, build_mp4_with_reordered_frames(40)).expect("writes reordered");
+
+    let changed = dir.path().join("frame-rate-change.mp4");
+    std::fs::write(&changed, build_mp4_with_frame_rate_change(30, 30)).expect("writes changed");
+
+    let engine = AnalysisEngine::new();
+
+    let (bundle, _) = engine.observe_stages(&reordered);
+    assert!(
+        bundle.container.is_some(),
+        "sanity: the reordered fixture must still parse"
+    );
+    let reordered_findings = builtin_rules()
+        .iter()
+        .find(|r| r.id() == "VIDEO.FRAME_RATE_CHANGE")
+        .map(|r| r.evaluate(&bundle, &RuleProfile::default()))
+        .unwrap_or_default();
+    assert!(
+        reordered_findings.is_empty(),
+        "reordering frames is not a frame-rate change, but got: {:?}",
+        reordered_findings
+            .iter()
+            .map(|f| &f.observation.summary)
+            .collect::<Vec<_>>()
+    );
+
+    // The rule must still fire when the rate genuinely changes. A fix that silences
+    // the rule is not a fix.
+    let (bundle, _) = engine.observe_stages(&changed);
+    let changed_findings = builtin_rules()
+        .iter()
+        .find(|r| r.id() == "VIDEO.FRAME_RATE_CHANGE")
+        .map(|r| r.evaluate(&bundle, &RuleProfile::default()))
+        .unwrap_or_default();
+    assert!(
+        !changed_findings.is_empty(),
+        "a genuine mid-file frame-rate change must still be reported"
+    );
+}
+
+#[test]
+fn a_reordered_file_is_out_of_order_only_in_presentation_time() {
+    // The reordering fixture is the one place a backwards timestamp is expected,
+    // so the guard that would normally catch such a thing has to be shown still
+    // working rather than switched off.
+    //
+    // What distinguishes a B-frame stream from a corrupt one is that *decode*
+    // time stays strictly increasing while *presentation* time does not. A
+    // fixture that went backwards in both would be proving nothing: any
+    // backwards-timestamp reader would report it, including one that had merely
+    // mis-parsed the table.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("reordered.mp4");
+    std::fs::write(&path, build_mp4_with_reordered_frames(40)).expect("writes fixture");
+
+    let (bundle, _) = AnalysisEngine::new().observe_stages(&path);
+    let info = bundle
+        .container
+        .as_ref()
+        .and_then(|c| c.first_video_frames())
+        .expect("the fixture has a video track");
+
+    assert!(
+        info.decode_times.windows(2).all(|w| w[0] < w[1]),
+        "decode time must stay strictly increasing; a file that goes backwards in \
+         both is a broken table, not reordered frames"
+    );
+    assert!(
+        info.frame_times.windows(2).any(|w| w[0] > w[1]),
+        "presentation time must actually go backwards, or the fixture is not \
+         exercising what it claims to"
+    );
+    assert_eq!(
+        info.frame_times.len(),
+        info.decode_times.len(),
+        "the two sequences must describe the same frames"
+    );
+}
+
+#[test]
+fn each_audio_amplitude_fixture_triggers_only_its_own_rule() {
+    // The corpus satisfies the coverage guard as a *set*: some file trips each
+    // rule. That is weaker than it looks — a single loud file with a DC offset
+    // would satisfy `AUDIO.CLIPPING`, `AUDIO.DC_OFFSET`, and `AUDIO.INAUDIBLE` at
+    // once, and all three would pass while none of the fixtures actually isolated
+    // the condition it claims to.
+    //
+    // Each fixture is therefore checked on its own, and checked for what it must
+    // *not* trip. A fixture that trips extra rules is not wrong, but it stops
+    // being evidence for the rule it was built for.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let engine = AnalysisEngine::new();
+
+    let cases: &[(&str, &[f32], &str, &[&str])] = &[
+        (
+            "audio-clipped.webm",
+            &square_wave(1.0),
+            "AUDIO.CLIPPING",
+            &["AUDIO.DC_OFFSET", "AUDIO.INAUDIBLE"],
+        ),
+        (
+            "audio-dc-offset.webm",
+            &biased_tone(0.2),
+            "AUDIO.DC_OFFSET",
+            &["AUDIO.CLIPPING"],
+        ),
+        (
+            "audio-inaudible.webm",
+            &tone(1.0e-4),
+            "AUDIO.INAUDIBLE",
+            &["AUDIO.CLIPPING", "AUDIO.DC_OFFSET"],
+        ),
+    ];
+
+    for (name, samples, expected, forbidden) in cases {
+        let path = dir.path().join(name);
+        std::fs::write(&path, webm_with_opus(dir.path(), samples)).expect("writes fixture");
+
+        let (bundle, _) = engine.observe_stages(&path);
+        assert!(
+            !bundle.audio_levels.is_none(),
+            "{name}: audio was never analysed, so the rule could not have fired"
+        );
+
+        let fired: Vec<&str> = builtin_rules()
+            .iter()
+            .map(|r| r.id())
+            .filter(|id| {
+                builtin_rules().iter().any(|r| {
+                    r.id() == *id && !r.evaluate(&bundle, &RuleProfile::default()).is_empty()
+                })
+            })
+            .collect();
+
+        assert!(
+            fired.contains(expected),
+            "{name} should trip {expected} but only tripped {fired:?}"
+        );
+        for rule in *forbidden {
+            assert!(
+                !fired.contains(rule),
+                "{name} also tripped {rule}, so it is not isolating {expected}: {fired:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rule_fires_only_on_files_built_for_its_condition() {
+    // The coverage guard asks "does every rule fire on *some* fixture". That
+    // question is satisfiable by a rule firing everywhere, and one did: the
+    // Matroska reader could not see `Segment > Info > Duration`, so every WebM
+    // fixture reported "declares no duration". The finding was *correct about the
+    // fixture* — the fixtures simply had no duration element, which no real muxer
+    // omits — so the corpus trained a reader to expect that rule to fire on WebM
+    // and would have hidden it on a file that genuinely lacked one.
+    //
+    // This asserts attribution instead: each rule fires only where its condition
+    // was built. The list is the mapping from fixture to the rule it exists for.
+    // A rule appearing twice is a fixture reaching two conditions, which is fine
+    // and is why this is a set of pairs rather than one rule per fixture.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let engine = AnalysisEngine::new();
+
+    let expected: &[(&str, &str)] = &[
+        // Duration is absent here by construction, and declared everywhere else.
+        ("no-duration.webm", "CONTAINER.STREAM_DURATION_MISSING"),
+        ("trailing-data.mp4", "CONTAINER.STRUCTURAL_DEFECT"),
+        ("truncated.mp4", "CONTAINER.TRUNCATED_MEDIA"),
+        ("empty-moov.mp4", "CONTAINER.NO_USABLE_STREAMS"),
+        // An empty `moov` is one defect with three true answers: the structure is
+        // malformed, the demuxer reported an anomaly, and no usable stream
+        // resulted. All three are correct statements about the same bytes. Listing
+        // all three is the point — a reader seeing one finding should be able to
+        // find the other two without concluding the engine invented them.
+        ("empty-moov.mp4", "CONTAINER.MALFORMED_STRUCTURE"),
+        ("empty-moov.mp4", "CONTAINER.PARSE_ANOMALY"),
+        ("track-mismatch.mp4", "CONTAINER.DECLARED_TRACK_MISMATCH"),
+        (
+            "wrong-duration.mp4",
+            "METADATA.DECLARED_VS_MEASURED_MISMATCH",
+        ),
+        ("frame-rate-change.mp4", "VIDEO.FRAME_RATE_CHANGE"),
+        ("frame-rate-change.mp4", "TIMING.TIMESTAMP_GAP"),
+        ("reordered.mp4", "TIMING.NON_MONOTONIC_PTS"),
+        // True of any closed IBBP stream, and the reason the frame-rate fix was
+        // needed at all: composition offsets are applied per group, so the gap
+        // between one group's last frame and the next group's first is not the
+        // nominal frame duration. `scan_presentation` sees that as a gap in the
+        // decode-to-presentation timeline.
+        //
+        // This is a real property of B-frame video, not an artefact of the
+        // fixture, which is why it is listed rather than engineered away — a
+        // fixture that hid it would misrepresent what the reader sees.
+        ("reordered.mp4", "TIMING.TIMESTAMP_GAP"),
+        ("bitrate-drop.mp4", "VIDEO.BITRATE_DROP"),
+        // A consequence of how that fixture expresses a bitrate drop: the reduced
+        // frames are 8 bytes of `0x5A`, so 40 consecutive samples are identical
+        // and are therefore also a duplicate-frame run.
+        //
+        // Recorded rather than fixed. Byte-identical reduced frames are the
+        // simplest way to shrink a sample, and a real encoder produces small but
+        // *distinct* frames — so a fixture matching that more closely is worth
+        // doing, but not at the cost of making the bitrate drop itself harder to
+        // see. The pair is listed so the extra finding is a known quantity.
+        ("bitrate-drop.mp4", "VIDEO.DUPLICATE_FRAME_RUN"),
+        ("repeated-frames.mp4", "VIDEO.DUPLICATE_FRAME_RUN"),
+        ("single-keyframe.mp4", "VIDEO.SINGLE_KEYFRAME"),
+        ("gop-change.mp4", "VIDEO.GOP_LENGTH_CHANGE"),
+        ("audio-clipped.webm", "AUDIO.CLIPPING"),
+        ("audio-dc-offset.webm", "AUDIO.DC_OFFSET"),
+        ("audio-inaudible.webm", "AUDIO.INAUDIBLE"),
+        // Also correct, and worth stating rather than hiding: a tone at 1e-4 sits
+        // below the 0.001 silence threshold as well as below the -70 LUFS floor.
+        // "Too quiet to hear" and "sustained sub-threshold amplitude" are the same
+        // observation measured two ways, so a file with this condition legitimately
+        // answers both questions. Suppressing one to satisfy this guard would hide
+        // a true finding.
+        ("audio-inaudible.webm", "AUDIO.SILENCE_REGION"),
+        ("audio.webm", "AUDIO.SILENCE_REGION"),
+        ("video.av1.webm", "VIDEO.SCENE_CHANGE"),
+        // The gradient in this fixture translates by 30 units per frame, so
+        // consecutive frames are similar without being identical. That is a real
+        // near-duplicate run, not an accident of the fixture: any moving-content
+        // clip produces one. Recorded so the pair is visible rather than
+        // discovered later as an unexplained extra finding.
+        ("video.av1.webm", "VIDEO.NEAR_DUPLICATE_FRAME"),
+        ("all-keyframes.mp4", "VIDEO.ALL_FRAMES_KEYFRAMES"),
+        // One metadata fixture reaches two conditions: the atoms it carries have
+        // both a conflicting timestamp pair and no creation time. Listing both is
+        // the honest record — the fixtures are built for the metadata layer, and
+        // these are the two questions that layer can answer about them.
+        ("metadata.mp4", "METADATA.TIMESTAMP_CONFLICT"),
+        ("metadata.mp4", "METADATA.MISSING_CREATION_TIME"),
+        ("av.mp4", "TIMING.AV_SYNC_DRIFT"),
+        // Also intended: this fixture is built with a 40 ms edit-list delay on its
+        // audio track, so the audio stream's start offset *is* a condition it was
+        // constructed to produce.
+        ("av.mp4", "CONTAINER.STREAM_START_OFFSET"),
+        // This fixture exists for the colour layer and nothing else: a `colr`
+        // box naming BT.2020 and PQ, with no `mdcv` or `clli` beside it.
+        ("hdr-signalling-only.mp4", "VIDEO.HDR_METADATA_MISSING"),
+    ];
+
+    for path in corpus(dir.path()) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let (bundle, _) = engine.observe_stages(&path);
+        let fired: Vec<&str> = builtin_rules()
+            .iter()
+            .map(|r| r.id())
+            .filter(|id| {
+                builtin_rules().iter().any(|r| {
+                    r.id() == *id && !r.evaluate(&bundle, &RuleProfile::default()).is_empty()
+                })
+            })
+            .collect();
+
+        for rule in &fired {
+            assert!(
+                expected.contains(&(name.as_str(), *rule)),
+                "{name} fired {rule}, which it was not built to test. Either the \
+                 condition is broader than intended, or the fixture is reaching \
+                 something incidental. All of it fired: {fired:?}"
+            );
+        }
+    }
+
+    // And the other direction: every listed pair must still fire. A guard that
+    // only rejects unexpected findings would pass on a corpus that quietly stopped
+    // testing anything.
+    for (name, rule) in expected {
+        let path = dir.path().join(name);
+        assert!(path.exists(), "{name} is missing from the corpus");
+        let (bundle, _) = engine.observe_stages(&path);
+        assert!(
+            builtin_rules().iter().any(
+                |r| r.id() == *rule && !r.evaluate(&bundle, &RuleProfile::default()).is_empty()
+            ),
+            "{name} no longer fires {rule}; the fixture is no longer testing what it was built for"
+        );
+    }
 }

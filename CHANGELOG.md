@@ -4,6 +4,304 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Encoder fingerprinting that cannot overstate itself
+- Spec §27 asks for encoder signatures "where technically defensible". The
+  defensible reading is that a signature is *not* an identification: `Lavf58.45.100`
+  is a string in the file, and anyone can write any string into any file
+- `fingerprint::Confidence` has **no top grade**. Declared tags are `Low`;
+  all-intra structure, the one property that cannot be written as a string, is
+  `Medium`. Nothing measured here can support a claim about which program ran, so
+  the type makes that unrepresentable rather than relying on discipline
+- Every indicator carries its own `limitations`, and a test fails the build if one
+  is ever empty
+- §27's bitstream and quantisation evidence is not collected: this build parses no
+  coded slice data. That is reported as `not_measured` rather than omitted,
+  because a fingerprint that hides its inputs reads as a complete answer
+- `©nam` and `©cmt` are deliberately not matched. A file named after its camera is
+  not evidence about what wrote it, and matching a title would fire on most files
+  in existence
+
+#### Property tests found a bug in the property test
+- `-container/tests/properties.rs`: 6 properties, 512 cases each, over
+  `next_box`, `parse_track_colour`, `parse_edit_lists`, and `scan_isobmff`
+- The invariants are stronger than any example set can express: no panic;
+  truncation is monotone, so a prefix never reveals more than the whole file; no
+  reader emits more entries than there are `trak` boxes; damage offsets stay
+  inside the input; absurd declared sizes are refused
+- The box-walk property looped on `cursor` and never assigned it, so it only ever
+  checked offset 0 — a passing property that examined nothing. Clippy caught the
+  dead `mut`
+- The harness was itself verified: an injected panic in a property body was caught,
+  so the properties are genuinely executing rather than vacuously passing
+
+#### Colour was a type that existed and nothing more
+- `ColourInfo` had five fields and `VideoFormat::is_hdr` a sixth. All six were
+  populated by `Default::default()` and `false` in every reader, on every file, so
+  every report in every format carried empty colour
+- `is_hdr` was not a measurement that came out false. It was a constant. A report
+  could have said "not HDR" about an HDR master and been reporting a value no
+  code path could ever produce otherwise
+- `tpt-kinetix-demux` has no colour support of any kind, so this could not be
+  obtained from the demuxer. It needed a reader, the same way `elst` and `ctts`
+  did before it
+- New `container/src/colr.rs` reads `colr` inside the visual sample entry, plus
+  `mdcv` and `clli`. `nclx` and `nclc` are read separately, because treating one
+  as the other would report a range for a box that declares none
+- The 78-byte `VisualSampleEntry` offset is the whole difficulty. Searching the
+  sample entry from offset 0 reads the width and height fields as a box header,
+  walks into the middle of the entry, and reports no colour on every file —
+  indistinguishable from a file that carries none
+- Codes this build cannot name are reported as `unrecognised code N`. A file
+  declaring an unknown code has still declared something, and the number is the
+  evidence
+- Matroska is unchanged and reports nothing. That reader exposes no picture
+  geometry, so there is no `VideoFormat` to attach colour to
+
+#### `VIDEO.HDR_METADATA_MISSING` — a new rule over a field that was always false
+- Reports a stream that signals HDR (BT.2020 primaries, or PQ/HLG transfer)
+  while carrying neither `mdcv` nor `clli`. Warning/High: nothing is damaged, and
+  both halves are read directly from the box structure
+- It asserts no cause. A re-mux that kept `colr` and dropped `mdcv` is the
+  obvious story and is not named; a test fails the build if the finding's text
+  ever does
+- Its first version keyed on `is_hdr` alone, which fired on conformant HDR10
+  masters as well — a rule reporting every correct HDR file as defective. The
+  negative test caught it; it now checks `hdr_metadata` for the boxes it is
+  actually about
+- Its first version discriminated findings by primaries. Two HDR tracks declaring
+  the same primaries would then derive one `FindingId`, and `findings` has a
+  primary key on `(analysis_id, id)` — the second insert would abort the whole
+  analysis. That is the collision already fixed once in `RuleEngine::evaluate`;
+  this time the discriminator is the stream index
+
+#### The fixture's `stsd` was not a valid visual sample entry
+- It wrote 50 zero bytes where a `VisualSampleEntry` has a specified layout, so no
+  child box could exist inside the sample entry and no `colr` could be written at
+  all
+- It now writes the real 78-byte field layout, with a `debug_assert` on the
+  length. Every other fixture's bytes shift accordingly, which is why the whole
+  suite was re-run rather than the colour tests alone
+
+#### Three rendering bugs the CLI check caught that the unit tests did not
+- The mastering display printed one coordinate per primary, so `R(0.6800)
+  G(0.2650) B(0.1500)` looked like the y values had been dropped when the caller
+  had only asked for one of each pair
+- `mdcv` and `clli` were appended to one string, so a report read
+  `...(raw 1)content light:...` with no boundary between the two boxes
+- Content light levels were formatted to whole cd/m², and `clli` stores whole
+  lumels, so 4,000 lumels rendered as `0 cd/m2` — indistinguishable from no value
+  at all. Now four decimal places, with the raw lumel count kept beside it
+- All three were visible only by running the real binary over a real file. The
+  assertions that caught them are now in `colr.rs`'s tests
+
+#### Two findings from one rule could abort the whole analysis
+- `findings` has a primary key on `(analysis_id, id)`, and a finding's ID was
+  derived from the rule ID and timeline locator alone. Nineteen of the 26 rules
+  pass no locator, so any two findings from one of them collided
+- The second insert failed with `UNIQUE constraint failed`, which surfaced as
+  `case database error` — the analysis stored nothing and the operator was told
+  the file could not be read. Not a degraded report; no report at all
+- Every rule was affected. Verified directly: for all 26, two findings at one
+  position derive an identical ID
+- It could only be reached by a file producing two findings from a single rule,
+  which no fixture in the corpus did. Chasing an unrelated fixture gap is what
+  uncovered it: `build_mp4_with_frame_rate_change` fires
+  `TIMING.TIMESTAMP_GAP` once per affected sample, and the second one crashed
+  the analysis
+- Fixed in `RuleEngine::evaluate`, not rule by rule, so a rule cannot
+  reintroduce it by forgetting to disambiguate. Collisions are resolved from the
+  finding's own content, after sorting, so the IDs are still reproducible across
+  runs — confirmed by analysing the same file twice and comparing all 59 IDs
+- Guarded by `a_file_yielding_several_findings_from_one_rule_stores_without_a_key_collision`,
+  which runs through `analyse` rather than the rule engine, because persistence
+  is where the failure was
+
+#### `CONTAINER.DECLARED_TRACK_MISMATCH` now fires — it was unfireable, not just untested
+- The rule compares what the container declared against what was recovered. Both
+  container readers assigned `declared_track_count` from `tracks.len()`, so the
+  two sides were the same number by construction and the condition could never be
+  true — for a real file, a malformed one, or a synthetic one
+- Fixed by reading `mvhd` independently of the demuxer, in a new `boxes` module
+  holding the ISO-BMFF walkers that `elst.rs` already needed. Those helpers had
+  been written twice by two readers; they now exist once
+- `next_track_ID` is the declaration that matters, and it catches the case the
+  `trak` count cannot: a file that claims a track it never carried leaves no box
+  to count. Both are compared, so a track *lost in parsing* and a track *never
+  present* are both reported
+- Matroska is unchanged and stays silent. It has no `mvhd` equivalent, so the
+  demuxer's track list is both the declaration and the recovery. Documented at the
+  call site rather than silently reporting agreement
+- Added `build_mp4_with_declared_track_mismatch`, the first file in the project
+  that can trigger this rule
+
+#### `VIDEO.FRAME_RATE_CHANGE` would have fired on nearly every real video file
+- The rule took the spacing between consecutive entries of `frame_times`. Those are
+  in *decode* order, so any file with B-frames has unevenly spaced presentation
+  times even when the frame rate never changes: one IBBP group presents as
+  0, 3, 1, 2, whose differences are +3, -2 and +1 ticks
+- Essentially every real encoded video file uses B-frames, so the rule would have
+  reported a frame-rate change on almost all real media. In a forensic tool that is
+  the loudest way to be wrong: it trains an analyst to ignore the rule entirely
+- Found only after `ctts` parsing made presentation times reachable. Before that,
+  every timestamp was decode time and the sequence was monotonic by construction,
+  so the bug could not express itself
+- Fixed by sorting the presentation timeline before measuring. After sorting, a
+  constant-rate track has identical intervals whatever its reordering, and a genuine
+  rate change still stands out
+- The finding's position also indexed the decode-ordered array while `position`
+  counted the sorted one. For any file with B-frames those are different frames, so
+  the reported time pointed somewhere else entirely
+- Guarded by `b_frame_reordering_alone_is_not_a_frame_rate_change`, which also
+  asserts the rule still fires on a real rate change — a fix that silenced the rule
+  would not be a fix
+
+#### The B-frame fixture was not a permutation of any real stream
+- `build_mp4_with_reordered_frames` used composition offsets that produced
+  presentation times of `3, 3, 3, 1, 7, 7, 7, 5`: three frames sharing a
+  presentation time and two times with no frame at all. No encoder emits that, and it
+  made the track look as if it had both duplicated and missing frames
+- Now uses the closed-IBBP offsets a real encoder writes — `0, +2, -1, -1` — which
+  is a genuine permutation: every frame presents once, at a distinct time, and sorted
+  the presentation times recover `0, 1, 2, ...`
+- `the_reordered_fixture_presents_every_frame_exactly_once` asserts that property
+  directly, so a future change to the offsets cannot quietly reintroduce it
+- With a real permutation the file also stops looking like a frame-rate change,
+  which is what exposed the rule bug above
+
+#### Twelve of sixteen video fixtures claimed every frame was a keyframe
+- Omitting `stss` means *every* sample is a sync sample. The fixture builder
+  omitted it for every track, so 12 of 16 video fixtures declared a stream of
+  nothing but intra frames
+- No real encoder produces that. `VIDEO.ALL_FRAMES_KEYFRAMES` fired on 12 of 20
+  fixtures, which reads as a rule that fires on almost everything rather than as a
+  property of the files — the same shape as the WebM duration problem, one layer
+  down
+- It had also been quietly excusing coverage. The attribution guard excluded this
+  rule with a comment saying it "says nothing about attribution" — which was true,
+  and was the problem: the guard had learned to expect a rule that could not be
+  attributed, and would have kept excluding it
+- `build_mp4` now writes a periodic sync-sample table (a keyframe every 12 frames)
+  as a muxer does. Omitting it is now `SyncTable::AllSync` and must be asked for
+- The rule fires on exactly one fixture, and the attribution guard no longer needs
+  an exclusion for it. That is the check that the fix was real rather than cosmetic
+
+#### A batch test that passed for the wrong reason
+- `findings_are_collected_across_the_whole_batch` asserted findings span more than
+  one asset. They did — because all three MP4 fixtures reported
+  `ALL_FRAMES_KEYFRAMES`, a finding that said nothing about whether any file was
+  damaged
+- With the fixtures corrected, one asset had findings and the test failed, which is
+  the honest result: only `damaged.mp4` was defective. `nested.mp4` now carries a
+  real defect, and the test also asserts the clean file reports nothing
+- Worth noting because it was passing, and had been for as long as it existed
+
+#### Appending bytes to a valid file produced a finding about missing media
+- The structural scanner kept walking boxes *after* `mdat`. Bytes a muxer appended
+  for any reason — a signature, padding, a second `free` box — were parsed as box
+  headers
+- Appending the literal string `payload a real muxer never writes` produced `box
+  'oad ' at offset 3677 declares 1885436268 bytes but only 33 remain`, reported as
+  `CONTAINER.TRUNCATED_MEDIA`. The "box type" was the fourth character of the word
+  "muxer"
+- So an analyst would have been told media was missing from a file whose media was
+  entirely present. In a forensic tool that is worse than silence: it names a defect
+  that is not in the evidence
+- `mdat` now ends the walk. Bytes after it are reported once, as trailing data,
+  which is what they are — outside the container's structure by definition
+- An existing test had *pinned the buggy behaviour*, asserting that appended bytes
+  must surface as an over-read. Rewritten into two: a box appearing where a box is
+  expected is still parsed and reported, and bytes after `mdat` never are. Both
+  cases are legitimate and the distinction is the point
+
+#### `CONTAINER.STREAM_DURATION_MISSING` fired on every WebM file, for a wrong reason
+- The Matroska reader exposed no duration, so every WebM file reported "declares no
+  duration". The finding was *correct about the fixture* — and the fixtures were
+  unusual, not the files
+- Compounding it, the fixture builder wrote no `Segment > Info > Duration` at all,
+  so the corpus contained no WebM file resembling a real one. A reader would have
+  learned to expect that rule on WebM, hiding it on files that genuinely omit the
+  element
+- `Segment > Info > Duration` is now parsed. `MkvTrack` carries only a number, a
+  type and a codec id, so this had to be read from the bytes
+- `build_webm` now writes the element, and `build_webm_without_duration` exists to
+  produce the file the rule is actually for. The rule now fires on exactly one
+  fixture
+
+#### A guard for attribution, not just coverage
+- The coverage guard asks "does every rule fire on *some* fixture", which a rule
+  firing *everywhere* satisfies. Added `a_rule_fires_only_on_files_built_for_its_condition`,
+  mapping each fixture to the rules it was built to test and asserting nothing else
+  fires
+- It found four things on first run, three of them real:
+  - `no-duration.webm` also tripped `VIDEO.SINGLE_KEYFRAME` and
+    `VIDEO.DUPLICATE_FRAME_RUN`. A duration fixture should reach no other
+    condition; rebuilt with several distinct blocks
+  - `bitrate-drop.mp4` trips `VIDEO.DUPLICATE_FRAME_RUN`, because its reduced
+    frames are 8 bytes of `0x5A` and therefore identical. A real encoder produces
+    small but *distinct* frames; recorded rather than fixed, since changing it
+    would obscure the bitrate drop itself
+  - Six further pairs are one condition with several true answers — an empty
+    `moov` is malformed, anomalous, *and* streamless. Listed with a note each, so
+    an extra finding reads as a known quantity rather than a mystery
+
+#### The audio amplitude rules now fire from real encoded audio
+- `AUDIO.CLIPPING`, `AUDIO.DC_OFFSET`, and `AUDIO.INAUDIBLE` had no fixture. The
+  analysis was present, wired, and fed — the corpus's single audio fixture is a
+  0.8-amplitude tone, which sits below the 0.999 clipping threshold, has a mean
+  of zero, and is far above the -70 LUFS floor. It simply never reached any
+  threshold
+- Three signals added, each going through the same real Opus → Ogg → WebM path
+  as the existing fixture, because these rules read *decoded* levels and a stub
+  payload would parse as an audio track then decode to nothing
+- A square wave for clipping rather than a full-scale sine: a sine spends most of
+  its time well below its peak, so every sample has to be pushed over the
+  threshold by decoder ringing, while a square wave sits at its extreme for half of
+  every cycle. Each signal is pushed well past its threshold rather than to it,
+  since a lossy codec will not reproduce a boundary value
+- Added `each_audio_amplitude_fixture_triggers_only_its_own_rule`, which asserts
+  each fixture trips its own rule *and not the other two*. The coverage guard only
+  checks the set — one loud file with a DC offset would satisfy all three rules
+  at once and pass, while proving nothing about any of them
+
+#### `TIMING.NON_MONOTONIC_PTS` now fires — presentation order is now computed
+- The second and last rule that could not fire on any file
+- `scan_presentation` was always correct; nothing upstream could feed it. Frame
+  timestamps came from `stts`, whose deltas are unsigned, so the sequence was
+  monotonic by construction and no MP4 could violate it
+- Root cause: **presentation order was never computed.** B-frames produce a
+  non-monotonic presentation order through composition offsets, and
+  `tpt-kinetix-demux` has no `ctts` support at all — the box was simply not being
+  read. Now parsed in `boxes.rs` and added to decode time
+- `TrackFrameInfo` gained `decode_times` alongside `frame_times`. Keeping both
+  matters: a file whose decode order is correct but presentation order is not is
+  *normal*, and reporting only presentation times would make that
+  indistinguishable from a corrupt timestamp table
+- Offsets are applied in ticks and converted once. Converting to microseconds,
+  adding, and converting back would round twice, and the error would vary per
+  sample — inventing jitter in files whose timestamps are exact
+- `build_mp4_with_reordered_frames` writes a run-length `ctts` in the IBBP
+  pattern a real muxer produces, not one entry per sample
+- Guarded by `a_reordered_file_is_out_of_order_only_in_presentation_time`, which
+  asserts decode time stays strictly increasing. A fixture going backwards in
+  *both* would be a broken table rather than reordered frames, and would prove
+  nothing about the reader
+- `NO_END_TO_END_FIXTURE` is now empty. Every one of the 26 rules fires end to
+  end from a file this project owns
+- `METADATA.DECLARED_VS_MEASURED_MISMATCH`, `TIMING.TIMESTAMP_GAP`,
+  `VIDEO.FRAME_RATE_CHANGE`, `CONTAINER.MALFORMED_STRUCTURE`,
+  `CONTAINER.NO_USABLE_STREAMS`, `CONTAINER.PARSE_ANOMALY`,
+  `CONTAINER.STREAM_START_OFFSET`, `CONTAINER.STRUCTURAL_DEFECT`,
+  `VIDEO.GOP_LENGTH_CHANGE`, `VIDEO.SINGLE_KEYFRAME`
+- Not one required new analysis. Every one was a builder that already existed —
+  and `TrackSpec::declared_duration` was in use by the container's own unit
+  tests — which had simply never been written to disk as part of the corpus
+- Three added: `build_mp4_with_wrong_declared_duration`,
+  `build_mp4_with_frame_rate_change`, and a trailing-data fixture for the
+  structural rule, which needs a defect *other* than truncation
+- The remaining five are documented individually in `stage_guard.rs` rather than
+  left as a bare list, because "needs a builder" and "cannot fire" call for
+  different work
+
 #### The README claimed colour and HDR analysis that no reader performs
 - "Video analysis — structure, GOP layout, duplicate and near-duplicate
   detection, scene changes, **colour and HDR signalling**" was listed under
@@ -107,6 +405,84 @@ All notable changes to this project are documented in this file, following
   a future `Hash` or `Ord` derive would have produced silently wrong ordering
 - Caught by the compiler, not by review — the first sign that deriving `Eq` over a
   measurement is a category error rather than a style choice
+
+#### Six fixture builders existed, were correct, and were never called
+- `build_mp4_empty_moov`, `build_mp4_stsd_gop_change`, `build_mp4_with_keyframes`
+  and `build_mp4_without_stss` were written, exported, and used by the rules
+  crate's own tests. Nothing was wrong with any of them
+- They were simply never written to disk by the corpus. So five rules could not
+  fire end to end on any file the project owns, while every guard in the project
+  reported the rule set as fully exercised
+- This is the cheapest possible instance of the defect the guard was built for,
+  and the most embarrassing: the capability existed, the test existed, and the
+  wiring between them did not. Only asking "can this rule ever *say* anything",
+  as opposed to "are its inputs reachable", surfaced it
+- Six fixtures in the corpus closed it. `CONTAINER.STRUCTURAL_DEFECT` needed one
+  piece of new construction — four appended bytes — because nothing built a file
+  with trailing data
+
+#### A trailing-data fixture tested the limitation instead of the rule
+- The first version appended `b"trailing-bytes"`. Fourteen bytes is more than a
+  box header, so `scan_isobmff` read the appended text as a further box and
+  reported truncation rather than trailing data
+- `CONTAINER.STRUCTURAL_DEFECT` therefore still did not fire, and the fixture was
+  silently exercising the documented limitation that appended data long enough to
+  resemble a box is read as one
+- Reduced to four bytes, which cannot be a box header. The comment now says why:
+  a fixture built on the fragile side of that boundary would be testing the
+  limitation rather than the rule. Worth writing down because the fixture would
+  otherwise have kept passing for the wrong reason
+
+#### `edit_list_offset` was a modelled field no reader ever filled
+- `StreamTiming::edit_list_offset` existed in the model, serialised into reports,
+  and was hardcoded `None` in `mp4.rs` for every file ever analysed
+- `tpt-kinetix-demux`'s `Mp4Track` carries no `elst` field at all, so the delay
+  could not be populated through the demuxer. The fixture built a correct edit
+  list; the reader discarded it
+- This is the colour/HDR defect class exactly — a type that is present and never
+  populated — and it had been hiding behind a field that looked implemented
+- `elst.rs` parses `moov/trak/edts/elst` from the bytes the container reader
+  already holds, so no extra I/O. `CONTAINER.STREAM_START_OFFSET` now fires end
+  to end, verified on a real 120 ms-delayed file reporting `00:00:00.120`
+- That rule had been sitting in `NO_END_TO_END_FIXTURE` from the day that list
+  was written. It fired immediately once the field was populated, and the
+  reverse assertion in the guard caught its own list entry going stale
+
+#### The rule reported `00:00:00.000` for a track delayed by 120 ms
+- `CONTAINER.STREAM_START_OFFSET` built its summary from `start_time`, which the
+  container reader sets to zero unconditionally. The edit-list offset — the value
+  that actually tripped the rule — appeared only in the measurements
+- So the finding's headline said "starts at 00:00:00.000" while its own second
+  line said "edit-list offset: 00:00:00.120". A precise, confident, wrong
+  timecode, which is worse than the `None` it replaced
+- The summary and the timeline placement now use whichever value triggered the
+  rule. This is the declared-versus-measured distinction the project already
+  applies to durations: a start time that was never read is not a measurement
+
+#### The fixture wrote `media_time = 1` where an empty edit requires `-1`
+- `build_mp4_av`'s edit list wrote `media_time: 1`. An empty edit — "hold nothing
+  here for `segment_duration`" — is defined by `media_time == -1`
+- `1` declares that presentation starts one tick into the media, a different edit
+  entirely. It happened to work for the delay cases because only
+  `segment_duration` is read, which is exactly why nothing caught it
+- Found only because the parser distinguishes `Some(ZERO)` from `None` and a test
+  asserted the difference. A parser that ignored `media_time` would never have
+  noticed
+
+#### A four-byte field was read through an eight-byte slice, silently
+- `next_box` did `u32::from_be_bytes(data[offset..offset + 8].try_into().ok()?)`.
+  The slice is eight bytes; `from_be_bytes` wants four; `try_into` returns `None`
+  on a length mismatch and `.ok()?` turns that into an early return
+- The walk therefore reported "end of input" at the first box it met, for every
+  file, forever. No panic, no warning — the parser simply found nothing and
+  returned an empty vector, which reads exactly like "this file has no edit
+  lists"
+- Found by printing the intermediate offsets. Four earlier revisions of the
+  `moov` walk were each *read* as correct and each skipped every `trak`, because
+  `body_end` and "one header in" are different numbers and both read plausibly
+- The fix was to stop doing offset arithmetic entirely: `next_box` already returns
+  the body as a borrow, so `moov_body` hands that straight to the child walk.
+  There is no longer an offset to get wrong
 
 #### Fourteen rules have no fixture that triggers them
 - The bitrate guard I added was one rule. Generalised it to every rule, and the

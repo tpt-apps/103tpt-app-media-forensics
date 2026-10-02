@@ -25,6 +25,8 @@
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod boxes;
+pub mod colr;
 pub mod damage;
 pub mod elst;
 pub mod error;
@@ -33,14 +35,18 @@ pub mod mkv;
 pub mod mp4;
 pub mod probe;
 
+pub use colr::{parse_track_colour, TrackColour};
 pub use damage::{scan_isobmff, SampleIndex, SampleOrigin, SamplePosition, StructuralDamage};
 pub use elst::{parse_edit_lists, EditList};
 pub use error::ContainerError;
 pub use fixture::{
     build_mp4, build_mp4_av, build_mp4_empty_moov, build_mp4_stsd_gop_change,
-    build_mp4_with_bitrate_drop, build_mp4_with_keyframes, build_mp4_with_metadata,
-    build_mp4_with_repeated_frames, build_mp4_without_moov, build_webm, gop_change_keyframes,
-    TrackSpec,
+    build_mp4_with_bitrate_drop, build_mp4_with_colour, build_mp4_with_declared_track_mismatch,
+    build_mp4_with_frame_rate_change, build_mp4_with_hdr_colour,
+    build_mp4_with_hdr_signalling_only, build_mp4_with_keyframes, build_mp4_with_metadata,
+    build_mp4_with_reordered_frames, build_mp4_with_repeated_frames,
+    build_mp4_with_wrong_declared_duration, build_mp4_without_moov, build_webm,
+    build_webm_without_duration, gop_change_keyframes, TrackSpec,
 };
 pub use mkv::{
     inspect_bytes as inspect_matroska_bytes, inspect_file as inspect_matroska_file,

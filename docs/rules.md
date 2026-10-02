@@ -93,7 +93,7 @@ analyzer a rule consumes.
 
 ## The built-in rule set
 
-Twenty-six rules ship in Phase 1. The engine evaluates them in sorted
+Twenty-seven rules ship in Phase 1. The engine evaluates them in sorted
 rule-ID order regardless of registration order, so the set cannot drift.
 
 ```text
@@ -111,6 +111,7 @@ VIDEO.FRAME_RATE_CHANGE
 VIDEO.GOP_LENGTH_CHANGE
 VIDEO.BITRATE_DROP
 VIDEO.DUPLICATE_FRAME_RUN
+VIDEO.HDR_METADATA_MISSING
 VIDEO.SCENE_CHANGE
 VIDEO.NEAR_DUPLICATE_FRAME
 AUDIO.CLIPPING

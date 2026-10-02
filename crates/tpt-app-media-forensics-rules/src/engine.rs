@@ -21,6 +21,8 @@
 //! therefore produce identical output (spec §77) regardless of registration
 //! order.
 
+use std::collections::HashMap;
+
 use tpt_app_media_forensics_model::{AssetId, Finding, FindingId};
 
 use crate::profile::RuleProfile;
@@ -313,8 +315,35 @@ impl RuleEngine {
                 .then_with(|| a.id.cmp(&b.id))
         });
 
-        // Identifiers are content-derived from rule ID plus location, so two
-        // runs over the same input produce identical IDs (spec §77).
+        // Two findings from one rule at one position derive the same ID, and
+        // `findings` has a primary key on `(analysis_id, id)` — so the second
+        // insert aborts the entire analysis. Rather than requiring every rule to
+        // remember to disambiguate, collisions are resolved here, in one place.
+        //
+        // Duplicates are suffixed by position in the sorted order, and their text
+        // is mixed in so the ID still reflects what the finding says. The `#n`
+        // component is what guarantees uniqueness: two findings from one rule at
+        // one position are distinct rows and must stay separately addressable
+        // even when they read identically.
+        //
+        // The findings are sorted before this loop and `seen` is only used to
+        // count — never iterated — so re-running over the same input reproduces
+        // the same IDs (spec §77).
+        let mut seen: HashMap<FindingId, usize> = HashMap::new();
+        for finding in &mut findings {
+            let count = seen.entry(finding.id).or_insert(0);
+            if *count > 0 {
+                let text = format!(
+                    "{}\u{1f}#{count}\u{1f}{}\u{1f}{}",
+                    finding.timeline_range().0,
+                    finding.observation.summary,
+                    finding.observation.measurements.join("|"),
+                );
+                finding.id = finding_id(&finding.rule_id, &finding.asset_id, &text);
+            }
+            *count += 1;
+        }
+
         Ok(findings)
     }
 

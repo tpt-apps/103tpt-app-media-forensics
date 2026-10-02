@@ -70,13 +70,23 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       asserts the list matches `builtin_rules()` so it cannot drift again.
 - [x] Integrate tpt-cadence (	pt-av-cadence-core, -wav)
 - [x] Implement container/stream inspection (§12–13)
-- [~] Implement video analysis: structural, temporal, spatial, colour (§14)
+- [x] Implement video analysis: structural, temporal, spatial, colour (§14)
       Structural, temporal and spatial are done (GOP, duplicates, near-duplicates,
-      scene changes). **Colour is not:** `ColourInfo` and `is_hdr` exist in
-      `-model` and serialise, but every reader assigns `Default::default()` and
-      `false`, so the fields are empty for every file. A type that is present and
-      never populated is the same silent gap as an unwired stage; the README
-      listed colour/HDR as shipped until `readme_claims.rs` caught it.
+      scene changes). **Colour is now done for ISO-BMFF**: `-container/src/colr.rs`
+      reads `colr` (`nclx` and `nclc` separately, so range is reported only where
+      the box declares it) plus `mdcv` and `clli`, walking
+      `trak/mdia/minf/stbl/stsd/<entry>` from the spec's 78-byte
+      `VisualSampleEntry` offset. `is_hdr` is now a measurement — BT.2020 primaries
+      or a PQ/HLG transfer — rather than a hardcoded `false`. Unrecognised codes
+      are reported as `unrecognised code N` rather than dropped, and an unparsable
+      `mdcv` leaves `None` rather than a fabricated zero.
+      **Not done: Matroska.** That reader exposes no picture geometry, so a WebM
+      stream has no `VideoFormat` to attach colour to; inventing one to hold a
+      primaries value would put a resolution in a report that no measurement
+      produced. Listed in the README as a named gap instead.
+      `VIDEO.HDR_METADATA_MISSING` consumes this (§45): HDR signalled with no
+      `mdcv`/`clli` is Warning/High, reported as a comparison of the file's own
+      declarations with no cause asserted.
 - [x] Implement GOP analysis (§15) — packet-layer only; no decoding required
 - [x] Implement frame analysis & duplicate detection (§16–17) — exact duplication
       at the packet layer, no decoding
@@ -105,7 +115,17 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [x] Implement metadata extraction + consistency cross-checks (§25–26)
       — text atoms with scope/source provenance; conflicts are flagged
       without asserting a cause
-- [ ] Implement encoder fingerprinting (best-effort, confidence-labelled) (§27)
+- [x] Implement encoder fingerprinting (best-effort, confidence-labelled) (§27)
+      `-metadata/src/fingerprint.rs`. Reads the `©too` encoder tag and the
+      all-intra structure; each indicator carries a confidence grade and a
+      statement of what it does not establish. **No grade above `Medium` exists**,
+      deliberately: a declared tag is a string anyone can write, so nothing
+      measured here can support a claim about *which program* produced a file.
+      Bitstream and quantisation evidence from §27 is not collected — this build
+      parses no coded slice data — and that is stated as `not_measured` rather
+      than omitted, because a fingerprint that hides its inputs reads as complete.
+      `©nam` and `©cmt` are deliberately not matched: a file named after its
+      camera is not evidence about what wrote it.
 - [x] Implement compression/bitrate analysis + anomaly detection (§28–29)
       `video/src/bitrate.rs`: sliding window over compressed sample sizes, no
       decoder needed. `VIDEO.BITRATE_DROP` reproduces spec §29's own worked
@@ -234,16 +254,51 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 
 ## Testing & Quality (spec §75–77, ongoing across phases)
 - [x] Unit tests for parsers, timing, hashing, rule evaluation, tolerances
-      535 passing across 12 crates. Rule evaluation is checked in both
-      directions — each rule trips on a fixture built to trigger it *and* stays
+      579 passing across 12 crates. Rule evaluation is checked in both
+      directions - each rule trips on a fixture built to trigger it *and* stays
       silent on a clean one, so a rule that fires on everything is caught.
-      **Known gap:** 15 of the 26 rules have no fixture that triggers them end
-      to end; they are tested only against hand-built bundles in `new_rules.rs`.
-      Recorded as `NO_END_TO_END_FIXTURE` in `stage_guard.rs`, which now fails if
-      a *new* rule joins that set — or if a listed one starts firing. Closing the
-      gap means roughly fifteen fixtures, one per rule.
-- [ ] Property tests for timestamps, frame ordering, container parsing
-      Not started. No `proptest`/`quickcheck` dependency is declared.
+      **No known gaps.** All 27 rules fire end to end from a file this project
+      owns, so `NO_END_TO_END_FIXTURE` in `stage_guard.rs` is empty. The list and
+      the mechanism that maintains it are kept: the guard fails if a new rule
+      cannot fire, *and* if a listed one starts firing.
+
+      The list began at fifteen. Reaching zero was not fifteen fixtures - it was
+      three different problems wearing the same label, and telling them apart was
+      the actual work:
+
+      - **Ten** were builders that already existed and had never been written to
+        disk, or signals the corpus's existing Opus path could already produce.
+        No new analysis was needed.
+      - **Two** (`CONTAINER.DECLARED_TRACK_MISMATCH`, `TIMING.NON_MONOTONIC_PTS`)
+        could not fire on *any* file, which is a materially different claim from
+        "not yet exercised". Both sides of each comparison came from the same
+        source, or one side was never computed: `declared_track_count` came from
+        the demuxer's own track list and so equalled `streams.len()` by
+        construction, and frame timestamps were decode time, which `stts` builds
+        from unsigned deltas and is therefore monotonic by construction. Both
+        needed a *reader* - `mvhd`, then `ctts`.
+      - **Three** needed fixtures reaching a *different* condition from the one
+        already present, not a louder instance of it: `truncated.mp4` damages
+        bytes, while `CONTAINER.STRUCTURAL_DEFECT` needs a defect that is not
+        missing data.
+
+      An entry added back to that list should name which of the three it is.
+      Conflating "no fixture yet" with "no fixture could exist" is how a rule stays
+      unfireable while looking merely untested.
+- [~] Property tests for timestamps, frame ordering, container parsing
+      **Container parsing now has real properties.**
+      `-container/tests/properties.rs`: 6 properties, 512 cases each, on
+      `next_box`, `parse_track_colour`, `parse_edit_lists`, and `scan_isobmff`.
+      The invariants are stronger than any example set — no panic, truncation is
+      monotone (a prefix never reveals more than the whole file), no reader
+      exceeds the `trak` count, damage offsets stay inside the input, absurd box
+      sizes are refused. Verified these actually execute: an injected panic in the
+      property body was caught, so the harness is not vacuous.
+      The harness caught a bug in the test itself — a loop that never advanced
+      `cursor` and so only ever checked offset 0.
+      **Still not started:** timestamps and frame ordering. Those need generators
+      for presentation/decode sequences, which is a different piece of work from
+      parsing bytes.
 - [ ] Fuzzing for container/codec/metadata/packet/timestamp parsers
 - [ ] Golden tests against known fixtures (metadata, structure, findings)
 - [~] Build corrupt-media test corpus (§76): synthetic generator in place;

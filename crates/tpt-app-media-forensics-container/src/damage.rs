@@ -240,6 +240,25 @@ pub fn scan_isobmff(data: &[u8]) -> Vec<StructuralDamage> {
         }
 
         offset = offset.saturating_add(full_size);
+
+        // `mdat` is the media payload, not structure. Stepping into it and
+        // continuing the walk parses sample data as if it were box headers,
+        // which manufactures damage out of ordinary compressed bytes.
+        //
+        // This is not hypothetical: appending the bytes "payload a real muxer never
+        // writes" after a valid file produced `box 'oad ' at offset 3677 declares
+        // 1885436268 bytes but only 33 remain`, reported as
+        // `CONTAINER.TRUNCATED_MEDIA`. The trailing bytes were read as a box whose
+        // type was the fourth character of "muxer" — a finding that named a defect
+        // which is not in the file, and would have told an analyst that media was
+        // missing when it was all present.
+        //
+        // Stopping here also makes the trailing-data report below correct: bytes
+        // after `mdat` genuinely are unaccounted for, and are reported once as
+        // such instead of being re-parsed as structure.
+        if &box_type == b"mdat" {
+            break;
+        }
     }
 
     if offset < total {
@@ -628,28 +647,107 @@ mod tests {
     }
 
     #[test]
-    fn appended_data_long_enough_to_mimic_a_box_is_read_as_one() {
+    fn a_real_box_before_mdat_is_still_read_as_structure() {
         // A documented limitation, pinned so a change to it is deliberate.
         //
         // There is no way to tell an appended payload from a further box by
         // looking at the bytes: a box is exactly a size followed by a type, and
-        // appended data frequently has that shape. This walker therefore parses
-        // the first 8 bytes as a box header and reports what the bytes say.
+        // appended data frequently has that shape. A box appearing where a box is
+        // expected is therefore parsed as one, and what it says is reported.
         //
-        // The alternative — treating leftover bytes as opaque — would hide
-        // genuine trailing boxes, which are themselves a forensic signal.
-        let mut data = well_formed();
-        data.extend_from_slice(b"APPENDED-NOT-IN-ANY-BOX");
+        // The alternative — treating leftover bytes as opaque — would hide genuine
+        // trailing boxes, which are themselves a forensic signal.
+        //
+        // Placed *before* `mdat` deliberately. After `mdat` the walk stops, since
+        // everything there is outside the container's structure; see the companion
+        // test below for that case.
+        let mut data = box_of(b"ftyp", 24, &[0u8; 16]);
+        data.extend_from_slice(&box_of(b"moov", 40, &[0xEE; 0x20]));
+        data.extend_from_slice(&box_of(b"free", 40, &[0xFF; 0x20]));
+        data.extend_from_slice(&box_of(b"mdat", 40, &[0u8; 0x20]));
 
         let damage = scan_isobmff(&data);
         assert!(
-            !damage.is_empty(),
-            "the bytes are read as structure, so something must be reported"
+            damage.is_empty(),
+            "every box is well-formed and none follows `mdat`, so nothing should be \
+             reported, got {damage:?}"
         );
-        // 'A' 'P' 'P' 'E' = 0x41505045 as a big-endian size: far past the end.
+    }
+
+    #[test]
+    fn a_box_before_mdat_declaring_an_impossible_size_is_reported() {
+        // The other half of the limitation above: bytes that *look* like a box and
+        // say something impossible are reported rather than skipped.
+        //
+        // Two distinct impossible sizes, and they mean different things:
+        //
+        // - Larger than the file: the box claims more bytes than exist, which is
+        //   what a truncated file looks like.
+        // - Smaller than its own header: a box cannot contain the size and type
+        //   fields that describe it, so no interpretation can be consistent.
+        //
+        // Both are reported, and the distinction is preserved rather than collapsed
+        // — "the file is cut short" and "this box is nonsense" are different
+        // conclusions for an analyst.
+        let mut oversized = box_of(b"ftyp", 24, &[0u8; 16]);
+        oversized.extend_from_slice(&[0x7F, 0xFF, 0xFF, 0xFF, b'f', b'r', b'e', b'e']);
+        oversized.extend_from_slice(&[0u8; 8]);
+        oversized.extend_from_slice(&box_of(b"mdat", 40, &[0u8; 0x20]));
         assert!(
-            matches!(damage[0], StructuralDamage::Truncated { .. }),
-            "expected the over-read to surface, got {damage:?}"
+            matches!(
+                scan_isobmff(&oversized).first(),
+                Some(StructuralDamage::Truncated { .. })
+            ),
+            "a box claiming more bytes than exist means the file is short, got {:?}",
+            scan_isobmff(&oversized)
+        );
+
+        let mut undersized = box_of(b"ftyp", 24, &[0u8; 16]);
+        undersized.extend_from_slice(&[0x00, 0x00, 0x00, 0x02, b'f', b'r', b'e', b'e']);
+        undersized.extend_from_slice(&box_of(b"mdat", 40, &[0u8; 0x20]));
+        assert!(
+            matches!(
+                scan_isobmff(&undersized).first(),
+                Some(StructuralDamage::ImpossibleBoxSize { .. })
+            ),
+            "a box smaller than its own header cannot be interpreted, got {:?}",
+            scan_isobmff(&undersized)
+        );
+    }
+
+    #[test]
+    fn bytes_after_mdat_are_trailing_data_and_never_parsed_as_boxes() {
+        // The complement to the tests above, and the reason they need saying.
+        //
+        // Everything after `mdat` is outside the container's structure by
+        // definition: `mdat` holds sample payloads, and a muxer may append
+        // anything at all — a second `free` box, a signature, padding. Parsing
+        // those bytes as box headers invents boxes that are not there.
+        //
+        // This was live behaviour. Appending the literal string
+        // "payload a real muxer never writes" to a valid file produced
+        // `box 'oad ' at offset 3677 declares 1885436268 bytes but only 33
+        // remain` and a `CONTAINER.TRUNCATED_MEDIA` finding — telling an analyst
+        // that media was missing from a file whose media was entirely present. The
+        // "box type" was the fourth character of the word "muxer".
+        let mut data = well_formed();
+        let appended = b"payload a real muxer never writes";
+        data.extend_from_slice(appended);
+
+        let damage = scan_isobmff(&data);
+        assert_eq!(
+            damage.len(),
+            1,
+            "exactly one defect, not several: {damage:?}"
+        );
+        let StructuralDamage::TrailingData { byte_count, .. } = &damage[0] else {
+            panic!("trailing bytes must be reported as trailing data, got {damage:?}");
+        };
+        assert_eq!(*byte_count, u64::try_from(appended.len()).unwrap());
+        assert!(
+            !damage[0].is_missing_data(),
+            "appended bytes are unaccounted for, not missing: reporting them as a \
+             truncation would claim media is absent when it is present"
         );
     }
 

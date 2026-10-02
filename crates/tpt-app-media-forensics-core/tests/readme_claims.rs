@@ -46,22 +46,11 @@ fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
 /// silently become wrong the way the BLAKE3 entry did. That entry asserted
 /// BLAKE3 was never called, and stopped being true the moment
 /// `acquisition.rs` hashed with it.
-const NOT_IMPLEMENTED: [(&str, &str); 8] = [
+const NOT_IMPLEMENTED: [(&str, &str); 4] = [
     ("reference master", "no comparison engine exists"),
     ("comparison", "no comparison engine exists"),
     ("spectrum", "no spectral analysis exists"),
     ("spectral", "no spectral analysis exists"),
-    // Colour and HDR. `ColourInfo` exists in the model and serialises, but
-    // every reader assigns `Default::default()` and `is_hdr: false`, so each
-    // field is empty for every file. The types being present is not the same as
-    // the measurement happening, which is the distinction this list exists for.
-    (
-        "hdr",
-        "no reader populates ColourInfo; is_hdr is hardcoded false",
-    ),
-    ("colour", "no reader populates ColourInfo"),
-    ("color", "no reader populates ColourInfo"),
-    ("primaries", "no reader populates ColourInfo"),
 ];
 
 /// Builds the claim table, embedding each file's source at compile time.
@@ -86,11 +75,27 @@ macro_rules! claimed_exist {
 /// This is the check that would have caught the stale claims found by hand:
 /// colour/HDR (no reader populates `ColourInfo`), spectral (no FFT in the audio
 /// crate), and progress/cancellation (no such code in `-core`).
-const CLAIMED_EXIST: [(&str, &str, &str); 14] = claimed_exist![
+const CLAIMED_EXIST: [(&str, &str, &str); 17] = claimed_exist![
     (
         "container inspection",
         "../../tpt-app-media-forensics-container/src/mp4.rs",
         "pub fn inspect_bytes"
+    ),
+    // Claimed as "colour signalling" in the README. `parse_track_colour` is what
+    // reads `colr`; before it existed, `ColourInfo` was `Default::default()` and
+    // `is_hdr` a hardcoded `false` on every file.
+    (
+        "colour signalling",
+        "../../tpt-app-media-forensics-container/src/colr.rs",
+        "pub fn parse_track_colour"
+    ),
+    // Claimed as "Encoder fingerprinting". The `Confidence` enum having no top
+    // grade is the mechanism: no indicator *can* claim more than its evidence
+    // supports, so the claim cannot drift into a verdict.
+    (
+        "fingerprinting",
+        "../../tpt-app-media-forensics-metadata/src/fingerprint.rs",
+        "pub fn identify_encoders"
     ),
     (
         "gop",
@@ -144,6 +149,13 @@ const CLAIMED_EXIST: [(&str, &str, &str); 14] = claimed_exist![
         "error timeline",
         "../../tpt-app-media-forensics-container/src/damage.rs",
         "pub fn locate"
+    ),
+    // Claimed as "Edit lists" in the README. `parse_edit_lists` is what reads
+    // `elst`; before it existed, `edit_list_offset` was `None` for every file.
+    (
+        "edit lists",
+        "../../tpt-app-media-forensics-container/src/elst.rs",
+        "pub fn parse_edit_lists"
     ),
     ("sha-256", "../src/acquisition.rs", "sha2::Sha256::new"),
     ("blake3", "../src/acquisition.rs", "blake3::Hasher::new"),

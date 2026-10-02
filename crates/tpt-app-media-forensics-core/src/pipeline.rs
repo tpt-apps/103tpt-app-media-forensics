@@ -27,7 +27,7 @@ use std::path::Path;
 use tpt_app_media_forensics_audio::{find_silence, integrated_loudness, level_stats, Measurement};
 use tpt_app_media_forensics_container::probe::{detect_file, extension_matches};
 use tpt_app_media_forensics_container::{detect, ContainerFormat};
-use tpt_app_media_forensics_metadata::{MetadataEntry, MetadataTree, Scope};
+use tpt_app_media_forensics_metadata::{FingerprintReport, MetadataEntry, MetadataTree, Scope};
 use tpt_app_media_forensics_model::{
     AcquisitionRecord, AnalysisId, AnalysisVersion, CacheKey, Case, Finding, MediaAsset, MediaTime,
     MediaType,
@@ -58,6 +58,12 @@ pub struct AnalysisOutcome {
     pub cache_hit: bool,
     /// The metadata tree extracted from the container.
     pub metadata: MetadataTree,
+    /// Observed encoder indicators, with their confidence and limits (spec §27).
+    ///
+    /// A field rather than only a finding, because an encoder indicator is an
+    /// observation about the file, not a conclusion about it — the same reason
+    /// `metadata` sits beside `findings` rather than inside it.
+    pub fingerprint: FingerprintReport,
     /// What could not be measured, and why.
     pub limitations: Vec<String>,
     /// The profile used.
@@ -127,12 +133,18 @@ impl AnalysisEngine {
         let cached = cache.load(&cache_key)?;
         let cache_hit = cached.is_some();
         if let Some(entry) = cached {
+            limitations.push(
+                "encoder fingerprinting served from the analysis cache; re-run to \
+                     recompute"
+                    .to_owned(),
+            );
             return Ok(AnalysisOutcome {
                 findings: entry.findings,
                 cache_hit: true,
                 cache_key,
-                limitations: vec!["result served from the analysis cache".to_owned()],
+                limitations,
                 metadata: MetadataTree::default(),
+                fingerprint: FingerprintReport::default(),
                 asset,
                 profile: self.profile.clone(),
             });
@@ -168,12 +180,32 @@ impl AnalysisEngine {
             self.persist(case_dir, &asset, &cache_key, &findings)?;
         }
 
+        // Encoder indicators are derived from the metadata tree and the keyframe
+        // table, both of which are already in hand by this point — no extra I/O,
+        // and no second parse of the file.
+        // All-intra means every frame is a keyframe, which the GOP report can show
+        // without a decoder: every counted frame is a keyframe. The `frame_count`
+        // check keeps an empty track from reading as all-intra, which vacuous
+        // truth would turn into an encoder indicator for a file with no frames.
+        let all_intra = bundle
+            .gop
+            .as_ref()
+            .is_some_and(|g| g.frame_count > 0 && g.keyframe_count == g.frame_count);
+        let fingerprint = tpt_app_media_forensics_metadata::identify_encoders(
+            bundle.metadata.as_ref(),
+            all_intra,
+        );
+        for gap in &fingerprint.not_measured {
+            limitations.push(gap.clone());
+        }
+
         Ok(AnalysisOutcome {
             asset,
             findings,
             cache_key,
             cache_hit: false,
-            metadata: bundle.metadata.unwrap_or_default(),
+            metadata: bundle.metadata.clone().unwrap_or_default(),
+            fingerprint,
             limitations,
             profile: self.profile.clone(),
         })

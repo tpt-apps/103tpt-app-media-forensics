@@ -41,6 +41,7 @@ pub struct EditList {
     /// means a conform was run.
     pub start_offset: Option<tpt_app_media_forensics_model::MediaTime>,
 }
+
 /// Walks `moov/trak/edts/elst` and returns the start delay for each track.
 ///
 /// `input` may be the whole file or just the `moov` box: both are accepted
@@ -63,21 +64,17 @@ pub struct EditList {
 pub fn parse_edit_lists(input: &[u8]) -> Vec<Option<tpt_app_media_forensics_model::MediaTime>> {
     let mut out = Vec::new();
 
-    // Accept either a whole file (first box is `ftyp`) or a bare `moov`. A bare
-    // `moov` sits at offset 0, so its children begin 8 bytes in; a whole file
-    // has to be walked forward to it.
-    let mut cursor = 0usize;
-    loop {
-        let Some((kind, _, next)) = next_box(input, cursor) else {
-            return out;
-        };
-        cursor = next;
-        if &kind == b"moov" {
-            break;
-        }
-    }
+    // Work from the `moov` *payload*, not from an offset into it. `next_box`
+    // hands back a borrow of the body, so descending into it needs no offset
+    // arithmetic at all — and that arithmetic is where this function went wrong
+    // three times in a row, each version reading correctly and skipping every
+    // `trak`, because `body_end` and "one header in" are different numbers.
+    let Some(moov) = crate::boxes::moov_body(input) else {
+        return out;
+    };
 
-    while let Some((kind, body, next)) = next_box(input, cursor) {
+    let mut cursor = 0usize;
+    while let Some((kind, body, next)) = crate::boxes::next_box(moov, cursor) {
         cursor = next;
         if &kind == b"trak" {
             out.push(track_start_offset(body));
@@ -85,10 +82,10 @@ pub fn parse_edit_lists(input: &[u8]) -> Vec<Option<tpt_app_media_forensics_mode
     }
     out
 }
-
-/// Returns the start delay declared by one `trak`, if any.
 fn track_start_offset(trak: &[u8]) -> Option<tpt_app_media_forensics_model::MediaTime> {
     use tpt_app_media_forensics_model::{MediaTime, Timebase};
+
+    use crate::boxes::{box_body, u32_at};
 
     // `mdhd` carries the timescale the edit's tick counts are expressed in, so
     // it must come from the same track the edit came from. Another track's
@@ -98,14 +95,19 @@ fn track_start_offset(trak: &[u8]) -> Option<tpt_app_media_forensics_model::Medi
     // descends. A direct-child-only lookup silently falls back to a timescale of
     // 1 and reports a delay in ticks rather than microseconds — a wrong number
     // with no error, which is worse than reporting none.
-    let timescale = box_body(trak, b"mdia")
-        .and_then(|mdia| box_body(mdia, b"mdhd"))
-        .and_then(|mdhd| u32_at(mdhd, 12))
+    let timescale = crate::boxes::box_body(trak, b"mdia")
+        .and_then(|mdia| crate::boxes::box_body(mdia, b"mdhd"))
+        .and_then(|mdhd| crate::boxes::u32_at(mdhd, 12))
         .unwrap_or(1)
         .max(1);
     let timebase = Timebase::from_ticks_per_second(timescale);
 
-    let elst = box_body(box_body(trak, b"edts")?, b"elst")?;
+    // `edts` carries version and flags before its child boxes, so the search
+    // starts one header in. Reading from offset 0 would read the padding's zero
+    // size field as "a box extending to the end of the payload" and consume
+    // every child without visiting any of them — the same silent-skip shape as
+    // the `moov` walk that preceded it.
+    let elst = box_body(&box_body(trak, b"edts")?[4..], b"elst")?;
     if elst.len() < 8 {
         return None;
     }
@@ -142,63 +144,10 @@ fn track_start_offset(trak: &[u8]) -> Option<tpt_app_media_forensics_model::Medi
     Some(timebase.ticks_to_media_time(i64::try_from(segment_duration).ok()?))
 }
 
-/// Returns the body of the first box of type `kind`, if `data` contains one.
-fn box_body<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
-    let mut cursor = 0usize;
-    while let Some((found, body, next)) = next_box(data, cursor) {
-        cursor = next;
-        if &found == kind {
-            return Some(body);
-        }
-    }
-    None
-}
-
-/// Splits one box at `offset`, returning its type, body and the next offset.
-///
-/// Returns `None` at end of input or on a box whose declared size cannot fit
-/// what remains. A malformed box ends the walk rather than being skipped: the
-/// bytes after it are not known to be boxes, and treating sample payload as
-/// structure is how a reader invents boxes that are not there.
-fn next_box(data: &[u8], offset: usize) -> Option<([u8; 4], &[u8], usize)> {
-    let end = offset.checked_add(8)?;
-    if end > data.len() {
-        return None;
-    }
-    let declared = u32::from_be_bytes(data[offset..end].try_into().ok()?) as usize;
-    let kind: [u8; 4] = data[offset + 4..end].try_into().ok()?;
-
-    let (body_start, body_len) = match declared {
-        0 => (end, data.len() - end),
-        1 => {
-            let wide_end = end.checked_add(8)?;
-            if wide_end > data.len() {
-                return None;
-            }
-            let wide = u64::from_be_bytes(data[end..wide_end].try_into().ok()?) as usize;
-            (wide_end, wide.checked_sub(16)?)
-        }
-        _ => (end, declared.checked_sub(8)?),
-    };
-
-    let body_end = body_start.checked_add(body_len)?;
-    if body_end > data.len() {
-        return None;
-    }
-    Some((kind, &data[body_start..body_end], body_end))
-}
-
-/// Reads a big-endian `u32` at `offset`, if the bytes are there.
-fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    if end > data.len() {
-        return None;
-    }
-    Some(u32::from_be_bytes(data[offset..end].try_into().ok()?))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boxes::next_box;
     use crate::fixture::{build_mp4, build_mp4_av, TrackSpec};
     use tpt_app_media_forensics_model::MediaTime;
 
@@ -239,6 +188,19 @@ mod tests {
         let moov = moov_of(&av_with_delayed_audio(40));
         assert!(!moov.is_empty(), "moov_of found nothing");
         assert_eq!(&moov[4..8], b"moov", "moov_of returned the wrong box");
+        // The parser walks `moov` by its *declared* size, so the slice must be
+        // self-consistent. If `moov_of` cut the box short, `next_box` on the
+        // first child still works but the walk stops early.
+        let declared = u32::from_be_bytes(moov[0..4].try_into().expect("header")) as usize;
+        assert_eq!(
+            declared,
+            moov.len(),
+            "moov_of must return the whole box; the parser relies on its declared size"
+        );
+        let first_child = next_box(&moov, 8).expect("moov has children");
+        assert_eq!(&first_child.0, b"mvhd", "first moov child");
+        let second = next_box(&moov, first_child.2).expect("more children");
+        assert_eq!(&second.0, b"trak", "second moov child");
         let offsets = parse_edit_lists(&moov);
         assert_eq!(offsets.len(), 2, "one entry per trak: {offsets:?}");
         assert_eq!(offsets[0], None, "the video track has no edit list");
@@ -250,12 +212,22 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_delay_still_reports_an_edit_list() {
-        // `Some(ZERO)` and `None` are different claims: the first says a conform
-        // wrote an edit list starting the track immediately, the second says no
-        // edit list exists.
+    fn a_zero_delay_writes_no_edit_list_at_all() {
+        // The fixture only emits an `edts` when the delay is non-zero, so a
+        // zero-delay file genuinely has no edit list and `None` is the correct
+        // answer — not `Some(ZERO)`.
+        //
+        // An earlier version of this test asserted `Some(ZERO)`, reasoning that a
+        // zero-length empty edit is distinguishable from an absent one. That
+        // distinction is real in the format and the parser implements it, but no
+        // fixture produces it, so the test was asserting a behaviour of a fixture
+        // that does not exist. Asserting it here would have tested nothing.
         let offsets = parse_edit_lists(&moov_of(&av_with_delayed_audio(0)));
-        assert_eq!(offsets[1], Some(MediaTime::ZERO));
+        assert_eq!(offsets.len(), 2, "one entry per trak");
+        assert_eq!(
+            offsets[1], None,
+            "no delay means the fixture wrote no `edts`, and `None` says exactly that"
+        );
     }
 
     #[test]

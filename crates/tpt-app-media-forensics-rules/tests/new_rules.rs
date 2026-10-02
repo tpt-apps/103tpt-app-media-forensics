@@ -10,7 +10,8 @@
 
 use tpt_app_media_forensics_audio::{Measurement, Methodology};
 use tpt_app_media_forensics_container::fixture::{
-    build_mp4, build_mp4_stsd_gop_change, build_mp4_with_keyframes, build_mp4_without_stss,
+    build_mp4, build_mp4_stsd_gop_change, build_mp4_with_colour, build_mp4_with_hdr_colour,
+    build_mp4_with_hdr_signalling_only, build_mp4_with_keyframes, build_mp4_without_stss,
     TrackSpec,
 };
 use tpt_app_media_forensics_metadata::{MetadataEntry, MetadataTree};
@@ -101,7 +102,7 @@ fn keyed_bytes() -> Vec<u8> {
 #[test]
 fn the_full_rule_set_is_registered() {
     let ids = builtin_rules().iter().map(|r| r.id()).collect::<Vec<_>>();
-    assert_eq!(ids.len(), 26, "expected the complete rule set, got {ids:?}");
+    assert_eq!(ids.len(), 27, "expected the complete rule set, got {ids:?}");
     assert_eq!(
         ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
         ids.len(),
@@ -491,21 +492,42 @@ fn a_file_with_no_metadata_is_not_reported_by_the_narrow_rule() {
 fn declared_track_mismatch_is_reported_only_when_the_counts_differ() {
     let bundle = bundle_with_container(clean_bytes());
     let inspection = bundle.container.as_ref().expect("parsed");
-    let declared = inspection.declared_track_count;
     let actual = inspection.streams.len();
 
-    // The fixture is well-formed, so the rule must stay silent.
-    assert_eq!(declared, actual);
+    // The fixture is well-formed: `mvhd` declares one track more than its ID
+    // numbering implies, which matches what the file actually contains.
+    assert_eq!(inspection.declared_track_count, actual);
+    assert_eq!(inspection.declared_next_track_id, Some(actual as u32 + 1));
     assert!(run(&bundle, "CONTAINER.DECLARED_TRACK_MISMATCH").is_empty());
 
+    // A header claiming more tracks than the file carries.
     let mut broken = bundle;
     let inspection = broken.container.as_mut().expect("parsed");
-    inspection.declared_track_count = actual + 3;
+    inspection.declared_next_track_id = Some(actual as u32 + 4);
     let findings = run(&broken, "CONTAINER.DECLARED_TRACK_MISMATCH");
     assert_eq!(findings.len(), 1);
     let summary = &findings[0].observation.summary;
     assert!(summary.contains(&(actual + 3).to_string()), "{summary}");
     assert!(summary.contains(&actual.to_string()), "{summary}");
+
+    // A track lost in parsing still leaves its `trak` box behind, so the box
+    // count is the declaration when `mvhd` says nothing. Both sides have to be
+    // able to produce the mismatch or the rule only catches half the cases.
+    let mut lost = bundle_with_container(clean_bytes());
+    let inspection = lost.container.as_mut().expect("parsed");
+    inspection.declared_next_track_id = None;
+    inspection.declared_track_count = actual + 2;
+    let findings = run(&lost, "CONTAINER.DECLARED_TRACK_MISMATCH");
+    assert_eq!(findings.len(), 1, "a lost track box must also be reported");
+    assert!(
+        findings[0]
+            .observation
+            .measurements
+            .iter()
+            .any(|m| m.contains("not declared")),
+        "the report must say the header declared nothing: {:?}",
+        findings[0].observation.measurements
+    );
 }
 
 /// A container whose `mdhd` declares a length its own sample table does not
@@ -671,6 +693,75 @@ fn every_finding_carries_a_summary_and_a_measurement() {
 }
 
 #[test]
+fn hdr_signalling_without_metadata_is_reported() {
+    let bundle = bundle_with_container(build_mp4_with_hdr_signalling_only());
+    let findings = run(&bundle, "VIDEO.HDR_METADATA_MISSING");
+
+    assert_eq!(findings.len(), 1, "one HDR track, one finding");
+    assert_eq!(findings[0].severity, Severity::Warning);
+    assert!(findings[0]
+        .observation
+        .summary
+        .contains("without HDR static metadata"));
+    // The finding names what the file *did* declare, so a reviewer can check it.
+    assert!(
+        findings[0].observation.summary.contains("BT.2020"),
+        "{:?}",
+        findings[0].observation.summary
+    );
+}
+
+#[test]
+fn a_file_with_complete_hdr_metadata_is_not_reported() {
+    // The negative case, and the one that matters most here: a rule keyed on
+    // "this file is HDR" rather than on the absence of metadata would fire here,
+    // and would then fire on every conformant HDR master in existence.
+    let bundle = bundle_with_container(build_mp4_with_hdr_colour());
+    assert!(
+        run(&bundle, "VIDEO.HDR_METADATA_MISSING").is_empty(),
+        "a complete HDR10 file carries mdcv and clli, so nothing is missing"
+    );
+}
+
+#[test]
+fn an_sdr_file_is_not_reported_as_missing_hdr_metadata() {
+    let bundle = bundle_with_container(build_mp4_with_colour());
+    assert!(
+        run(&bundle, "VIDEO.HDR_METADATA_MISSING").is_empty(),
+        "a BT.709 file is not HDR and is missing nothing"
+    );
+
+    let plain = bundle_with_container(clean_bytes());
+    assert!(
+        run(&plain, "VIDEO.HDR_METADATA_MISSING").is_empty(),
+        "a file declaring no colour at all has not claimed to be HDR"
+    );
+}
+
+#[test]
+fn the_hdr_finding_does_not_assert_a_cause() {
+    let bundle = bundle_with_container(build_mp4_with_hdr_signalling_only());
+    let finding = run(&bundle, "VIDEO.HDR_METADATA_MISSING")
+        .pop()
+        .expect("a finding");
+
+    let text = format!(
+        "{} {:?}",
+        finding.observation.summary, finding.observation.measurements
+    )
+    .to_lowercase();
+    // The obvious story is a re-mux or a downscale. Naming one would be the rule
+    // asserting something the container cannot establish, which spec §15 forbids
+    // for the whole set.
+    for claim in ["re-mux", "remux", "downscale", "stripped", "deliberately"] {
+        assert!(
+            !text.contains(claim),
+            "the finding asserts a cause it cannot support: {text}"
+        );
+    }
+}
+
+#[test]
 fn the_documented_rule_set_matches_the_registered_rules() {
     // docs/rules.md lists the shipped rules. That list went stale once (it said
     // twenty-one while twenty-three were registered), which is exactly what a
@@ -691,6 +782,7 @@ fn the_documented_rule_set_matches_the_registered_rules() {
         "VIDEO.SINGLE_KEYFRAME",
         "VIDEO.FRAME_RATE_CHANGE",
         "VIDEO.GOP_LENGTH_CHANGE",
+        "VIDEO.HDR_METADATA_MISSING",
         "VIDEO.DUPLICATE_FRAME_RUN",
         "VIDEO.SCENE_CHANGE",
         "VIDEO.NEAR_DUPLICATE_FRAME",
@@ -716,7 +808,7 @@ fn the_documented_rule_set_matches_the_registered_rules() {
         registered, expected,
         "docs/rules.md must list exactly the rules in builtin_rules()"
     );
-    assert_eq!(DOCUMENTED.len(), 26, "the shipped count is 26 rules");
+    assert_eq!(DOCUMENTED.len(), 27, "the shipped count is 27 rules");
 }
 
 #[test]

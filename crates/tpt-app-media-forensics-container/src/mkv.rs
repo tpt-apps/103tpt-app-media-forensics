@@ -8,8 +8,15 @@
 //! [`MkvDemuxer`] is a deliberately minimal EBML reader. It parses the element
 //! tree, extracts `TrackEntry` metadata, and pulls frames out of `SimpleBlock`
 //! and `Block` elements. It does **not** expose picture width or height, the
-//! audio sample rate, or per-track duration — those live in `Video`/`Audio`
-//! child elements the reader never descends into.
+//! audio sample rate, or duration — those live in `Video`/`Audio` child elements
+//! the reader never descends into.
+//!
+//! Duration is read separately, from `Segment > Info > Duration`, by
+//! [`parse_segment_duration`]. It is worth separating from the other two: without
+//! it every WebM file reports "declares no duration" however long it is, and
+//! `CONTAINER.STREAM_DURATION_MISSING` — a rule whose whole purpose is catching
+//! files that omit a duration — would fire on correct files. An empty `Info`
+//! element is genuinely rare; a reader that cannot see one is not rare at all.
 //!
 //! Those omissions are reported rather than filled in with plausible defaults.
 //! A video stream is therefore described with `video: None` and no frame rate,
@@ -48,6 +55,149 @@ use crate::ContainerInspection;
 ///
 /// See the module documentation for why that is recorded rather than hidden.
 const MKV_TIMEBASE_TICKS_PER_SECOND: u32 = 1_000;
+
+/// `Segment` element ID, per EBML/Matroska.
+const ID_SEGMENT: [u8; 4] = [0x18, 0x53, 0x80, 0x67];
+/// `Segment > Info` element ID.
+const ID_INFO: [u8; 4] = [0x15, 0x49, 0xA9, 0x66];
+/// `Info > TimecodeScale` element ID: nanoseconds per Matroska tick.
+const ID_TIMECODE_SCALE: [u8; 3] = [0x2A, 0xD7, 0xB1];
+/// `Info > Duration` element ID: length of the segment, in `TimecodeScale` units.
+const ID_DURATION: [u8; 2] = [0x44, 0x89];
+
+/// Default `TimecodeScale`: one tick is one millisecond.
+const DEFAULT_TIMECODE_SCALE_NS: u64 = 1_000_000;
+
+/// Reads `Segment > Info > Duration`, converted to microseconds.
+///
+/// # Why this is parsed here
+///
+/// Matroska records how long the segment is, and every real muxer writes it. The
+/// underlying reader exposes only track number, type and codec id — no duration —
+/// so without this every WebM file reports "declares no duration" regardless of
+/// what the file actually says.
+///
+/// That is a false statement in a forensic report, not merely a missing one, and
+/// it matters most for `CONTAINER.STREAM_DURATION_MISSING`, whose entire purpose
+/// is to catch files that omit a duration.
+///
+/// `None` means the file genuinely declares no duration, which is then true of
+/// the file rather than about the reader.
+///
+/// # Panics
+///
+/// Never. The input is attacker-controlled (spec §75); every read is bounds
+/// checked and element sizes are validated before use.
+#[must_use]
+pub fn parse_segment_duration(input: &[u8]) -> Option<MediaTime> {
+    let info = ebml_child(ebml_child(input, &ID_SEGMENT)?, &ID_INFO)?;
+
+    // TimecodeScale changes what a duration *number* means, so it is read before
+    // the duration rather than assumed. Defaulting instead would scale every
+    // duration by the wrong factor on any file using a non-default scale.
+    let scale_ns = ebml_child(info, &ID_TIMECODE_SCALE)
+        .map(ebml_uint)
+        .filter(|&scale| scale > 0)
+        .unwrap_or(DEFAULT_TIMECODE_SCALE_NS);
+
+    let duration = ebml_child(info, &ID_DURATION)?;
+
+    // `Duration` is a float, 4 or 8 bytes. Reading it as an integer would report a
+    // wildly wrong length — a 4-byte float is mostly exponent bits.
+    let ticks = match duration.len() {
+        4 => f64::from(f32::from_be_bytes(duration.try_into().ok()?)),
+        8 => f64::from_be_bytes(duration.try_into().ok()?),
+        // A 16-bit float is legal EBML but not something any muxer writes, and
+        // this build has no half-precision decoder. Reporting none beats guessing.
+        _ => return None,
+    };
+    if !ticks.is_finite() || ticks <= 0.0 {
+        return None;
+    }
+
+    let micros = ticks * (scale_ns as f64) / 1_000.0;
+    // Bounded *before* the cast. `f64 as i64` saturates rather than erroring, so
+    // an unbounded hostile duration would silently become `i64::MAX` and be
+    // reported as a real measurement.
+    if !micros.is_finite() || micros >= i64::MAX as f64 {
+        return None;
+    }
+    Some(MediaTime::from_micros(micros as i64))
+}
+
+/// Returns the body of the first child element with the given ID.
+fn ebml_child<'a>(data: &'a [u8], id: &[u8]) -> Option<&'a [u8]> {
+    let mut cursor = 0usize;
+    while let Some((found, body, next)) = ebml_next(data, cursor) {
+        cursor = next;
+        if found == id {
+            return Some(body);
+        }
+    }
+    None
+}
+
+/// Splits one EBML element, returning its ID, body and the next offset.
+///
+/// # Panics
+///
+/// Never. A malformed size ends the walk rather than being skipped: the bytes
+/// after it are not known to be elements.
+fn ebml_next(data: &[u8], offset: usize) -> Option<(&[u8], &[u8], usize)> {
+    // An element ID encodes its own length in its leading bits: per the EBML
+    // specification, "the number of leading 0's + 1 is the length of the ID in
+    // octets". `u8::leading_zeros` counts exactly those bits, so this is the
+    // whole rule — `0x18` (`0001_1000`) gives 3 leading zeros and a 4-byte ID
+    // matching `0x18538067`, and `0x2A` (`0010_1010`) gives 2 and a 3-byte ID
+    // matching `0x2AD7B1`. Both `Segment` and `TimecodeScale` are read correctly
+    // by this one line.
+    let first = *data.get(offset)?;
+    let id_len = 1 + first.leading_zeros() as usize;
+    if !(1..=4).contains(&id_len) || offset.checked_add(id_len)? > data.len() {
+        return None;
+    }
+    let id = data.get(offset..offset + id_len)?;
+
+    // The size is a VINT: the same leading-1 marker, but the remaining bits of the
+    // first byte are part of the value, and it may describe unknown length.
+    let size_at = offset.checked_add(id_len)?;
+    let size_first = *data.get(size_at)?;
+    let len = 1 + size_first.leading_zeros() as usize;
+    if !(1..=8).contains(&len) || size_at.checked_add(len)? > data.len() {
+        return None;
+    }
+    let raw = data.get(size_at..size_at + len)?;
+    let value_mask = 0xFFu8 >> len;
+    if raw[0] & value_mask == value_mask {
+        // All value bits set is the "unknown size" encoding, meaning "to the end of
+        // the file". Nothing here needs an unbounded element, so the walk stops
+        // rather than guessing how far one extends.
+        return None;
+    }
+    let mut size = u64::from(raw[0] & value_mask);
+    for &byte in raw.get(1..)? {
+        size = size.checked_mul(256)?.checked_add(u64::from(byte))?;
+    }
+
+    let body_start = size_at.checked_add(len)?;
+    let body_end = body_start.checked_add(usize::try_from(size).ok()?)?;
+    if body_end > data.len() {
+        return None;
+    }
+    Some((id, data.get(body_start..body_end)?, body_end))
+}
+
+/// Reads a big-endian EBML unsigned integer of any width up to 8 bytes.
+fn ebml_uint(bytes: &[u8]) -> u64 {
+    let mut out = 0u64;
+    // Saturating rather than wrapping: a `TimecodeScale` at the top of the 64-bit
+    // range would wrap to zero, which reads as "one nanosecond per tick" and
+    // scales every duration in the file to nothing.
+    for &byte in bytes.iter().take(8) {
+        out = out.saturating_mul(256).saturating_add(u64::from(byte));
+    }
+    out
+}
 
 /// Upper bound on samples read from one Matroska file.
 ///
@@ -108,6 +258,13 @@ fn parse(data: Vec<u8>) -> Result<Parsed, ContainerError> {
     use sha2::Digest as _;
     use tpt_kinetix_demux::Demuxer as _;
 
+    // Read before `data` is handed to the demuxer, which consumes it. The demuxer's
+    // `MkvTrack` carries only a number, a type and a codec id, so
+    // `Segment > Info > Duration` is not obtainable from it — and without it every
+    // WebM file reports "declares no duration" whatever the file actually says,
+    // which is a false statement in a forensic report rather than a missing one.
+    let declared_duration = parse_segment_duration(&data);
+
     let mut demuxer = MkvDemuxer::new(data).map_err(|e| ContainerError::Parse(e.to_string()))?;
     let tracks: Vec<MkvTrack> = demuxer.tracks().to_vec();
 
@@ -139,7 +296,13 @@ fn parse(data: Vec<u8>) -> Result<Parsed, ContainerError> {
     let mut streams: Vec<StreamAnalysis> = tracks
         .iter()
         .enumerate()
-        .map(|(position, track)| convert_track(u32::try_from(position).unwrap_or(u32::MAX), track))
+        .map(|(position, track)| {
+            convert_track(
+                u32::try_from(position).unwrap_or(u32::MAX),
+                track,
+                declared_duration,
+            )
+        })
         .collect();
 
     // Per-stream accumulation of frame timing, keyframes, and sample bytes.
@@ -229,6 +392,11 @@ fn parse(data: Vec<u8>) -> Result<Parsed, ContainerError> {
             } else {
                 Some(TrackFrameInfo {
                     all_frames_are_keyframes: false,
+                    // Matroska block timestamps *are* presentation times. There is no separate decode
+                    // order to shift them out of, so composition offsets do not
+                    // exist as a concept here, and the two sequences are the same
+                    // — a fact about the format rather than a default.
+                    decode_times: times.clone(),
                     frame_times: times,
                     keyframes: keys,
                 })
@@ -255,7 +423,18 @@ fn parse(data: Vec<u8>) -> Result<Parsed, ContainerError> {
             streams,
             frame_info,
             anomalies,
+            // Matroska has no `mvhd` equivalent: `Tracks`/`TrackEntry` is the only
+            // place a track is named, so there is no independent declaration to
+            // read it back from. The demuxer's track list is both the declaration
+            // and the recovery, and they cannot disagree by construction.
+            //
+            // Reporting `tracks.len()` here is therefore *not* the same claim the
+            // MP4 path makes. It means "no separate count exists to check", so
+            // `CONTAINER.DECLARED_TRACK_MISMATCH` stays silent for every Matroska
+            // file — an honest non-answer rather than a fabricated agreement.
             declared_track_count: tracks.len(),
+            // Matroska has no next-track-ID field.
+            declared_next_track_id: None,
         },
         samples,
     })
@@ -274,7 +453,15 @@ fn media_time(millis: Option<i64>) -> MediaTime {
 }
 
 /// Converts one Matroska track into the engine's stream model.
-fn convert_track(index: u32, track: &MkvTrack) -> StreamAnalysis {
+///
+/// `declared_duration` is `Segment > Info > Duration`, read from the bytes by
+/// [`parse_segment_duration`]. Matroska records one duration for the whole
+/// segment rather than per track, so the same value applies to every stream.
+fn convert_track(
+    index: u32,
+    track: &MkvTrack,
+    declared_duration: Option<MediaTime>,
+) -> StreamAnalysis {
     let kind = match track.track_type {
         MkvTrackType::Video => StreamKind::Video,
         MkvTrackType::Audio => StreamKind::Audio,
@@ -293,11 +480,12 @@ fn convert_track(index: u32, track: &MkvTrack) -> StreamAnalysis {
         timing: StreamTiming {
             timebase: Timebase::from_ticks_per_second(MKV_TIMEBASE_TICKS_PER_SECOND),
             start_time: MediaTime::ZERO,
-            duration: None,
-            // The Matroska reader exposes no declared duration, so there is
-            // nothing for a measurement to be compared against. `None` here
-            // means "not available", and the declared-versus-measured rule stays
-            // quiet rather than inventing agreement.
+            duration: declared_duration,
+            // No per-track duration exists to compare against: Matroska records
+            // one duration for the whole segment. `None` here means "not
+            // available", so the declared-versus-measured rule stays quiet rather
+            // than inventing agreement between a segment length and a stream
+            // length, which are not the same measurement.
             measured_duration: None,
             edit_list_offset: None,
         },
@@ -375,6 +563,41 @@ mod tests {
     /// source, and the fixture is byte-deterministic on every machine
     /// (spec §77).
     fn webm_document(codec_id: &str, track_type: u8, blocks: &[(u16, bool, &[u8])]) -> Vec<u8> {
+        webm_document_with_duration(codec_id, track_type, blocks, Some(1_000.0))
+    }
+
+    /// A WebM document carrying `Segment > Info > Duration`.
+    ///
+    /// Every real muxer writes it. Omitting it made this crate's WebM fixtures
+    /// unusual in a way that read as a *defect*: `CONTAINER.STREAM_DURATION_MISSING`
+    /// fired on all of them, which is the rule correctly reporting a genuinely
+    /// absent duration — but the fixtures were the unusual thing, not the rule.
+    ///
+    /// `duration_ms` is an 8-byte float in `TimecodeScale` units with the scale
+    /// left at its 1 ms default, matching what ffmpeg and libwebm emit.
+    fn webm_document_with_duration(
+        codec_id: &str,
+        track_type: u8,
+        blocks: &[(u16, bool, &[u8])],
+        duration_ms: Option<f64>,
+    ) -> Vec<u8> {
+        webm_document_with_scale(codec_id, track_type, blocks, duration_ms, None)
+    }
+
+    /// As [`webm_document_with_duration`], with an explicit `TimecodeScale`.
+    ///
+    /// `scale_ns` is written as a `TimecodeScale` element, which changes what the
+    /// `Duration` number means. Written as a proper element rather than patched
+    /// into existing bytes, because splicing into nested EBML without fixing each
+    /// parent's length field yields a structurally invalid document — and the
+    /// parser would then correctly report nothing, for the wrong reason.
+    fn webm_document_with_scale(
+        codec_id: &str,
+        track_type: u8,
+        blocks: &[(u16, bool, &[u8])],
+        duration_ms: Option<f64>,
+        scale_ns: Option<u64>,
+    ) -> Vec<u8> {
         let mut track_entry = vec![
             0xD7, // TrackNumber
             0x81,
@@ -406,12 +629,55 @@ mod tests {
         }
 
         let mut segment = Vec::new();
+        // `Segment > Info` precedes `Tracks`. EBML does not require that order, but
+        // real muxers lay the segment out this way and matching them keeps the
+        // fixture honest about what a WebM file looks like.
+        if duration_ms.is_some() || scale_ns.is_some() {
+            let mut info = Vec::new();
+            if let Some(scale) = scale_ns {
+                // `0x88` declares an 8-byte value. Writing `0x81` here would
+                // describe a 1-byte element containing 8 bytes of data, which
+                // truncates the scale to its low byte and desynchronises the
+                // walk for every element after it — the failure this fixture
+                // originally had, and it read as a parser bug.
+                info.extend_from_slice(&[0x2A, 0xD7, 0xB1, 0x88]); // TimecodeScale
+                info.extend_from_slice(&scale.to_be_bytes());
+            }
+            if let Some(duration) = duration_ms {
+                info.extend_from_slice(&[0x44, 0x89, 0x88]); // Duration, 8-byte float
+                info.extend_from_slice(&duration.to_be_bytes());
+            }
+            segment.extend_from_slice(&[0x15, 0x49, 0xA9, 0x66]); // Info
+            segment.push(0x80 | info.len() as u8);
+            segment.extend_from_slice(&info);
+        }
         segment.extend_from_slice(&[0x16, 0x54, 0xAE, 0x6B]); // Tracks
         segment.push(0x80 | tracks_body.len() as u8);
         segment.extend_from_slice(&tracks_body);
         segment.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75]); // Cluster
         segment.push(0x80 | cluster.len() as u8);
         segment.extend_from_slice(&cluster);
+
+        let mut doc = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80]; // empty EBML header
+        doc.extend_from_slice(&[0x18, 0x53, 0x80, 0x67]); // Segment
+        doc.push(0x80 | segment.len() as u8);
+        doc.extend_from_slice(&segment);
+        doc
+    }
+
+    /// A document whose `Duration` element is `raw`, at whatever width.
+    ///
+    /// For exercising widths no muxer writes. The length is written as a real EBML
+    /// VINT so the document stays structurally valid and the parser is genuinely
+    /// reaching the element rather than failing earlier.
+    fn webm_document_with_raw_duration(raw: &[u8]) -> Vec<u8> {
+        let mut info = vec![0x44, 0x89];
+        info.push(0x80 | raw.len() as u8);
+        info.extend_from_slice(raw);
+
+        let mut segment = vec![0x15, 0x49, 0xA9, 0x66]; // Info
+        segment.push(0x80 | info.len() as u8);
+        segment.extend_from_slice(&info);
 
         let mut doc = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80]; // empty EBML header
         doc.extend_from_slice(&[0x18, 0x53, 0x80, 0x67]); // Segment
@@ -561,11 +827,89 @@ mod tests {
     }
 
     #[test]
-    fn short_and_truncated_documents_do_not_panic() {
-        // Spec §75 again, over every prefix of a valid file.
-        let bytes = vp9_document();
-        for len in 0..bytes.len() {
-            let _ = inspect_bytes(bytes[..len].to_vec());
+    fn a_webm_file_declares_its_duration() {
+        // Every real muxer writes `Segment > Info > Duration`. Reading it is what
+        // stops `CONTAINER.STREAM_DURATION_MISSING` from reporting a file as
+        // duration-less when the file plainly states otherwise.
+        let doc = vp9_document();
+        let duration = parse_segment_duration(&doc).expect("duration is readable");
+        assert_eq!(duration.as_micros(), 1_000_000, "1000 ms in microseconds");
+
+        let inspection = inspect_bytes(doc).expect("webm parses");
+        let stream = inspection.streams.first().expect("has a stream");
+        assert_eq!(
+            stream.timing.duration,
+            Some(duration),
+            "the declared duration must reach the stream model"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_duration_element_really_has_none() {
+        // The counterpart to the test above. If this ever reports a duration, the
+        // parser is inventing one — which would silence the rule that exists to
+        // catch genuinely absent durations.
+        let doc = webm_document_with_duration("V_VP9", 1, &[(0, true, &[1, 2, 3])], None);
+        assert!(parse_segment_duration(&doc).is_none());
+
+        let inspection = inspect_bytes(doc).expect("webm parses");
+        let stream = inspection.streams.first().expect("has a stream");
+        assert_eq!(stream.timing.duration, None);
+    }
+
+    #[test]
+    fn a_non_default_timecode_scale_changes_what_the_duration_means() {
+        // `Duration` counts `TimecodeScale` units, not milliseconds. Treating the
+        // number as milliseconds regardless would scale every duration in any file
+        // using a non-default scale — silently, and by a factor of a million.
+        //
+        // Built as a document rather than by patching `vp9_document()`: editing
+        // bytes inside nested EBML elements without fixing each parent's length
+        // field produces a structurally invalid file, and the parser would then
+        // correctly report nothing. A test that passed for that reason would be
+        // worse than no test.
+        let doc = webm_document_with_scale(
+            "V_VP9",
+            1,
+            &[(0, true, &[1, 2, 3])],
+            Some(1_000.0),
+            Some(1), // 1 ns per tick
+        );
+        let duration = parse_segment_duration(&doc).expect("duration is readable");
+        assert_eq!(
+            duration.as_micros(),
+            1,
+            "1000 ticks at 1 ns each is 1000 ns = 1 microsecond, not 1 second"
+        );
+    }
+
+    #[test]
+    fn a_duration_of_an_unusual_width_is_reported_as_absent() {
+        // `Duration` is a float, and only 4- and 8-byte floats are decodable
+        // here. A 16-bit float is legal EBML that no muxer writes; reporting none
+        // is the honest answer. The point is that an unexpected width returns
+        // rather than reading adjacent bytes as a wildly wrong length.
+        for width in [1usize, 2, 3, 5, 6, 7] {
+            let doc = webm_document_with_raw_duration(&[0xAA; 16][..width]);
+            assert!(
+                parse_segment_duration(&doc).is_none(),
+                "a {width}-byte duration must not be decoded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_or_negative_duration_is_absent_rather_than_a_measurement() {
+        // A zero length is what an unfinalised file carries while being written.
+        // Reporting `0` would state a duration the file does not actually declare
+        // as finished.
+        for value in [0.0f64, -1.0, f64::NAN, f64::INFINITY] {
+            let doc =
+                webm_document_with_duration("V_VP9", 1, &[(0, true, &[1, 2, 3])], Some(value));
+            assert!(
+                parse_segment_duration(&doc).is_none(),
+                "{value} must not become a duration"
+            );
         }
     }
 }

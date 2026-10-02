@@ -11,6 +11,18 @@ use crate::engine::{finding_id, AnalysisBundle, BundleInput, ForensicRule};
 use crate::profile::RuleProfile;
 
 /// Builds a finding from the engine's standard parts.
+///
+/// `discriminator` distinguishes several findings raised by the same rule at the
+/// same timeline position. Nineteen rules pass `None` for `at`, so two findings
+/// from one of them would otherwise derive the *same* [`FindingId`] — which is
+/// not a theoretical problem: `findings` has a primary key on
+/// `(analysis_id, id)`, so the second insert aborts the whole analysis with a
+/// UNIQUE constraint failure.
+///
+/// The value must be a deterministic function of what the finding *is* — an
+/// index within the rule's output, or a field of the observation — never a
+/// counter that depends on evaluation order, because IDs must be reproducible
+/// across runs (spec §77).
 #[allow(clippy::too_many_arguments)]
 fn finding(
     rule_id: &'static str,
@@ -21,9 +33,39 @@ fn finding(
     measurements: Vec<String>,
     at: Option<MediaTime>,
 ) -> Finding {
+    finding_with(
+        rule_id,
+        bundle,
+        severity,
+        confidence,
+        summary,
+        measurements,
+        at,
+        "",
+    )
+}
+
+/// Builds a finding whose ID is disambiguated by `discriminator`.
+///
+/// See [`finding`] for why a discriminator is needed.
+#[allow(clippy::too_many_arguments)]
+pub fn finding_with(
+    rule_id: &'static str,
+    bundle: &AnalysisBundle,
+    severity: Severity,
+    confidence: Confidence,
+    summary: String,
+    measurements: Vec<String>,
+    at: Option<MediaTime>,
+    discriminator: &str,
+) -> Finding {
     let locator = at.map_or_else(String::new, |t| t.to_timecode());
     Finding {
-        id: finding_id(rule_id, &bundle.asset_id, &locator),
+        id: finding_id(
+            rule_id,
+            &bundle.asset_id,
+            &format!("{locator}\u{1f}{discriminator}"),
+        ),
         rule_id: rule_id.to_owned(),
         severity,
         confidence,
@@ -841,24 +883,49 @@ impl ForensicRule for DeclaredTrackMismatch {
         let Some(inspection) = &bundle.container else {
             return Vec::new();
         };
-        if inspection.declared_track_count == inspection.streams.len() {
+        // The declared side is `mvhd`'s `next_track_ID`, which per ISO/IEC 14496-12 is
+        // one past the highest track ID — so it implies `next_track_ID - 1`
+        // tracks were expected. Where it is absent, the count of `trak` boxes
+        // serves as the declaration instead.
+        //
+        // Both are needed and neither is redundant. A track the demuxer skipped
+        // is still a `trak` box, so comparing recovered streams against `trak`
+        // boxes catches a track that was *lost* in parsing. A track the file
+        // never carried at all leaves no box to count, and only `next_track_ID`
+        // records that one was claimed.
+        let expected = inspection
+            .declared_next_track_id
+            .map_or(inspection.declared_track_count, |id| {
+                usize::try_from(id.saturating_sub(1)).unwrap_or(usize::MAX)
+            });
+
+        if expected == inspection.streams.len() {
             return Vec::new();
         }
+
+        let declared = match inspection.declared_next_track_id {
+            Some(id) => format!(
+                "{id} (implying {} track(s) were expected)",
+                id.saturating_sub(1)
+            ),
+            None => "not declared".to_owned(),
+        };
+
         vec![finding(
             self.id(),
             bundle,
             Severity::Significant,
-            // The count is read directly from the box structure, so this is a
-            // structural fact rather than an inference.
+            // Read directly from the box structure, so this is a structural fact
+            // rather than an inference.
             Confidence::High,
             format!(
-                "Container declares {} track(s) but {} stream(s) were recovered",
-                inspection.declared_track_count,
+                "Container expects {expected} track(s) but {} stream(s) were recovered",
                 inspection.streams.len()
             ),
             vec![
-                format!("declared `trak` boxes: {}", inspection.declared_track_count),
-                format!("recovered streams: {}", inspection.streams.len()),
+                format!("`mvhd` `next_track_ID`: {declared}"),
+                format!("`trak` boxes found: {}", inspection.declared_track_count),
+                format!("streams recovered: {}", inspection.streams.len()),
             ],
             None,
         )]
@@ -950,16 +1017,21 @@ impl ForensicRule for StreamStartOffset {
                 significant.then_some((stream, start, edit))
             })
             .map(|(stream, start, edit)| {
+                // The summary names whichever value actually tripped the rule.
+                // Using `start_time` alone would say "starts at 00:00:00.000"
+                // for a track delayed by 120 ms — a precise, confident, and
+                // wrong timecode, which is worse than reporting nothing.
+                let effective = edit.unwrap_or(start);
                 finding(
                     self.id(),
                     bundle,
                     Severity::Info,
                     Confidence::High,
                     format!(
-                        "Stream {} ({}) starts at {}",
+                        "Stream {} ({}) is offset by {}",
                         stream.index,
                         stream.kind.tag(),
-                        start.to_timecode()
+                        effective.to_timecode()
                     ),
                     vec![
                         format!("declared start: {}", start.to_timecode()),
@@ -968,7 +1040,10 @@ impl ForensicRule for StreamStartOffset {
                             edit.map_or_else(|| "none".to_owned(), |o| o.to_timecode())
                         ),
                     ],
-                    Some(start),
+                    // Placed at the offset, not at a start time that is always
+                    // zero — otherwise the finding lands at 00:00:00 whatever
+                    // the delay is, which is where it is least useful.
+                    Some(effective),
                 )
             })
             .collect()
@@ -1147,8 +1222,24 @@ impl ForensicRule for FrameRateChange {
             };
 
             // Compare each frame duration against the dominant one.
-            let deltas: Vec<i64> = info
-                .frame_times
+            //
+            // Measured on the presentation timeline *sorted*, not on the raw
+            // `frame_times` order. `frame_times` is in decode order, so any file
+            // with B-frames has unevenly spaced presentation times even at a
+            // perfectly constant frame rate: one IBBP group presents as
+            // 0, 3, 1, 2, whose consecutive differences are +3, -2 and +1 ticks.
+            // Taking those as "frame durations" would report a frame-rate change on
+            // essentially every real encoded video file, which is the loudest way
+            // this rule could be wrong.
+            //
+            // Sorting is what makes the measurement mean what its name says. After
+            // sorting, a constant-rate track has identical intervals whatever its
+            // reordering, and a genuine rate change still appears as a minority of
+            // intervals that differ from the dominant one.
+            let mut ordered = info.frame_times.clone();
+            ordered.sort_unstable();
+
+            let deltas: Vec<i64> = ordered
                 .windows(2)
                 .map(|w| w[1].signed_diff(w[0]).as_micros())
                 .collect();
@@ -1172,10 +1263,17 @@ impl ForensicRule for FrameRateChange {
                     format!("Frame duration changes from {}us to {}us", dominant, delta),
                     vec![
                         format!("dominant frame duration: {dominant}us"),
-                        format!("observed at frame {}", position + 1),
+                        // An index into the sorted presentation timeline, not into
+                        // frame order. For a file with B-frames the two differ, and
+                        // quoting the frame's decode position would point the
+                        // reader at a different frame than the one measured.
+                        format!(
+                            "observed {delta}us interval ending at {}",
+                            ordered[position + 1]
+                        ),
                         format!("stream: {}", stream.index),
                     ],
-                    Some(info.frame_times[position]),
+                    Some(ordered[position + 1]),
                 ));
             }
         }
@@ -1434,6 +1532,107 @@ impl ForensicRule for NearDuplicateFrames {
 /// thousands of findings that no reviewer will read.
 const MAX_REPORTED_NEAR_DUPLICATES: usize = 20;
 
+/// Reports a track that signals HDR but carries no HDR static metadata.
+///
+/// # Why this is an observation and not a verdict
+///
+/// Spec §45 asks for primaries, transfer, matrix, range and HDR metadata to be
+/// inspected separately, precisely so a report can say which of them a file
+/// declares. A file naming BT.2020 and PQ while carrying no mastering display
+/// and no content light level has declared *less* than a conformant HDR master
+/// does — and this rule reports exactly that difference, stopping there.
+///
+/// The obvious explanations (a re-mux that kept `colr` and dropped `mdcv`, a
+/// downscale, a hand-built file) are not asserted. The finding says what is
+/// present and what is not, and lets the reviewer draw the conclusion.
+///
+/// # Why it cannot fire without the colour reader
+///
+/// `is_hdr` was a hardcoded `false` and `ColourInfo` was permanently
+/// `Default::default()`, so before `container/src/colr.rs` existed this rule had
+/// nothing to read: every video stream reported no primaries and no transfer, so
+/// no track could ever look HDR. A rule built on that would have been unfireable
+/// on any file, real or synthetic — the same defect class as the five other
+/// unwired stages this crate has already corrected.
+pub struct HdrMetadataMissing;
+
+impl ForensicRule for HdrMetadataMissing {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::Container]
+    }
+    fn id(&self) -> &'static str {
+        "VIDEO.HDR_METADATA_MISSING"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether a video stream signals HDR — BT.2020 primaries, or a PQ or HLG \
+         transfer function — without also carrying the static metadata that \
+         accompanies HDR: a mastering display colour volume, or a content light level."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "HDR signalling and HDR metadata are separate declarations, and a file can \
+         carry one without the other. Without mastering display and content light \
+         levels, nothing in the file states the peak brightness the content was \
+         graded to, so a downstream display has no stated target to map to."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        let Some(container) = &bundle.container else {
+            return Vec::new();
+        };
+
+        container
+            .streams
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stream)| stream.video_format().map(|video| (index, video)))
+            // A track with no colour declaration has not said it is HDR, and
+            // saying so would be this rule inventing the condition it reports.
+            .filter(|(_, video)| video.is_hdr)
+            // An HDR track that carries `mdcv` or `clli` is not missing anything.
+            // `hdr_metadata` is the only place the model records that the reader
+            // found them, which is why this check reads it rather than `is_hdr`.
+            .filter(|(_, video)| video.colour.hdr_metadata.is_none())
+            .map(|(index, video)| {
+                let colour = &video.colour;
+                let primaries = colour.primaries.as_deref().unwrap_or("none declared");
+                let transfer = colour.transfer.as_deref().unwrap_or("none declared");
+
+                finding_with(
+                    self.id(),
+                    bundle,
+                    // Warning, not Significant: the file is not damaged and plays
+                    // normally. What is missing is a declaration, which is a
+                    // difference a reviewer should know about rather than a defect.
+                    Severity::Warning,
+                    // High: both halves are read directly from `colr`, `mdcv`, and
+                    // `clli`. Nothing here interprets the media.
+                    Confidence::High,
+                    format!(
+                        "HDR signalling without HDR static metadata on stream {index} \
+                         (primaries {primaries}, transfer {transfer})"
+                    ),
+                    vec![
+                        "the container signals HDR but declares no mastering display \
+                         colour volume (`mdcv`) and no content light level (`clli`)"
+                            .to_owned(),
+                        "no peak-luminance target is stated anywhere in this file".to_owned(),
+                        "this is a comparison of the file's own declarations. It does \
+                         not establish how the file was produced, or that the content \
+                         was graded to any particular brightness"
+                            .to_owned(),
+                    ],
+                    None,
+                    // The stream index, not the primaries: this rule passes no
+                    // timeline locator, so two findings from it would otherwise
+                    // derive the same ID — and `findings` has a primary key on
+                    // `(analysis_id, id)`, so the second insert would abort the
+                    // entire analysis. A multi-HDR-track file reaches that.
+                    &index.to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
 /// Returns every built-in rule.
 #[must_use]
 pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
@@ -1452,6 +1651,7 @@ pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
         Box::new(StructuralDefect),
         Box::new(FrameRateChange),
         Box::new(GopLengthChange),
+        Box::new(HdrMetadataMissing),
         Box::new(InaudibleAudio),
         Box::new(MetadataConflict),
         Box::new(MissingCreationMetadata),

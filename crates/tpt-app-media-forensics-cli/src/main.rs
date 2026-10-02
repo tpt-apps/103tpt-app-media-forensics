@@ -328,6 +328,35 @@ fn inspect(path: &std::path::Path, json: bool) -> anyhow::Result<()> {
                         .frame_rate
                         .map_or_else(|| "not measurable".to_owned(), |r| r.to_string())
                 );
+                // Colour is what the container declares, not what the pixels are.
+                // A file with no `colr` prints "not declared" rather than a
+                // default: BT.709 would be a guess, and a guessed value here
+                // reads as a measurement in everything downstream.
+                let colour = &video.colour;
+                let declared = colour
+                    .primaries
+                    .as_deref()
+                    .unwrap_or("not declared")
+                    .to_owned();
+                let transfer = colour
+                    .transfer
+                    .as_deref()
+                    .unwrap_or("not declared")
+                    .to_owned();
+                let range = match colour.full_range {
+                    Some(true) => "full",
+                    Some(false) => "limited",
+                    None => "not declared",
+                };
+                println!(
+                    "        colour:    primaries {declared}, transfer {transfer}, range {range}"
+                );
+                if video.is_hdr {
+                    println!("        HDR:       signalled (BT.2020 or PQ/HLG)");
+                }
+                if let Some(metadata) = &colour.hdr_metadata {
+                    println!("        HDR data:  {metadata}");
+                }
             }
             println!("        timescale: {}", stream.timing.timebase);
             println!("        samples:   {}", stream.packet_count.unwrap_or(0));
@@ -877,6 +906,7 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
             "analysis_fingerprint": fingerprint,
             "finding_count": outcome.findings.len(),
             "findings": outcome.findings,
+            "encoder_indicators": outcome.fingerprint,
             "limitations": outcome.limitations,
             "bundle_files": manifest.files,
         });
@@ -907,6 +937,20 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
                 finding.rule_id,
                 finding.observation.summary
             );
+        }
+        // Each indicator is printed with what it does not establish. A declared
+        // tag shown on its own invites a reader to treat "Lavf58" as proof of
+        // FFmpeg, which is precisely the inference spec §27's "where technically
+        // defensible" rules out.
+        if !outcome.fingerprint.indicators.is_empty() {
+            println!("Encoder indicators");
+            for indicator in &outcome.fingerprint.indicators {
+                println!(
+                    "  {} [{:?}/{:?}] observed: {}",
+                    indicator.name, indicator.evidence, indicator.confidence, indicator.observation
+                );
+                println!("      does not establish: {}", indicator.limitations);
+            }
         }
         if !outcome.limitations.is_empty() {
             println!("Limitations");

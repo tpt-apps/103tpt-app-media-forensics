@@ -5,7 +5,9 @@
 //! whether one bad file can take down a whole run.
 
 use std::path::Path;
-use tpt_app_media_forensics_container::fixture::{build_mp4, build_mp4_stsd_gop_change, TrackSpec};
+use tpt_app_media_forensics_container::fixture::{
+    build_mp4, build_mp4_stsd_gop_change, build_mp4_with_wrong_declared_duration, TrackSpec,
+};
 use tpt_app_media_forensics_core::batch::{self, FileOutcome};
 use tpt_app_media_forensics_core::case_dir::CaseDirectory;
 use tpt_app_media_forensics_core::AnalysisEngine;
@@ -22,6 +24,15 @@ fn case_at(root: &Path) -> CaseDirectory {
 /// a text file, and an `.mp4` that is not media at all.
 fn intake(root: &Path) {
     std::fs::create_dir_all(root.join("sub")).expect("creates subdir");
+    // Two files carry a real defect and one is clean, so the batch produces
+    // findings spanning more than one asset.
+    //
+    // Previously this wrote three MP4s that all omitted `stss`, so all three
+    // reported `VIDEO.ALL_FRAMES_KEYFRAMES` and the multi-asset assertion passed
+    // on a finding that said nothing about damage. Fixtures now declare a periodic
+    // sync-sample table, so `nested.mp4` is given a genuine defect — an `mdhd`
+    // duration its own sample table contradicts — and the assertion below counts
+    // assets that really are flagged.
     std::fs::write(
         root.join("clean.mp4"),
         build_mp4(&TrackSpec::video_25fps(320, 240, 30)),
@@ -30,7 +41,7 @@ fn intake(root: &Path) {
     std::fs::write(root.join("damaged.mp4"), build_mp4_stsd_gop_change()).expect("writes damaged");
     std::fs::write(
         root.join("sub/nested.mp4"),
-        build_mp4(&TrackSpec::video_25fps(320, 240, 30)),
+        build_mp4_with_wrong_declared_duration(),
     )
     .expect("writes nested");
     std::fs::write(root.join("notes.txt"), b"not media at all").expect("writes text");
@@ -206,12 +217,25 @@ fn findings_are_collected_across_the_whole_batch() {
         "the batch's findings include the GOP change"
     );
     // Findings from different files carry different asset identifiers.
+    //
+    // Previously every MP4 fixture omitted `stss`, so every one of them reported
+    // `VIDEO.ALL_FRAMES_KEYFRAMES` and this assertion passed for the wrong reason:
+    // it counted distinct *assets* on the strength of a finding that said nothing
+    // about whether the files were damaged. Fixtures now write a periodic
+    // sync-sample table as real muxers do, so the assets carrying findings are the
+    // ones that genuinely have something wrong with them.
     let assets: std::collections::BTreeSet<String> =
         findings.iter().map(|f| f.asset_id.to_string()).collect();
     assert!(
         assets.len() >= 2,
-        "findings should span more than one asset, got {}",
-        assets.len()
+        "findings should span more than one asset, got {assets:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.rule_id == "VIDEO.ALL_FRAMES_KEYFRAMES"),
+        "the clean fixtures must not report all-keyframes: they now declare a \
+         periodic sync-sample table, as a real muxer writes"
     );
 }
 

@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   535 passing
+tests   600 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -54,13 +54,20 @@ one that names the gap:
   malformed structures, truncation, trailing data
 - **Error timeline** — structural damage located by byte offset and placed at a
   media time, so a finding says *where* the file stops being sound
+- **Edit lists** — a track's declared start delay read from `elst`, so a stream
+  that does not begin at zero is reported rather than assumed to
 - **Video analysis** — structure, GOP layout, duplicate and near-duplicate
   detection, scene changes, bitrate and compression anomalies
+- **Colour signalling** — primaries, transfer, matrix and range read from the
+  container's own declarations, plus HDR static metadata (mastering display,
+  content light level) where present
 - **Audio analysis** — channels, silence, clipping, DC offset, dynamic range,
   loudness
 - **Timestamp forensics** — PTS/DTS monotonicity, gaps, overlaps, edit lists,
   A/V offset and drift
 - **Metadata analysis** — structured extraction plus consistency cross-checks
+- **Encoder fingerprinting** — declared encoder tags and encoding structure,
+  each labelled with its confidence and what it does not establish
 - **Evidence preservation** — SHA-256 and BLAKE3 at acquisition, computed in one
   pass; derived artefacts stored with hashes and provenance
 - **Rule-driven findings** — severity, confidence, timeline placement, and an
@@ -76,8 +83,8 @@ reappears in the list above.
 | Capability | Spec | State |
 |---|---|---|
 | Comparing two or more assets against a reference master | §38–40 | not started |
-| Colour primaries, transfer, matrix, and HDR10 static metadata | §14, §45–46 | model types exist and are serialised; no reader populates them, so every field is empty |
 | Spectral / FFT audio analysis | §21–22 | not started |
+| Colour for Matroska / WebM | §45 | not started; the Matroska reader exposes no picture geometry, so there is no video format to attach colour to |
 | A corrupt-media corpus held on disk | §76 | directories are empty; every damaged file today is built in code by a fixture |
 
 ## Three principles

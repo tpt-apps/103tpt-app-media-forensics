@@ -21,6 +21,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Property tests for the box readers. These parsers take attacker-controlled
+# input (spec �75), and the example tests guarding them cannot cover every
+# combination of truncation, box size, and nesting depth.
+proptest = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

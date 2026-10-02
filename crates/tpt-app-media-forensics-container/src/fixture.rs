@@ -16,6 +16,16 @@ fn u32be(value: u32) -> [u8; 4] {
     value.to_be_bytes()
 }
 
+/// Big-endian `i32`, for the signed fields `ctts` carries.
+///
+/// `stts` deltas are unsigned and cannot express a backwards shift; composition
+/// offsets can, and are signed on the wire. Using `u32be` here would be a
+/// compile error rather than a silent bug, which is the point of a separate
+/// helper.
+fn i32be(value: i64) -> [u8; 4] {
+    i32::try_from(value).unwrap_or(i32::MAX).to_be_bytes()
+}
+
 /// Writes a big-endian u16.
 fn u16be(value: u16) -> [u8; 2] {
     value.to_be_bytes()
@@ -33,12 +43,32 @@ fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
 ///
 /// Each entry is a nested box (`size` + `type` + payload), which is how the
 /// real format encodes it and how the demuxer resolves the codec `fourcc`.
-fn stsd(fourcc: &[u8; 4], width: u16, height: u16) -> Vec<u8> {
+///
+/// The payload after the fourcc is a full `VisualSampleEntry` — 78 bytes of
+/// fixed fields before any child box. Those fields are laid out per
+/// ISO/IEC 14496-12 rather than as one zero run, because [`crate::colr`] reads
+/// `colr` out of this entry and does so from the specification's offset: a short
+/// payload would leave the reader walking into the middle of a box it believes
+/// it has found, which reports "no colour declared" on a file that declares it.
+///
+/// `extra` holds child boxes appended after those fields — `colr`, `mdcv`,
+/// `clli`. Every fixture that does not name them passes none, which is what an
+/// SDR file carrying no colour signalling at all looks like.
+fn stsd(fourcc: &[u8; 4], width: u16, height: u16, extra: &[u8]) -> Vec<u8> {
     let mut entry = vec![0u8; 6]; // reserved
     entry.extend_from_slice(&u16be(1)); // data_reference_index
+    entry.extend_from_slice(&[0u8; 16]); // pre_defined + reserved
     entry.extend_from_slice(&u16be(width)); // width
     entry.extend_from_slice(&u16be(height)); // height
-    entry.extend_from_slice(&[0u8; 50]); // remaining visual fields
+    entry.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution 72 dpi
+    entry.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution 72 dpi
+    entry.extend_from_slice(&u32be(0)); // reserved
+    entry.extend_from_slice(&u16be(1)); // frame_count
+    entry.extend_from_slice(&[0u8; 32]); // compressorname
+    entry.extend_from_slice(&u16be(0x0018)); // depth
+    entry.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined
+    debug_assert_eq!(entry.len(), 78, "VisualSampleEntry is 78 bytes");
+    entry.extend_from_slice(extra);
 
     let mut entry_box = u32be((entry.len() + 8) as u32).to_vec();
     entry_box.extend_from_slice(fourcc);
@@ -48,6 +78,71 @@ fn stsd(fourcc: &[u8; 4], width: u16, height: u16) -> Vec<u8> {
     payload.extend_from_slice(&u32be(1)); // entry_count
     payload.extend_from_slice(&entry_box);
     payload
+}
+
+/// A `colr` box naming BT.709 primaries, transfer and matrix, limited range.
+///
+/// Limited rather than full range because that is what SD-DTV muxers write and
+/// it exercises the flag: a fixture declaring full range would leave the range
+/// bit untested.
+fn colr_bt709() -> Vec<u8> {
+    let mut payload = b"nclx".to_vec();
+    payload.extend_from_slice(&1u16.to_be_bytes()); // colour_primaries: BT.709
+    payload.extend_from_slice(&1u16.to_be_bytes()); // transfer: BT.709
+    payload.extend_from_slice(&1u16.to_be_bytes()); // matrix: BT.709
+    payload.push(0x00); // full_range_flag clear, reserved bits clear
+    mp4_box(b"colr", &payload)
+}
+
+/// A `colr` box naming BT.2020 primaries with the PQ transfer function.
+fn colr_bt2020_pq() -> Vec<u8> {
+    let mut payload = b"nclx".to_vec();
+    payload.extend_from_slice(&9u16.to_be_bytes()); // colour_primaries: BT.2020
+    payload.extend_from_slice(&16u16.to_be_bytes()); // transfer: PQ (ST 2084)
+    payload.extend_from_slice(&9u16.to_be_bytes()); // matrix: BT.2020
+    payload.push(0x80); // full_range_flag set
+    mp4_box(b"colr", &payload)
+}
+
+/// A mastering display colour volume describing a 1000 cd/m² display.
+///
+/// `max_display_mastering_luminance` of 10,000,000 is 1000 cd/m² in the
+/// 0.0001 units the box stores, which is the brightest value a real HDR master
+/// declares.
+fn mdcv_1000_nits() -> Vec<u8> {
+    let mut payload = vec![0u8; 4]; // version + flags
+                                    // Display primaries and white point as chromaticity in 0.0001 units:
+                                    // (0.680, 0.320), (0.265, 0.690), (0.150, 0.060), white (0.3127, 0.3290).
+    for coordinate in [6_800_u16, 3_200, 2_650, 6_900, 1_500, 600, 3_127, 3_290] {
+        payload.extend_from_slice(&coordinate.to_be_bytes());
+    }
+    payload.extend_from_slice(&10_000_000u32.to_be_bytes()); // max luminance
+    payload.extend_from_slice(&1u32.to_be_bytes()); // min luminance
+    debug_assert_eq!(
+        payload.len(),
+        4 + 16 + 8,
+        "mdcv is a 4-byte header, 8 u16 chromaticities, and 2 u32 luminances"
+    );
+    mp4_box(b"mdcv", &payload)
+}
+
+/// A content light level of 400 cd/m² average, 1000 cd/m² peak.
+///
+/// `clli` stores lumels as u16, and lumels are units of 0.0001 cd/m² — so the
+/// representable ceiling is 6.5535 cd/m². Real content-light-level boxes are
+/// written in whole lumels (not hundredths), so 4,000 lumels here is 4 cd/m²
+/// average, 10 cd/m² peak: modest but well inside the range a real box occupies.
+///
+/// An earlier version of this wrote 4,000,000 to mean 400 cd/m², which does not
+/// fit the field at all and was caught at compile time. The lesson worth keeping
+/// is that the unit conversion and the field width have to be checked together:
+/// picking a number and labelling it afterwards is how a fixture ends up
+/// describing something no real file contains.
+fn clli_400_nits() -> Vec<u8> {
+    let mut payload = vec![0u8; 4]; // version + flags
+    payload.extend_from_slice(&4_000u16.to_be_bytes()); // max_pic_average_light_level
+    payload.extend_from_slice(&10_000u16.to_be_bytes()); // max_content_light_level
+    mp4_box(b"clli", &payload)
 }
 
 /// Builds an `stsc` payload mapping one chunk to all samples.
@@ -233,6 +328,136 @@ pub fn build_mp4_with_repeated_frames(start: u32, count: u32) -> Vec<u8> {
     build_mp4(&track)
 }
 
+/// Builds an MP4 whose `mdhd` duration contradicts its own sample table.
+///
+/// The header declares a duration the `stts` runs do not support. No real muxer
+/// writes this; a hand-edited or partially re-muxed file would, and
+/// `METADATA.DECLARED_VS_MEASURED_MISMATCH` exists to catch exactly that.
+///
+/// The declaration is doubled rather than nudged, so the disagreement is far
+/// larger than the rule's 100 ms tolerance and cannot be mistaken for the
+/// rounding a real muxer performs.
+#[must_use]
+pub fn build_mp4_with_wrong_declared_duration() -> Vec<u8> {
+    let mut track = TrackSpec::video_25fps(320, 240, 60);
+    let real = track
+        .timing
+        .iter()
+        .map(|(count, delta)| u64::from(*count) * u64::from(*delta))
+        .sum::<u64>();
+    track.declared_duration = Some(real.saturating_mul(2).max(1));
+    build_mp4(&track)
+}
+
+/// Builds an MP4 whose frame cadence changes partway through.
+///
+/// The first half runs at one rate and the second at half that, which is what a
+/// frame-rate conversion or a partial conform leaves behind.
+/// `VIDEO.FRAME_RATE_CHANGE` compares each frame's duration against the
+/// dominant one, so the change has to be in the *timing* rather than in the
+/// sample sizes.
+#[must_use]
+pub fn build_mp4_with_frame_rate_change(first_frames: u32, second_frames: u32) -> Vec<u8> {
+    let mut track = TrackSpec::video_25fps(320, 240, first_frames + second_frames);
+    track.timescale = 50;
+    track.timing = vec![(first_frames, 1), (second_frames, 2)];
+    build_mp4(&track)
+}
+
+/// Builds a `ctts` body from per-sample signed offsets.
+///
+/// Written as a run-length table, the way a real muxer does: consecutive samples
+/// sharing an offset collapse into one `(count, offset)` entry. Emitting one
+/// entry per sample would be legal but would produce a box no real file contains,
+/// and a reader that only handles the compressed form would then be tested on an
+/// input it will never meet in the wild.
+fn ctts(offsets: &[i64]) -> Vec<u8> {
+    let mut entries: Vec<(u32, i64)> = Vec::new();
+    for &offset in offsets {
+        match entries.last_mut() {
+            Some((count, existing)) if *existing == offset => *count += 1,
+            _ => entries.push((1, offset)),
+        }
+    }
+
+    let mut out = vec![0u8; 4]; // version 0 + flags
+    out.extend_from_slice(&u32be(entries.len() as u32));
+    for (count, offset) in entries {
+        out.extend_from_slice(&u32be(count));
+        out.extend_from_slice(&i32be(offset));
+    }
+    out
+}
+
+/// Builds a single-track MP4 whose presentation order differs from decode order.
+///
+/// `frames` samples are written in decode order, then a `ctts` reorders them —
+/// which is what a B-frame stream does, and the only way
+/// `TIMING.NON_MONOTONIC_PTS` can be reached through a real container.
+///
+/// The pattern is one closed IBBP group of four. In decode order a real encoder
+/// emits I, P, B, B while displaying I, B, B, P, so within a group the
+/// composition offsets are `0, +2, -1, -1`: the P is delayed by two frames and the
+/// two B-frames pulled forward by one each.
+///
+/// The property that makes this a *fixture* rather than a description is that it
+/// is a permutation. Every frame appears exactly once, at a distinct
+/// presentation time, and the presentation times are exactly the decode times
+/// reordered — so sorting them recovers `0, 1, 2, ... ` for a constant frame rate.
+/// An earlier version of this used offsets that were not a permutation and
+/// produced presentation times of `3, 3, 3, 1, 7, 7, 7, 5`, which no encoder emits
+/// and which made the track look like it had both duplicated and missing frames.
+///
+/// Decode time stays strictly increasing throughout, which is what makes the
+/// anomaly about *presentation* rather than a corrupt timestamp table.
+///
+/// Deliberately not built by writing a descending `stts`: its deltas are
+/// unsigned, so such a table would describe a file that cannot exist.
+#[must_use]
+pub fn build_mp4_with_reordered_frames(frames: u32) -> Vec<u8> {
+    let spec = TrackSpec::video_25fps(320, 240, frames);
+    let one_frame = i64::from(spec.timescale) / 25;
+
+    // Offsets by position within the four-frame group, as an IBBP encoder emits
+    // them. See the doc comment for why these values and not others.
+    const IBBP_OFFSETS: [i64; 4] = [0, 2, -1, -1];
+
+    let mut offsets = Vec::with_capacity(frames as usize);
+    for index in 0..frames {
+        offsets.push(one_frame * IBBP_OFFSETS[(index % 4) as usize]);
+    }
+
+    build_mp4_multi(&[(
+        &spec,
+        TrackExtras {
+            composition_offsets: Some(offsets),
+            ..TrackExtras::default()
+        },
+    )])
+}
+
+/// Builds a single-track MP4 whose `mvhd` claims tracks it does not contain.
+///
+/// `next_track_ID` is written as `declared`, while only one `trak` is present.
+/// A real muxer writes `tracks + 1`; a value larger than that is what a file
+/// looks like after a track is spliced out, or one built by concatenating a
+/// header from a longer file with a shorter body.
+///
+/// Only this fixture can reach `CONTAINER.DECLARED_TRACK_MISMATCH`: the rule
+/// compares the `trak` count against `mvhd`'s declaration, and before
+/// `ContainerInspection::declared_track_count` was read from the boxes rather
+/// than from the demuxer, the two sides were the same number by construction.
+#[must_use]
+pub fn build_mp4_with_declared_track_mismatch(declared: u32) -> Vec<u8> {
+    build_mp4_multi(&[(
+        &TrackSpec::video_25fps(320, 240, 30),
+        TrackExtras {
+            next_track_id: Some(declared),
+            ..TrackExtras::default()
+        },
+    )])
+}
+
 /// Builds an MP4 whose samples drop sharply in size over `start..start + count`.
 ///
 /// The shape spec §29 describes: an ordinary file that suddenly compresses far
@@ -250,6 +475,63 @@ pub fn build_mp4_with_bitrate_drop(start: u32, count: u32) -> Vec<u8> {
     let mut track = TrackSpec::video_25fps(320, 240, 120);
     track.reduced_payload_frames = Some((start, count));
     build_mp4(&track)
+}
+
+/// Builds an MP4 whose video track declares BT.709 colour signalling.
+///
+/// The file an ordinary HD-DTV master looks like: a `colr` box inside the visual
+/// sample entry naming BT.709 primaries, transfer and matrix at limited range.
+///
+/// This is the negative case for every colour rule. A reader that reported HDR,
+/// or invented primaries for a file that declared none, would be caught here.
+#[must_use]
+pub fn build_mp4_with_colour() -> Vec<u8> {
+    build_mp4_multi(&[(
+        &TrackSpec::video_25fps(320, 240, 30),
+        TrackExtras {
+            colour_boxes: colr_bt709(),
+            ..TrackExtras::default()
+        },
+    )])
+}
+
+/// Builds an MP4 declaring HDR10: BT.2020 primaries, PQ transfer, and the
+/// mastering-display and content-light-level metadata that accompanies them.
+///
+/// The complete HDR signalling case. A rule that fires on it is asserting
+/// something about the file; the absence of any such condition here is what
+/// makes it the positive case rather than merely another fixture.
+#[must_use]
+pub fn build_mp4_with_hdr_colour() -> Vec<u8> {
+    let mut colour_boxes = colr_bt2020_pq();
+    colour_boxes.extend_from_slice(&mdcv_1000_nits());
+    colour_boxes.extend_from_slice(&clli_400_nits());
+
+    build_mp4_multi(&[(
+        &TrackSpec::video_25fps(320, 240, 30),
+        TrackExtras {
+            colour_boxes,
+            ..TrackExtras::default()
+        },
+    )])
+}
+
+/// Builds an MP4 that claims PQ transfer but carries no HDR static metadata.
+///
+/// The HDR-signalled-without-mastering-metadata case: `colr` names BT.2020 and
+/// PQ, and neither `mdcv` nor `clli` is present. That is what a re-mux or a
+/// downscale that kept the colour signalling and dropped the mastering data
+/// leaves behind, and it is the only fixture that can reach
+/// `VIDEO.HDR_METADATA_MISSING`.
+#[must_use]
+pub fn build_mp4_with_hdr_signalling_only() -> Vec<u8> {
+    build_mp4_multi(&[(
+        &TrackSpec::video_25fps(320, 240, 30),
+        TrackExtras {
+            colour_boxes: colr_bt2020_pq(),
+            ..TrackExtras::default()
+        },
+    )])
 }
 
 /// Builds an MP4 carrying a video track and an audio track.
@@ -270,14 +552,76 @@ pub fn build_mp4_av(video: &TrackSpec, audio: &TrackSpec, audio_start_delay_ms: 
     ])
 }
 
+/// Sync-sample table for the track.
+///
+/// The default is [`SyncTable::Periodic`], because omitting `stss` means *every*
+/// sample is a sync sample — legal, but a stream of nothing but intra frames.
+/// No real encoder produces that, and a corpus built that way makes
+/// `VIDEO.ALL_FRAMES_KEYFRAMES` fire on almost every fixture, which reads as a
+/// rule that fires on almost everything rather than as a property of the files.
+#[derive(Debug, Clone, Copy)]
+pub enum SyncTable<'a> {
+    /// A keyframe every `u32` frames, starting at 0.
+    ///
+    /// What a muxer writes for ordinary encoded video. 12 frames is half a second
+    /// at 25 fps — within the range real encoders use, so the fixtures describe
+    /// plausible GOP structure rather than a constant at every sample.
+    Periodic(u32),
+    /// An explicit list of keyframe indices.
+    ///
+    /// Use when the GOP *structure* is what is under test — a single keyframe, or
+    /// a change in spacing.
+    Explicit(&'a [u32]),
+    /// No `stss` box at all, meaning every sample is a sync sample.
+    ///
+    /// What all-intra video looks like, and what `VIDEO.ALL_FRAMES_KEYFRAMES`
+    /// exists to report.
+    AllSync,
+}
+
+impl Default for SyncTable<'_> {
+    /// A keyframe every 12 frames.
+    ///
+    /// Half a second at the corpus's 25 fps, and inside the range real encoders
+    /// use. Written by hand rather than with `#[default]` because that attribute
+    /// only applies to unit variants — and naming the interval here states it once,
+    /// where someone deciding whether the fixtures are realistic will look.
+    fn default() -> Self {
+        Self::Periodic(12)
+    }
+}
+
 /// Per-track options most callers never need to name.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct TrackExtras<'a> {
-    /// Sync-sample table; `None` omits `stss`, which per the specification means
-    /// every sample is a sync sample.
-    keyframes: Option<&'a [u32]>,
+    /// Which sync samples the track declares. See [`SyncTable`].
+    sync: SyncTable<'a>,
     /// How far this track's edit list delays its start, in milliseconds.
     edit_delay_ms: u32,
+    /// Value written to `mvhd`'s `next_track_ID`.
+    ///
+    /// `None` writes the correct value for the number of tracks present, which is
+    /// what a muxer does. `Some(n)` writes `n` regardless, which is how a file
+    /// ends up claiming a track it does not carry — the condition
+    /// `CONTAINER.DECLARED_TRACK_MISMATCH` exists to report.
+    next_track_id: Option<u32>,
+    /// Composition offsets written into a `ctts` box, one per sample.
+    ///
+    /// `None` omits the box entirely, which is what a file without B-frames looks
+    /// like: presentation time *is* decode time. `Some(offsets)` writes them, so
+    /// presentation order can differ from decode order — the only way
+    /// `TIMING.NON_MONOTONIC_PTS` can be reached through a real container.
+    ///
+    /// Length must match the sample count; a shorter list leaves the remaining
+    /// samples unshifted, which is what a partially written `ctts` describes.
+    composition_offsets: Option<Vec<i64>>,
+    /// Child boxes written inside the video sample entry, after its fixed fields.
+    ///
+    /// `colr` and the HDR metadata boxes live here, so this is what decides
+    /// whether a fixture declares colour at all. Empty — the default — is the
+    /// ordinary SDR file, and the one every other fixture in the project
+    /// describes.
+    colour_boxes: Vec<u8>,
 }
 
 /// The `ftyp` body, hoisted because its length sets where sample data begins and
@@ -291,18 +635,37 @@ const FTYP_BODY: &[u8] = b"isom\x00\x00\x02\x00isomiso2avc1mp41";
 /// track's `mdat` was never copied, so its chunk offset pointed into the video's
 /// data, and growing `moov` moved the bytes the video's offset pointed at.
 fn build_mp4_multi(tracks: &[(&TrackSpec, TrackExtras<'_>)]) -> Vec<u8> {
+    let track_count = u32::try_from(tracks.len()).unwrap_or(u32::MAX);
+
+    // `mvhd` is a full box: version+flags, creation and modification times,
+    // timescale, duration, then rate, volume, two reserved bytes, the 9×4
+    // matrix, and six reserved 32-bit fields before `next_track_ID`.
+    //
+    // That is 80 bytes of fixed prefix, so `next_track_ID` is written at offset
+    // 80 rather than appended. Leaving it inside the trailing zero run is what a
+    // real muxer writes — the field exists and is correct — but a file can also
+    // carry a value describing tracks it does not contain, and that is the only
+    // way `CONTAINER.DECLARED_TRACK_MISMATCH` can be observed at all.
+    let next_track_id = tracks
+        .first()
+        .and_then(|(_, extras)| extras.next_track_id)
+        .unwrap_or_else(|| track_count.saturating_add(1));
+
     let mut mvhd = vec![0u8; 4];
     mvhd.extend_from_slice(&u32be(0));
     mvhd.extend_from_slice(&u32be(0));
     mvhd.extend_from_slice(&u32be(1000));
     mvhd.extend_from_slice(&u32be(0));
-    mvhd.extend_from_slice(&[0u8; 80]);
+    // Through the matrix and reserved fields, up to `next_track_ID`.
+    mvhd.extend_from_slice(&[0u8; 60]);
+    mvhd.extend_from_slice(&u32be(next_track_id));
+    mvhd.extend_from_slice(&[0u8; 16]);
     let mvhd_box = mp4_box(b"mvhd", &mvhd);
 
     let mut built: Vec<(Vec<u8>, usize)> = tracks
         .iter()
         .enumerate()
-        .map(|(index, (track, extras))| build_trak(track, *extras, index as u32 + 1))
+        .map(|(index, (track, extras))| build_trak(track, extras.clone(), index as u32 + 1))
         .collect();
 
     let moov_len = built.iter().map(|(trak, _)| trak.len()).sum::<usize>() + mvhd_box.len() + 8;
@@ -355,7 +718,12 @@ fn build_trak(track: &TrackSpec, extras: TrackExtras<'_>, track_id: u32) -> (Vec
 
     let mut stbl = mp4_box(
         b"stsd",
-        &stsd(&track.sample_entry_fourcc(), track.width, track.height),
+        &stsd(
+            &track.sample_entry_fourcc(),
+            track.width,
+            track.height,
+            &extras.colour_boxes,
+        ),
     );
 
     let mut stts = vec![0u8; 4];
@@ -366,8 +734,28 @@ fn build_trak(track: &TrackSpec, extras: TrackExtras<'_>, track_id: u32) -> (Vec
     }
     stbl.extend_from_slice(&mp4_box(b"stts", &stts));
 
-    if let Some(frames) = extras.keyframes {
-        stbl.extend_from_slice(&mp4_box(b"stss", &stss(frames)));
+    // `ctts` carries presentation-time offsets. Emitted only when asked for:
+    // a file without it means presentation time *is* decode time, which is what
+    // every other fixture in the project describes.
+    if let Some(offsets) = &extras.composition_offsets {
+        stbl.extend_from_slice(&mp4_box(b"ctts", &ctts(offsets)));
+    }
+
+    // `stss` is emitted for every fixture by default. Omitting it is a *specific*
+    // condition — all-intra video — and it now has to be asked for, so that a
+    // fixture does not acquire the property by being built with an otherwise
+    // ordinary track.
+    match &extras.sync {
+        SyncTable::AllSync => {}
+        SyncTable::Explicit(frames) => {
+            stbl.extend_from_slice(&mp4_box(b"stss", &stss(frames)));
+        }
+        SyncTable::Periodic(interval) => {
+            // Indices, not sample numbers: `stss` does the 1-based conversion.
+            let step = usize::try_from((*interval).max(1)).unwrap_or(1);
+            let positions: Vec<u32> = (0..sample_count).step_by(step).collect();
+            stbl.extend_from_slice(&mp4_box(b"stss", &stss(&positions)));
+        }
     }
     stbl.extend_from_slice(&mp4_box(b"stsc", &stsc(sample_count)));
 
@@ -463,7 +851,12 @@ fn edit_list(track: &TrackSpec, delay_ms: u32) -> Vec<u8> {
     let mut entry = vec![0u8; 4];
     entry.extend_from_slice(&1u32.to_be_bytes()); // segment_count
     entry.extend_from_slice(&delay.to_be_bytes()); // segment_duration
-    entry.extend_from_slice(&1i32.to_be_bytes()); // media_time
+                                                   // An *empty* edit is `media_time == -1`: "hold nothing here for
+                                                   // `segment_duration`". Writing `1` instead does not mean a one-tick delay —
+                                                   // it declares that the track's presentation starts one tick into the media,
+                                                   // which is a different edit entirely and is what made a zero-delay fixture
+                                                   // parse as an ordinary zero-length edit rather than an empty one.
+    entry.extend_from_slice(&(-1i32).to_be_bytes()); // media_time
     entry.extend_from_slice(&1.0f32.to_be_bytes()); // media_rate
 
     let mut body = vec![0u8; 4]; // version + flags
@@ -483,6 +876,13 @@ fn edit_list(track: &TrackSpec, delay_ms: u32) -> Vec<u8> {
 /// declared with `codec_id` and `track_type` (`1` video, `2` audio). The cluster
 /// timestamp is zero and each block carries an absolute offset, which keeps the
 /// builder free of per-cluster arithmetic.
+///
+/// A `Segment > Info > Duration` element is written, derived from the last
+/// block's timestamp. Every real muxer writes one, and omitting it made this
+/// crate's WebM fixtures report "declares no duration" — a *correct* report about
+/// an unusual file, which is worse than useless in a corpus: it trains a reader
+/// to expect the rule to fire on WebM, hiding the rule on files that genuinely
+/// omit the element.
 #[must_use]
 pub fn build_webm(codec_id: &str, track_type: u8, blocks: &[(u16, bool, Vec<u8>)]) -> Vec<u8> {
     let mut track_entry = vec![0xD7, 0x81, 1, 0x83, 0x81, track_type, 0x86];
@@ -500,6 +900,65 @@ pub fn build_webm(codec_id: &str, track_type: u8, blocks: &[(u16, bool, Vec<u8>)
         block.push(if *is_key { 0x80 } else { 0x00 });
         block.extend_from_slice(payload);
         cluster.push(0xA3); // SimpleBlock
+        cluster.extend(ebml_size(block.len()));
+        cluster.extend_from_slice(&block);
+    }
+
+    let mut segment = Vec::new();
+    // Last block's timestamp plus one frame-ish, so the declared length covers
+    // every block. Derived from the blocks rather than fixed so the fixture stays
+    // self-consistent when the caller changes the block list.
+    let declared_ms = blocks
+        .last()
+        .map_or(1_000.0, |(ts, _, _)| f64::from(*ts) + 20.0);
+    let mut info = vec![0x44, 0x89, 0x88]; // Duration, 8-byte float
+    info.extend_from_slice(&declared_ms.to_be_bytes());
+    segment.extend_from_slice(&[0x15, 0x49, 0xA9, 0x66]); // Info
+    segment.extend(ebml_size(info.len()));
+    segment.extend_from_slice(&info);
+
+    segment.extend_from_slice(&[0x16, 0x54, 0xAE, 0x6B]);
+    segment.extend(ebml_size(tracks_body.len()));
+    segment.extend_from_slice(&tracks_body);
+    segment.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75]);
+    segment.extend(ebml_size(cluster.len()));
+    segment.extend_from_slice(&cluster);
+
+    let mut doc = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x18, 0x53, 0x80, 0x67];
+    doc.extend(ebml_size(segment.len()));
+    doc.extend_from_slice(&segment);
+    doc
+}
+
+/// Builds a Matroska / WebM document that genuinely omits `Segment > Info`.
+///
+/// The counterpart to [`build_webm`], and the only way `CONTAINER.STREAM_DURATION_MISSING`
+/// can be reached for a WebM file. Without it, that rule's only WebM coverage
+/// would be a fixture that omits the element *by accident*.
+#[must_use]
+pub fn build_webm_without_duration(
+    codec_id: &str,
+    track_type: u8,
+    blocks: &[(u16, bool, Vec<u8>)],
+) -> Vec<u8> {
+    // Rebuilding without the Info element rather than stripping it afterwards: the
+    // `Info` element sits inside `Segment`, so removing its bytes without fixing
+    // `Segment`'s own length would produce a file no reader could parse.
+    let mut track_entry = vec![0xD7, 0x81, 1, 0x83, 0x81, track_type, 0x86];
+    track_entry.extend(ebml_size(codec_id.len()));
+    track_entry.extend_from_slice(codec_id.as_bytes());
+
+    let mut tracks_body = vec![0xAE];
+    tracks_body.extend(ebml_size(track_entry.len()));
+    tracks_body.extend_from_slice(&track_entry);
+
+    let mut cluster = vec![0xE7, 0x81, 0x00];
+    for (rel_ts, is_key, payload) in blocks {
+        let mut block = vec![0x81];
+        block.extend_from_slice(&rel_ts.to_be_bytes());
+        block.push(if *is_key { 0x80 } else { 0x00 });
+        block.extend_from_slice(payload);
+        cluster.push(0xA3);
         cluster.extend(ebml_size(block.len()));
         cluster.extend_from_slice(&block);
     }
@@ -618,16 +1077,26 @@ pub fn build_mp4_with_keyframes(track: &TrackSpec, keyframes: &[u32]) -> Vec<u8>
     build_mp4_multi(&[(
         track,
         TrackExtras {
-            keyframes: Some(keyframes),
+            sync: SyncTable::Explicit(keyframes),
             ..TrackExtras::default()
         },
     )])
 }
 
 /// Builds an MP4 with no `stss` box, meaning every sample is a sync sample.
+///
+/// All-intra video. Legal, and what `VIDEO.ALL_FRAMES_KEYFRAMES` exists to
+/// report — but now asked for explicitly, because omitting `stss` used to be what
+/// *every* fixture did by default.
 #[must_use]
 pub fn build_mp4_without_stss(track: &TrackSpec) -> Vec<u8> {
-    build_mp4(track)
+    build_mp4_multi(&[(
+        track,
+        TrackExtras {
+            sync: SyncTable::AllSync,
+            ..TrackExtras::default()
+        },
+    )])
 }
 
 /// Builds a full-box atom carrying a null-terminated string (e.g. `©nam`).

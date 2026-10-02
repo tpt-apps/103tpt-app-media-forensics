@@ -115,6 +115,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Test-only: scratch directories for acquisition and case-directory tests.
 tempfile = "3"
+# Property tests for the container parsers (spec §75-§77). Vendored locally; see
+# todo.md for why parsers specifically are the target: every parser so far is
+# defended by examples, and an example set cannot cover the length, alignment, and
+# truncation cases a container reader actually meets.
+proptest = "1.11"
 
 [profile.release]
 lto = "thin"

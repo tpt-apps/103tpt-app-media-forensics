@@ -13,7 +13,9 @@
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 pub mod consistency;
+pub mod fingerprint;
 pub mod tree;
 
 pub use consistency::{find_conflicts, Conflict, ConflictKind, Observation};
+pub use fingerprint::{identify_encoders, EncoderIndicator, EvidenceKind, FingerprintReport};
 pub use tree::{MetadataEntry, MetadataTree, Scope};

@@ -5,7 +5,8 @@
 //! any one layer in isolation.
 
 use tpt_app_media_forensics_container::fixture::{
-    build_mp4, build_mp4_stsd_gop_change, build_mp4_with_repeated_frames, TrackSpec,
+    build_mp4, build_mp4_stsd_gop_change, build_mp4_with_hdr_signalling_only,
+    build_mp4_with_repeated_frames, TrackSpec,
 };
 use tpt_app_media_forensics_core::case_dir::CaseDirectory;
 use tpt_app_media_forensics_core::{acquire, AnalysisEngine};
@@ -24,6 +25,117 @@ fn case_with(contents: &[u8], dir: &std::path::Path) -> (CaseDirectory, std::pat
 
 fn gop_change_bytes() -> Vec<u8> {
     build_mp4_stsd_gop_change()
+}
+
+#[test]
+fn encoder_fingerprinting_reports_declared_tags_without_asserting_a_cause() {
+    // A file carrying a `©too` atom reaches the report, and the indicator says
+    // what it does not establish. A fingerprint that reported "encoded with
+    // FFmpeg" would be asserting something no tag can support.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let bytes = tpt_app_media_forensics_container::fixture::build_mp4_with_metadata(
+        &TrackSpec::video_25fps(320, 240, 30),
+    );
+    let (case_dir, source) = case_with(&bytes, tmp.path());
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    // Whatever the fixture's tag says, every indicator must carry its limits.
+    for indicator in &outcome.fingerprint.indicators {
+        assert!(
+            !indicator.limitations.is_empty(),
+            "an indicator without limitations invites a verdict: {indicator:?}"
+        );
+        // And none may reach a confidence above what a self-report can support.
+        // `Confidence` has no top variant precisely so this cannot be exceeded.
+        assert!(
+            matches!(
+                indicator.confidence,
+                tpt_app_media_forensics_metadata::fingerprint::Confidence::Low
+                    | tpt_app_media_forensics_metadata::fingerprint::Confidence::Medium
+            ),
+            "an indicator claimed more weight than its evidence supports: {indicator:?}"
+        );
+    }
+    // And the gaps are stated as limitations, not silently omitted.
+    assert!(
+        outcome
+            .limitations
+            .iter()
+            .any(|l| l.contains("bitstream") || l.contains("quantisation")),
+        "{:?}",
+        outcome.limitations
+    );
+}
+
+#[test]
+fn a_file_with_no_encoder_tag_still_states_what_it_could_not_measure() {
+    // An empty fingerprint and a missing fingerprint must be distinguishable.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(
+        &build_mp4(&TrackSpec::video_25fps(320, 240, 30)),
+        tmp.path(),
+    );
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    assert!(outcome.fingerprint.is_empty());
+    assert!(!outcome.fingerprint.not_measured.is_empty());
+    // `describe` renders indicators, so with none found it is legitimately
+    // empty. What must not be empty is the statement of what was not measured:
+    // an empty result has to be readable as "nothing found" rather than as
+    // "nothing was looked at".
+    assert!(outcome.fingerprint.describe().is_empty());
+    assert!(
+        outcome
+            .limitations
+            .iter()
+            .any(|l| l.contains("not parsed by this build")),
+        "the gaps must reach the report's limitations: {:?}",
+        outcome.limitations
+    );
+}
+
+#[test]
+fn colour_reaches_the_report_through_the_whole_pipeline() {
+    // The stage guard proves the rule fires from a file. This proves the
+    // observation itself survives acquisition, inspection, rule evaluation, and
+    // persistence — the route a report actually takes. A colour reader wired
+    // into the container crate but not into the stored analysis would pass that
+    // guard and still produce an empty report.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(&build_mp4_with_hdr_signalling_only(), tmp.path());
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    let finding = outcome
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "VIDEO.HDR_METADATA_MISSING")
+        .unwrap_or_else(|| {
+            panic!(
+                "the HDR fixture should raise a finding; got {:?}",
+                outcome
+                    .findings
+                    .iter()
+                    .map(|f| &f.rule_id)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(finding.severity, Severity::Warning);
+    // The observation names the declaration it is about, so a report reader can
+    // check the finding against the file.
+    assert!(
+        finding.observation.summary.contains("BT.2020"),
+        "{:?}",
+        finding.observation.summary
+    );
 }
 
 #[test]
