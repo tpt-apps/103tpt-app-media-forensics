@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   600 passing
+tests   618 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -62,7 +62,7 @@ one that names the gap:
   container's own declarations, plus HDR static metadata (mastering display,
   content light level) where present
 - **Audio analysis** — channels, silence, clipping, DC offset, dynamic range,
-  loudness
+  loudness, and spectral content (peak frequency, centroid, flatness)
 - **Timestamp forensics** — PTS/DTS monotonicity, gaps, overlaps, edit lists,
   A/V offset and drift
 - **Metadata analysis** — structured extraction plus consistency cross-checks
@@ -83,7 +83,6 @@ reappears in the list above.
 | Capability | Spec | State |
 |---|---|---|
 | Comparing two or more assets against a reference master | §38–40 | not started |
-| Spectral / FFT audio analysis | §21–22 | not started |
 | Colour for Matroska / WebM | §45 | not started; the Matroska reader exposes no picture geometry, so there is no video format to attach colour to |
 | A corrupt-media corpus held on disk | §76 | directories are empty; every damaged file today is built in code by a fixture |
 

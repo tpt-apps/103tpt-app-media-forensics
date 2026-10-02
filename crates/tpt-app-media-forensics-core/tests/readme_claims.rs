@@ -46,11 +46,13 @@ fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
 /// silently become wrong the way the BLAKE3 entry did. That entry asserted
 /// BLAKE3 was never called, and stopped being true the moment
 /// `acquisition.rs` hashed with it.
-const NOT_IMPLEMENTED: [(&str, &str); 4] = [
+// The spectral entries moved to `CLAIMED_EXIST`. They were listed here because
+// `ColourInfo` and the audio crate had no spectral code at all, so the README
+// naming them would have been a false claim. `audio/src/spectral.rs` now
+// provides them, and the claim is checked against that source below.
+const NOT_IMPLEMENTED: [(&str, &str); 2] = [
     ("reference master", "no comparison engine exists"),
     ("comparison", "no comparison engine exists"),
-    ("spectrum", "no spectral analysis exists"),
-    ("spectral", "no spectral analysis exists"),
 ];
 
 /// Builds the claim table, embedding each file's source at compile time.
@@ -75,7 +77,7 @@ macro_rules! claimed_exist {
 /// This is the check that would have caught the stale claims found by hand:
 /// colour/HDR (no reader populates `ColourInfo`), spectral (no FFT in the audio
 /// crate), and progress/cancellation (no such code in `-core`).
-const CLAIMED_EXIST: [(&str, &str, &str); 17] = claimed_exist![
+const CLAIMED_EXIST: [(&str, &str, &str); 18] = claimed_exist![
     (
         "container inspection",
         "../../tpt-app-media-forensics-container/src/mp4.rs",
@@ -96,6 +98,15 @@ const CLAIMED_EXIST: [(&str, &str, &str); 17] = claimed_exist![
         "fingerprinting",
         "../../tpt-app-media-forensics-metadata/src/fingerprint.rs",
         "pub fn identify_encoders"
+    ),
+    // Claimed as "spectral content". `Methodology::HannWindowFft` is the marker
+    // worth checking, not `analyse`: spec §21 forbids reporting a spectral
+    // figure without the method behind it, so the citation is the part that has
+    // to exist.
+    (
+        "spectral content",
+        "../../tpt-app-media-forensics-audio/src/measurement.rs",
+        "HannWindowFft"
     ),
     (
         "gop",

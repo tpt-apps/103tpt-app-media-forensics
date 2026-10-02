@@ -112,6 +112,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# FFT for the spectral analysis (spec §22). A hand-rolled DFT would be O(n^2) and
+# unusable at audio frame sizes; this is the same transform every DAW uses.
+rustfft = "6.4"
 
 # Test-only: scratch directories for acquisition and case-directory tests.
 tempfile = "3"

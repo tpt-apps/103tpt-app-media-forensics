@@ -4,6 +4,42 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### The dBFS floor was inventing energy, and digital silence reported a centroid
+- Every bin below a threshold was floored at -200 dBFS rather than reporting
+  `-inf`. That is right on its own: `-inf` propagates into any sum computed from
+  the vector, and a report printing `-inf dBFS` looks like a tool defect
+- But converting a floored bin *back* to a linear magnitude and summing it — the
+  obvious way to compute a centroid — invented energy from nothing. 1024 floored
+  bins sum to more than enough power to clear any "is this silent?" threshold, so
+  a frame of pure digital silence reported a spectral centroid, and a peak
+  frequency at the first bin holding the floor
+- Fixed by treating a floored bin as the absence of a measurement rather than as a
+  measurement of something very quiet. The same correction applies to flatness,
+  where thousands of identical floored values in the geometric mean would pull
+  every signal toward the same number and make a pure tone look flat
+- Caught by a test written for the obvious behaviour: silence asserting that it has
+  no peak frequency, and failing
+
+#### Spectral analysis (spec section 22)
+- 2048-point Hann-windowed FFT at 50% overlap. A rectangular window — no window at
+  all — is the obvious thing to write and the wrong one: it leaks a strong tone
+  across the whole spectrum, which would make a pure tone look like broadband noise
+- The window's 1.5-bin equivalent noise bandwidth is reported, because that is the
+  number saying how finely the analysis can distinguish two adjacent tones. Without
+  it, "one bin" is an unstated claim
+- Peak frequency, spectral centroid, Wiener flatness, and low/high energy ratios.
+  DC (bin 0) is excluded from the peak search: a signal with an offset would
+  otherwise report 0 Hz as its loudest frequency, which is a property of the
+  waveform rather than anything audible
+- Energy is accumulated in linear power, never in decibels. Summing dB values is
+  not meaningful, because their total depends on how many bins were added
+- Every figure carries `Methodology::HannWindowFft`. Spec section 21 forbids
+  reporting a number without the method behind it, and a spectrum computed with
+  different window parameters is a different measurement rather than a rougher one
+- A signal shorter than one frame returns `TooShort` rather than an empty profile.
+  A file this method cannot measure is not the same as a file with no content, and
+  reporting one for the other is the failure this project exists to prevent
+
 #### Encoder fingerprinting that cannot overstate itself
 - Spec §27 asks for encoder signatures "where technically defensible". The
   defensible reading is that a signature is *not* an identification: `Lavf58.45.100`

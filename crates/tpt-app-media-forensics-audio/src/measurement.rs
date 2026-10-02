@@ -31,6 +31,12 @@ pub enum Methodology {
     SampleMean,
     /// Ratio of the loudest to the quietest meaningful level.
     DynamicRange,
+    /// Hann-windowed FFT, 2048-point frames with 50% overlap.
+    ///
+    /// The window length and overlap are part of the method: a spectrum computed
+    /// with different parameters is a different measurement, not a rougher one,
+    /// and its figures are not comparable.
+    HannWindowFft,
     /// Sample amplitude on the normalised 0.0 to 1.0 scale.
     ///
     /// Distinct from `Dbfs` on purpose. A peak amplitude of `1.0` is 0 dBFS,
@@ -49,6 +55,7 @@ impl Methodology {
             Self::AmplitudeThreshold => "sample amplitude threshold",
             Self::SampleMean => "arithmetic mean of signed samples",
             Self::DynamicRange => "ratio of peak to noise floor",
+            Self::HannWindowFft => "2048-point Hann-windowed FFT, 50% frame overlap",
             Self::SampleAmplitude => "sample amplitude, normalised to full scale",
         }
     }
@@ -97,6 +104,10 @@ impl Measurement {
             | Methodology::SampleMean
             | Methodology::SampleAmplitude => " (normalised 0.0-1.0)",
             Methodology::DynamicRange => " dB",
+            // The unit is carried in the citation rather than appended, because
+            // a dBFS figure from an FFT is not the same quantity as a dBFS
+            // figure of sample peak — same unit, different measurement.
+            Methodology::HannWindowFft => " dBFS",
         };
         format!(
             "{:.1}{} ({})",
