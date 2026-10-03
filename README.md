@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   702 passing
+tests   719 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```

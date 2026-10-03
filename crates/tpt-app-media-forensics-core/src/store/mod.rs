@@ -17,6 +17,9 @@
 //! report that cites evidence from nowhere.
 
 pub mod schema;
+pub mod search;
+
+pub use search::{SearchQuery, SearchResult, SearchScope, SeverityFilter};
 
 use rusqlite::Connection;
 

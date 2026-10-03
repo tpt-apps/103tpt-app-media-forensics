@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Search: SQLite compares by storage class, which fails silently
+- `-core/src/store/search.rs` implements search over case data (spec §41):
+  `SearchQuery`, `SearchScope`, `SeverityFilter`, `SearchResult`. Scopes are
+  findings, assets, and evidence, UNIONed in SQL and sorted once
+- **Two bugs the tests caught, both silent rather than loud.** A severity rank
+  bound as a `String` is compared against an integer expression *as text*, so
+  `rank >= '0'` matches nothing and the search returns an empty list with no
+  error. And `ArmParam` now distinguishes `Text` from `Int` so the mistake is a
+  type error rather than a runtime surprise
+- **"At least Critical" was inverted.** Rank 0 is the *most* severe, so the
+  filter is `rank <= given`. Written as `>=` it admitted everything below the
+  threshold — the exact opposite of what was asked
+- **A blank term is not an empty term.** `SearchQuery::all()` lists everything;
+  `SearchQuery::text("   ")` matches nothing. The first attempt used a NUL byte as
+  an impossible LIKE pattern, but SQLite's `LIKE` ignores NUL in a bound string,
+  so it matched every row. Now an unsatisfiable `AND 0` predicate, emitted as SQL
+  so no bound parameter is expected and the positional numbering stays intact
+- **A severity filter does not hide assets.** Assets carry no severity; applying
+  a findings-only filter to them would silently remove every asset a reviewer
+  asked to see alongside its findings
+- **LIKE wildcards in a term are escaped.** The term is bound so it cannot inject,
+  but an unescaped `%` would still match every row — which is not what someone
+  searching for a hash expects. There is a test for both the quote and the `%`
+- **Truncation is reported.** `SearchResult::truncated` and `total` come from a
+  separate `COUNT`, because a page reporting its own length as the total would
+  tell a reviewer there were 200 findings when the case holds thousands
+- Searches are bounded by default (200 rows) — an unlimited search over a large
+  case is a denial of service reachable by typing in a search box
+
 #### Whole-file comparison: tolerances, and why unmeasured is not a value
 - `-rules/src/comparison.rs` adds the whole-file aggregate — `Comparison`,
   `compare`, `compare_with`, `ComparisonInput` — feeding the metadata,

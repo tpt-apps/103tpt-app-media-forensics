@@ -265,7 +265,19 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       Fractional progress appears only where a total is genuinely known.
 - [ ] Implement file-to-file comparison engine (duration, streams, codec,
       colour, audio, metadata, timestamps, scene structure) (§38–40)
-- [ ] Implement search over case data (§41)
+- [x] Implement search over case data (§41)
+      `-core/src/store/search.rs`: `SearchQuery` with text, scope
+      (findings/assets/evidence), severity floor, asset filter, and row limit.
+      Scopes UNION in SQL and sort once, most severe first. Every term is a bound
+      parameter with LIKE wildcards escaped, so there is no expression syntax to
+      learn and no way to inject one.
+      Three distinctions the tests pin: a blank term matches nothing while
+      `SearchQuery::all()` lists everything; a severity filter constrains findings
+      only and does not hide assets; truncation is reported via `truncated` plus a
+      separate `total`, never implied by a short page.
+      Searches are bounded at 200 rows by default. Not done: full-text ranking
+      (matching is a substring `LIKE`, so results are ordered by severity and id,
+      not relevance), and no FTS index.
 - [x] Implement report generation: PDF, HTML, JSON, CSV (findings +
       measurements), with required disclaimers (§59–63)
       `-report`: `pdf.rs`, `html.rs`, `render.rs`, `bundle.rs`, plus a shared
