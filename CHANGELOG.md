@@ -4,6 +4,43 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Whole-file comparison: tolerances, and why unmeasured is not a value
+- `-rules/src/comparison.rs` adds the whole-file aggregate — `Comparison`,
+  `compare`, `compare_with`, `ComparisonInput` — feeding the metadata,
+  scene-structure, silence, and loudness axes that the model crate's per-stream
+  half left open. It lives in `-rules` because feeding it needs `MetadataTree`,
+  `SceneReport`, and `SilenceRegion`, and the model crate must not depend on
+  those; vocabulary stays in `-model`, aggregation stays above it
+- **Whole-file numeric axes compare against a tolerance.** Loudness and scene
+  counts are measurements: two runs of the same file differ in the last bits of
+  a float. Comparing exactly would report a difference on every pair of related
+  files, training a reviewer to ignore the axis. The tolerance used is recorded
+  on every result so a reader can judge the claim rather than trust it
+- **An unmeasured side is `NotComparable`, never a one-sided value.** The first
+  draft returned `OnlyLeft { value: "not measured" }`, which reads as "only this
+  file has silence" — a claim about the media that was never made. Caught by a
+  test asserting silence never measured must not read as zero silence
+- **Within-tolerance agreement reports `Equal`.** The first draft reported the
+  0.2 LU gap as a `Different`, contradicting `WithinTolerance::agreed`, which had
+  just told the caller the two agree
+- **An LRA measurement is not compared against integrated loudness.** Loudness
+  *range* is a different quantity over a different window; comparing them yields
+  a plausible-looking number that means nothing, so a non-integrated
+  methodology is treated as absent
+- **Metadata pairs on `(scope, track, key)`, not position.** Metadata is a set of
+  labelled values, not a sequence — pairing positionally compares whatever
+  happened to sort into slot 3 of each file
+- **Scene structure compares counts, not frame positions.** Two encodes of the
+  same footage rarely agree on which frame a cut lands on while agreeing closely
+  on how many cuts there are
+- `compare_self` compares two analyses of the same file, so engine
+  non-determinism is distinguishable from a genuine difference between two
+  assets — otherwise a reviewer would be sent looking for a problem in the media
+  that is not there
+- `is_equivalent` is deliberately strict: unmeasured axes keep it false.
+  `measured_differences` is the looser view for callers asking what actually
+  disagreed
+
 #### Comparing two files: streams are paired, not zipped
 - `-model/src/comparison.rs` adds `Difference`, `ComparisonAxis`, and
   `compare_streams` for file-to-file comparison (spec §38–40)

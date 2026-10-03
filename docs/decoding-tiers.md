@@ -75,19 +75,22 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       profile hash + rule-set hash (§54)
 - [ ] Implement large-file/streaming analysis with bounded memory,
       background workers, cancellation, progress reporting (§55–56)
-- [~] Implement file-to-file comparison engine (duration, streams, codec,
+- [x] Implement file-to-file comparison engine (duration, streams, codec,
       colour, audio, metadata, timestamps, scene structure) (§38–40)
-      **The per-stream half is done.** `-model/src/comparison.rs` compares
-      codec, timebase, start time, duration, coded dimensions, frame rate,
-      pixel format, rotation, colour, sample rate, bit depth, and channel
-      count. Tested against real container bytes, not only synthetic fixtures.
-      **Streams pair by kind and position within that kind, not by raw index** —
-      a file that dropped its first audio track reports one unmatched stream
-      rather than reporting every later track as changed.
-      **Not done: the whole-file aggregate.** Metadata, scene-structure,
-      silence, and loudness are declared in `ComparisonAxis` but nothing yet
-      feeds them from a completed analysis, and there is no `Comparison` type
-      tying the halves together. What exists is `StreamComparisonResult`.
+      **Done in two halves.** Vocabulary and per-stream pairing live in
+      `-model/src/comparison.rs`; the whole-file aggregate lives in
+      `-rules/src/comparison.rs`, which can see `MetadataTree`,
+      `SceneReport`, and `SilenceRegion` while the model crate cannot.
+      Axes covered: container, stream layout, codec, video format, colour,
+      audio format, timing, metadata, scene structure, silence, loudness.
+      **Streams pair by kind and position within that kind, not by raw index**;
+      metadata pairs on `(scope, track, key)`, not position. Both because the
+      right answer is "the same thing", not "the same slot".
+      **Numeric axes compare against a tolerance** (0.5 LU loudness, 1 scene
+      change) which is recorded on every result. Exact float comparison would
+      report a difference on every pair of related files.
+      `compare_self` checks a file against itself, so engine non-determinism is
+      distinguishable from a real difference between two assets.
       No similarity score, deliberately — see CHANGELOG.
 - [ ] Implement search over case data (§41)
 - [ ] Implement report generation: PDF, HTML, JSON, CSV (findings +

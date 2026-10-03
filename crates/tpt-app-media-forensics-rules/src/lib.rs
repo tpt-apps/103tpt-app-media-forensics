@@ -32,9 +32,14 @@
 //! as conclusions.
 
 pub mod builtin;
+pub mod comparison;
 pub mod engine;
 pub mod profile;
 
 pub use builtin::builtin_rules;
+pub use comparison::{
+    compare, compare_self, compare_with, Comparison, ComparisonInput, MetadataComparison,
+    SelfComparison, SilenceComparison, Tolerances, WithinTolerance,
+};
 pub use engine::{AnalysisBundle, BundleInput, ForensicRule, RuleEngine, RuleError};
 pub use profile::RuleProfile;
