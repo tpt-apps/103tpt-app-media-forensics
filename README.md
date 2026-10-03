@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   642 passing
+tests   657 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -72,7 +72,8 @@ one that names the gap:
 - **Encoder fingerprinting** — declared encoder tags and encoding structure,
   each labelled with its confidence and what it does not establish
 - **Evidence preservation** — SHA-256 and BLAKE3 at acquisition, computed in one
-  pass; derived artefacts stored with hashes and provenance
+  pass; derived artefacts stored with hashes and provenance, including decoded
+  frames written as real PNGs so a reviewer can open them with their own tools
 - **Rule-driven findings** — severity, confidence, timeline placement, and an
   explanation of what was observed and what it does not establish
 - **Reports** — PDF, HTML, JSON, CSV, all reproducible

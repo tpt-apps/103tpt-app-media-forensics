@@ -213,7 +213,27 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       `-core/tests/stage_guard.rs` fails when a declared input is never
       populated, so the same class of gap cannot return silently
 - [x] Implement Evidence model + integrity metadata (hashes, provenance) (§32–33)
-- [ ] Implement frame extraction as evidence
+- [x] Implement frame extraction as evidence
+      `-video/src/frame.rs`. Converts a decoded `VideoFrame` to interleaved 8-bit
+      RGB and writes it as a real PNG, ready for
+      `EvidenceStore::write_verified` with `EvidenceKind::ExtractedFrame` and
+      `Provenance::LosslessExtract`.
+      **Why PNG and not an in-house format:** evidence a reviewer cannot open with
+      their own tools is not evidence, it is an assertion. The `png` crate is
+      vendored locally, so this costs no network access.
+      Handles 4:2:0, 4:2:2 and 4:4:4 planar YUV, plus RGB, BGR and monochrome —
+      the last three reordered rather than converted, so the bytes stay the
+      decoder's own. **10- and 12-bit YUV are refused**, not approximated:
+      converting them needs dithering or truncation, either of which changes pixel
+      values and makes the result lossy rather than evidence.
+      **No scaling.** A thumbnail is a better artefact and worse evidence, so it is
+      not produced; the extracted frame is the decoded frame.
+      The BT.601 matrix is named on every `FrameImage`, because a YUV frame has no
+      inherent RGB appearance — the decoder does not report a colour space, and a
+      reviewer comparing against a reference decode needs to know which convention
+      produced the colours.
+      A truncated frame is refused rather than padded: padding would produce a
+      plausible image with invented pixels along one edge.
 - [x] Implement analysis cache keyed on asset hash + analysis version +
       profile hash + rule-set hash (§54)
 - [~] Implement large-file/streaming analysis with bounded memory,

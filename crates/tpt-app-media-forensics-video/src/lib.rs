@@ -19,8 +19,10 @@ pub mod bitrate;
 pub use bitrate::{analyse as analyse_bitrate, BitrateAnomaly, BitrateReport, BitrateSample};
 
 pub mod decode;
+pub mod frame;
 
 pub use decode::{is_decodable, DecodeError, DecodeLimits, DecodeSession, DecodedFrame};
+pub use frame::{extract as extract_frame, FrameError, FrameImage, COLOUR_MATRIX};
 
 pub mod near_duplicate;
 

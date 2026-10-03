@@ -16,6 +16,10 @@ tpt-kinetix-vp9 = { workspace = true }
 tpt-kinetix-av1 = { workspace = true }
 tpt-app-media-forensics-model = { workspace = true }
 serde = { workspace = true }
+# Frame extraction writes PNG evidence. An independently-implemented encoder
+# matters more here than usual: evidence a reviewer cannot open with their own
+# tools is not evidence, it is an assertion.
+png = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

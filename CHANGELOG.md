@@ -4,6 +4,49 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Frame timestamps were off by a factor of a million
+- The decoder's `Timestamp` carries a rational time base `(num, den)` meaning
+  `num/den` seconds per tick. The first version of `media_time` passed
+  `(1_000_000, 1)` as the microsecond base, which is the reciprocal: it asks for
+  one million seconds per tick. A frame at a 48 kHz base landed at 2 microseconds
+  instead of a millisecond
+- Correct is `(1, 1_000_000)`. A test that builds a `(1, 48_000)` timestamp and
+  checks the result in microseconds catches this immediately, and a second test
+  pins the already-microsecond case so the fix cannot be over-applied
+- This is the exact failure the project exists to prevent: a precise-looking
+  timecode that is wrong by orders of magnitude, attached to evidence
+
+#### Saturation, and the colour that wrapping would have produced
+- YUV below the studio-swing floor of 16 makes the BT.601 conversion overshoot:
+  with U=V=0, red works out to -223 and blue to -277. Cast to `u8` without
+  clamping those become 33 and 179 — a dark red and a mid blue, which render as a
+  plausible picture rather than an obvious fault
+- The clamp is what makes an out-of-range frame look broken instead of wrong. A
+  test asserts the values stay near black, with the specific wrapped value named
+  in the comment so the failure mode is documented rather than merely prevented
+
+#### Frame extraction as evidence (spec section 32, 33)
+- Converts a decoded frame to interleaved RGB and writes a real PNG, so the
+  artefact is openable with any image viewer rather than only by this engine.
+  Evidence a reviewer cannot inspect with their own tools is an assertion
+- Handles 4:2:0, 4:2:2, and 4:4:4 planar YUV plus RGB, BGR, and monochrome. The
+  last three are reordered rather than converted, so the bytes remain the
+  decoder's own
+- 10- and 12-bit YUV are **refused**, not approximated. Converting them requires
+  dithering or truncation, either of which alters pixel values, which would make
+  the artefact a lossy transform rather than evidence of what was decoded
+- No scaling anywhere. A thumbnail is a better artefact and worse evidence, so the
+  extracted frame is the decoded frame at its own resolution
+- The BT.601 matrix is recorded on every `FrameImage`. A YUV frame has no inherent
+  RGB appearance — the decoder reports no colour space — and BT.601 versus BT.709
+  differs visibly in skin tones, so a reviewer comparing against a reference
+  decode needs to know which convention produced these bytes
+- A truncated frame is refused rather than padded; padding would produce a
+  plausible image with invented pixels along one edge
+- Frame names derive from the frame's index and presentation time, so
+  re-extracting the same frame twice yields the same name instead of a
+  re-run-dependent sequence
+
 #### The timeline sorted its own provenance, and ranked a weaker claim above a stronger one
 - The unified error timeline (spec §31) merges structural damage, timestamp
   anomalies, and positioned findings into one ordered list. Every entry carries its

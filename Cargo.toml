@@ -115,6 +115,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # FFT for the spectral analysis (spec §22). A hand-rolled DFT would be O(n^2) and
 # unusable at audio frame sizes; this is the same transform every DAW uses.
 rustfft = "6.4"
+# PNG encoding for extracted frame evidence (spec §32). Evidence has to be
+# openable by something other than this engine, so the container is a real,
+# independently-implemented PNG rather than an in-house format. `png` is
+# vendored locally; see todo.md for why a frame is written as PNG at all.
+png = "0.17"
 
 # Test-only: scratch directories for acquisition and case-directory tests.
 tempfile = "3"

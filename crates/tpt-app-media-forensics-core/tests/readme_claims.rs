@@ -77,7 +77,7 @@ macro_rules! claimed_exist {
 /// This is the check that would have caught the stale claims found by hand:
 /// colour/HDR (no reader populates `ColourInfo`), spectral (no FFT in the audio
 /// crate), and progress/cancellation (no such code in `-core`).
-const CLAIMED_EXIST: [(&str, &str, &str); 18] = claimed_exist![
+const CLAIMED_EXIST: [(&str, &str, &str); 19] = claimed_exist![
     (
         "container inspection",
         "../../tpt-app-media-forensics-container/src/mp4.rs",
@@ -107,6 +107,14 @@ const CLAIMED_EXIST: [(&str, &str, &str); 18] = claimed_exist![
         "spectral content",
         "../../tpt-app-media-forensics-audio/src/measurement.rs",
         "HannWindowFft"
+    ),
+    // Claimed as "decoded frames written as real PNGs". `to_png` is the part that
+    // must exist: without it the bytes on disk are an in-house format no reviewer
+    // can open.
+    (
+        "decoded frames written as real",
+        "../../tpt-app-media-forensics-video/src/frame.rs",
+        "pub fn to_png"
     ),
     (
         "gop",
