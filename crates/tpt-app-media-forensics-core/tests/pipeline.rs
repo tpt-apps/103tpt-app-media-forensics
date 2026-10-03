@@ -26,6 +26,60 @@ fn case_with(contents: &[u8], dir: &std::path::Path) -> (CaseDirectory, std::pat
 fn gop_change_bytes() -> Vec<u8> {
     build_mp4_stsd_gop_change()
 }
+
+#[test]
+fn two_different_files_report_their_differences() {
+    // The comparison engine's reason for existing (spec §38-40). Compared against
+    // real container bytes so a regression in stream pairing shows up here rather
+    // than only in the model crate's synthetic fixtures.
+    let left = build_mp4(&TrackSpec::video_25fps(320, 240, 30));
+    let right = build_mp4(&TrackSpec::video_25fps(1920, 1080, 30));
+
+    let left_streams = tpt_app_media_forensics_container::inspect_bytes(left)
+        .expect("left inspects")
+        .streams;
+    let right_streams = tpt_app_media_forensics_container::inspect_bytes(right)
+        .expect("right inspects")
+        .streams;
+
+    let result =
+        tpt_app_media_forensics_model::compare_streams(Some(&left_streams), Some(&right_streams));
+
+    assert_eq!(result.streams.len(), 1, "both files have one video stream");
+    let fields: Vec<&str> = result.streams[0]
+        .differences()
+        .map(|f| f.field.as_str())
+        .collect();
+    assert!(
+        fields.contains(&"coded_dimensions"),
+        "the resolution change must be found: {fields:?}"
+    );
+    assert!(
+        !fields.contains(&"codec"),
+        "the codec did not change and must not be reported as if it did: {fields:?}"
+    );
+}
+
+#[test]
+fn a_file_compared_against_itself_reports_no_differences() {
+    // Without this, a comparison that reported everything as different would
+    // still pass every other test here.
+    let bytes = build_mp4(&TrackSpec::video_25fps(320, 240, 30));
+    let streams = tpt_app_media_forensics_container::inspect_bytes(bytes)
+        .expect("inspects")
+        .streams;
+
+    let result =
+        tpt_app_media_forensics_model::compare_streams(Some(&streams.clone()), Some(&streams));
+
+    assert!(
+        result.streams[0].differences().next().is_none(),
+        "a file must not differ from itself"
+    );
+    assert!(result.unmatched.is_empty());
+    assert!(result.layout.is_equal(), "the layout must match itself");
+}
+
 #[test]
 fn a_cancelled_analysis_stops_and_writes_nothing() {
     // The point of cancellation is that it stops real work, not just that a flag

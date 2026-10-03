@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Comparing two files: streams are paired, not zipped
+- `-model/src/comparison.rs` adds `Difference`, `ComparisonAxis`, and
+  `compare_streams` for file-to-file comparison (spec §38–40)
+- Streams pair by **kind and position within that kind**, not by raw index. Index
+  `0` in one file is not necessarily index `0` in the other, so a file that
+  dropped its first audio track reports *one unmatched stream* instead of
+  reporting every subsequent track as changed — which would bury the one real
+  difference in a wall of false ones
+- `Difference::NotComparable` exists precisely so "we could not read it" is never
+  rendered as "it matches". An unreadable container, a stream that carries video
+  properties on one side only, and a property neither side declared all land
+  here rather than in `Equal`
+- `Left`/`Right` in `Difference` follow *argument position*, not asset identity.
+  Documented on the enum because a caller that reorders its arguments gets
+  correspondingly renamed variants — visibly in the report rather than silently
+  reporting the wrong side
+- **No similarity score.** A transcode to a lower bitrate and a re-mux with
+  reordered atoms produce byte-different files, but only one of them changed
+  anything a reviewer would care about. A single number would discard exactly the
+  information the tool exists to surface
+- `ChromaSubsampling::tag()` added to the model, rendering conventional notation
+  (`4:2:0`, not `Cs420`) and showing undeclared values as such rather than
+  normalising them to whatever this build happens to model
+
 #### Progress and cancellation: what is and is not interruptible
 - `-core/src/progress.rs` adds `Stage`, `Progress`, `Cancellation`, and
   `ProgressTracker`. `Cancellation` is an `Arc<AtomicBool>` that clones *share*

@@ -75,8 +75,20 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       profile hash + rule-set hash (§54)
 - [ ] Implement large-file/streaming analysis with bounded memory,
       background workers, cancellation, progress reporting (§55–56)
-- [ ] Implement file-to-file comparison engine (duration, streams, codec,
+- [~] Implement file-to-file comparison engine (duration, streams, codec,
       colour, audio, metadata, timestamps, scene structure) (§38–40)
+      **The per-stream half is done.** `-model/src/comparison.rs` compares
+      codec, timebase, start time, duration, coded dimensions, frame rate,
+      pixel format, rotation, colour, sample rate, bit depth, and channel
+      count. Tested against real container bytes, not only synthetic fixtures.
+      **Streams pair by kind and position within that kind, not by raw index** —
+      a file that dropped its first audio track reports one unmatched stream
+      rather than reporting every later track as changed.
+      **Not done: the whole-file aggregate.** Metadata, scene-structure,
+      silence, and loudness are declared in `ComparisonAxis` but nothing yet
+      feeds them from a completed analysis, and there is no `Comparison` type
+      tying the halves together. What exists is `StreamComparisonResult`.
+      No similarity score, deliberately — see CHANGELOG.
 - [ ] Implement search over case data (§41)
 - [ ] Implement report generation: PDF, HTML, JSON, CSV (findings +
       measurements), with required disclaimers (§59–63)

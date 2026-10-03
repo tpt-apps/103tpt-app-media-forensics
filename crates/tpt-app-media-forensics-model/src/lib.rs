@@ -22,6 +22,7 @@
 pub mod analysis;
 pub mod asset;
 pub mod case;
+pub mod comparison;
 pub mod evidence;
 pub mod finding;
 pub mod id;
@@ -38,6 +39,10 @@ pub use asset::{
     HashSet, MediaAsset, MediaType,
 };
 pub use case::Case;
+pub use comparison::{
+    compare_pair, compare_streams, compare_timing, ComparisonAxis, ComparisonSide, Difference,
+    FieldComparison, StreamComparison, StreamComparisonResult, UnmatchedStream,
+};
 pub use evidence::{Evidence, EvidenceIntegrity, EvidenceKind, Provenance};
 pub use finding::{Confidence, Finding, FindingStatus, Observation, Severity};
 pub use id::{

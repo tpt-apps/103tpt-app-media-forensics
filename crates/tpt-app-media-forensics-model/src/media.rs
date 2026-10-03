@@ -111,6 +111,24 @@ pub enum ChromaSubsampling {
     Unknown(String),
 }
 
+impl ChromaSubsampling {
+    /// Returns the conventional notation, e.g. `"4:2:0"`.
+    ///
+    /// A report shows `4:2:0`, not `Cs420`: the former is what a colourist and a
+    /// specification both use, and an undeclared value is shown as such rather
+    /// than silently normalised to something this build happens to model.
+    #[must_use]
+    pub fn tag(&self) -> String {
+        match self {
+            Self::Monochrome => "monochrome".to_owned(),
+            Self::Cs420 => "4:2:0".to_owned(),
+            Self::Cs422 => "4:2:2".to_owned(),
+            Self::Cs444 => "4:4:4".to_owned(),
+            Self::Unknown(value) => format!("undeclared ({value})"),
+        }
+    }
+}
+
 /// A video pixel format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PixelFormat {
