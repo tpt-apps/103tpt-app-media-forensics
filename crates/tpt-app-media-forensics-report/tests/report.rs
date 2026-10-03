@@ -9,8 +9,8 @@ use tpt_app_media_forensics_model::{
 };
 use tpt_app_media_forensics_report::{
     asset_hashes_to_csv, escape_html, findings_to_csv, measurements_to_csv, standard_limitations,
-    to_html, to_json, write_bundle, AssetSummary, Methodology, Report, ValidationResult,
-    DISCLAIMER,
+    to_html, to_json, to_pdf, write_bundle, AssetSummary, Methodology, Note, Report,
+    ValidationResult, DISCLAIMER,
 };
 
 fn finding(rule: &str, severity: Severity, summary: &str) -> Finding {
@@ -51,7 +51,7 @@ fn methodology() -> Methodology {
 
 fn report() -> Report {
     Report {
-        schema_version: 1,
+        schema_version: tpt_app_media_forensics_report::REPORT_SCHEMA_VERSION,
         case_name: "Operation Alpha".to_owned(),
         case_id: "case:1".to_owned(),
         case_description: Some("A delivery dispute".to_owned()),
@@ -78,6 +78,7 @@ fn report() -> Report {
         evidence: Vec::new(),
         methodology: methodology(),
         limitations: standard_limitations(true, false, Some(48_000)),
+        notes: Vec::new(),
         validation: None,
     }
 }
@@ -299,4 +300,133 @@ fn the_bundle_manifest_matches_the_written_files() {
         assert_eq!(digest, entry.sha256, "{} hash does not match", entry.name);
         assert_eq!(bytes.len() as u64, entry.size_bytes);
     }
+}
+
+#[test]
+fn analyst_notes_are_rendered_in_html_and_pdf() {
+    let mut report = report();
+    report.notes = vec![Note::on("asset", "asset-1", "Frame rate disputed.")];
+
+    let html = to_html(&report);
+    assert!(
+        html.contains("Analyst notes"),
+        "the section must be present: {}",
+        &html[html.len().saturating_sub(400)..]
+    );
+    assert!(html.contains("Frame rate disputed."));
+
+    let pdf = to_pdf(&report).expect("pdf renders");
+    assert!(
+        pdf.starts_with(b"%PDF"),
+        "the pdf must still be well formed"
+    );
+}
+
+#[test]
+fn a_report_with_no_notes_omits_the_section() {
+    // An empty section heading would imply notes existed and none were shown.
+    let html = to_html(&report());
+    assert!(
+        !html.contains("Analyst notes"),
+        "no notes must mean no section, not an empty one"
+    );
+}
+
+#[test]
+fn a_note_body_is_escaped_in_html() {
+    let mut report = report();
+    report.notes = vec![Note::case("<script>alert(1)</script> & \"quotes\"")];
+
+    let html = to_html(&report);
+    assert!(
+        !html.contains("<script>alert(1)</script>"),
+        "a note is analyst-supplied text and must be escaped like any other"
+    );
+    assert!(html.contains("&lt;script&gt;"));
+}
+
+#[test]
+fn a_case_level_note_is_labelled_as_such() {
+    let mut report = report();
+    report.notes = vec![Note::case("Client disputes the timestamp.")];
+
+    let html = to_html(&report);
+    assert!(
+        html.contains(">case<"),
+        "a note with no subject must be labelled, not left blank: {html}"
+    );
+}
+
+#[test]
+fn a_note_naming_half_a_subject_is_labelled_as_ambiguous() {
+    // `add_note` refuses these, so this can only come from a hand-edited or older
+    // report file. It is labelled rather than silently presented as case-level.
+    let mut report = report();
+    report.notes = vec![tpt_app_media_forensics_report::Note {
+        subject_kind: Some("finding".to_owned()),
+        subject_id: None,
+        body: "half a subject".to_owned(),
+    }];
+
+    let html = to_html(&report);
+    assert!(
+        html.contains("subject not identified"),
+        "an ambiguous subject must be visible as such"
+    );
+}
+
+#[test]
+fn notes_survive_a_json_round_trip() {
+    let mut report = report();
+    report.notes = vec![Note::on("asset", "asset-1", "first"), Note::case("second")];
+
+    let json = to_json(&report).expect("json renders");
+    let back: Report = serde_json::from_str(&json).expect("parses");
+    assert_eq!(back.notes, report.notes);
+}
+
+#[test]
+fn a_report_written_before_notes_existed_still_parses() {
+    // `notes` is `#[serde(default)]`: an older report file has no `notes` key, and
+    // failing to parse it would make every previously-generated report unreadable.
+    let json = r#"{
+        "schema_version": 1,
+        "case_name": "Old",
+        "case_id": "case:1",
+        "case_description": null,
+        "assets": [],
+        "findings": [],
+        "evidence": [],
+        "methodology": {
+            "application_version": "1.0.0",
+            "analysis_version": "2",
+            "profile": "default",
+            "profile_fingerprint": "pf",
+            "enabled_rules": [],
+            "rule_set_fingerprint": "rs",
+            "input_hashes": [],
+            "analysis_timestamp_unix": 0,
+            "applicable_standards": [],
+            "analysis_fingerprint": "fp"
+        },
+        "limitations": [],
+        "validation": null
+    }"#;
+
+    let parsed: Report = serde_json::from_str(json).expect("an older report must parse");
+    assert!(
+        parsed.notes.is_empty(),
+        "absent notes must read as none recorded, not as a parse failure"
+    );
+}
+
+#[test]
+fn the_report_declares_the_schema_version_it_writes() {
+    // If this drifts from the constant, a consumer cannot tell what a report
+    // contains.
+    assert_eq!(
+        tpt_app_media_forensics_report::REPORT_SCHEMA_VERSION,
+        report().schema_version,
+        "the fixture must use the same version the build writes"
+    );
 }

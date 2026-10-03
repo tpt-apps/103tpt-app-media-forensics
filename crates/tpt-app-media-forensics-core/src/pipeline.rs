@@ -1471,6 +1471,20 @@ pub fn load_report(case_dir: &CaseDirectory) -> Result<CaseReport, CoreError> {
     let findings = store.findings_in_case(&case_id).map_err(rusqlite_to_core)?;
     let assets = store.assets_in_case(&case_id).map_err(rusqlite_to_core)?;
 
+    // Analyst notes travel into the report. A report that omitted them would show
+    // the engine's observations with none of the human judgement layered on top,
+    // which misrepresents the record rather than merely abbreviating it (§65).
+    let notes = store
+        .notes_in_case(&case_id)
+        .map_err(rusqlite_to_core)?
+        .into_iter()
+        .map(|n| tpt_app_media_forensics_report::Note {
+            subject_kind: n.subject_kind,
+            subject_id: n.subject_id,
+            body: n.body,
+        })
+        .collect();
+
     let manifest = case_dir.read_manifest();
     let (case_name, case_description) = manifest
         .map(|c| (c.name, c.description))
@@ -1497,7 +1511,7 @@ pub fn load_report(case_dir: &CaseDirectory) -> Result<CaseReport, CoreError> {
     };
 
     let report = tpt_app_media_forensics_report::Report {
-        schema_version: 1,
+        schema_version: tpt_app_media_forensics_report::REPORT_SCHEMA_VERSION,
         case_name,
         case_id,
         case_description,
@@ -1516,6 +1530,7 @@ pub fn load_report(case_dir: &CaseDirectory) -> Result<CaseReport, CoreError> {
         evidence: Vec::new(),
         methodology,
         limitations: Vec::new(),
+        notes,
         validation: None,
     };
 

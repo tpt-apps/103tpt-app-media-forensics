@@ -155,6 +155,22 @@ fn layout(report: &Report) -> Vec<Page> {
         }
     }
 
+    if !report.notes.is_empty() {
+        push("Analyst notes".to_owned(), 14.0, 16.0);
+        for note in &report.notes {
+            push(format!("[{}]", note.subject_label()), 9.5, 6.0);
+            // The body is pushed line by line so the analyst's own paragraph breaks
+            // survive into the PDF. `wrap` handles long lines; a single string would
+            // be reflowed into one paragraph and lose where they intended a break.
+            for line in note.body.lines() {
+                if !line.trim().is_empty() {
+                    push(line.to_owned(), 10.0, 1.0);
+                }
+            }
+            push(String::new(), 6.0, 4.0);
+        }
+    }
+
     if !report.limitations.is_empty() {
         push("Limitations".to_owned(), 14.0, 16.0);
         for limitation in &report.limitations {

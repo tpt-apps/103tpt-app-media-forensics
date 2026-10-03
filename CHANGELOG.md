@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Analyst notes reach the report — and the schema version says so
+- Closes the gap noted when notes landed: `Report` now carries `notes`, and both
+  the HTML and PDF renderers show them. A report that omitted a reviewer's
+  conclusions would show the engine's observations with none of the human
+  judgement layered on top — that misrepresents the record rather than
+  abbreviating it
+- **The schema version was a literal `1` at four construction sites.** It is now
+  `REPORT_SCHEMA_VERSION`, bumped to `2`. Adding a field without bumping it lets a
+  consumer read a report it cannot fully understand and treat the missing field as
+  "nothing was recorded" rather than "this build did not know about it"
+- `notes` is `#[serde(default)]`, pinned by a test that parses a hand-written
+  version-1 report. Without the default, adding the field would have made every
+  previously-generated report unreadable
+- **A note body is escaped like any other analyst-supplied text** — pinned by a
+  test feeding `<script>` through. The PDF pushes bodies line by line so the
+  analyst's own paragraph breaks survive; a single string would be reflowed into
+  one paragraph and lose where they intended a break. HTML uses `white-space:
+  pre-wrap` for the same reason
+- A note naming half its subject (only reachable from a hand-edited or older file,
+  since `add_note` refuses those) is labelled "subject not identified" rather than
+  silently presented as case-level
+- `notes_for` in the CLI returns empty rather than erroring when the database cannot
+  be read: `analyse` is mid-write to that database, and failing to produce a report
+  because a note lookup failed is worse than producing one without notes
+- `load_report` reads notes from the store, so re-running `analyse` on an annotated
+  case produces a report that still carries the analyst's conclusions
+
 #### Analyst notes: a note with half a subject names nothing
 - §65 done. `Store::add_note`, `notes_on`, `notes_in_case`, and `StoredNote` in
   `-core/src/store/mod.rs`. The `notes` table and its index existed since the base

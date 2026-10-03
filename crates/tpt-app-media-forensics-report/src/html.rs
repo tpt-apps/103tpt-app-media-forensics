@@ -118,6 +118,19 @@ pub fn to_html(report: &Report) -> String {
         out.push_str("</table>\n</section>\n");
     }
 
+    if !report.notes.is_empty() {
+        out.push_str("<section id=\"notes\"><h2>Analyst notes</h2>\n<table>\n");
+        out.push_str("<tr><th>Subject</th><th>Note</th></tr>\n");
+        for note in &report.notes {
+            out.push_str(&format!(
+                "<tr><td>{}</td><td class=\"note\">{}</td></tr>\n",
+                escape_html(&note.subject_label()),
+                escape_html(&note.body)
+            ));
+        }
+        out.push_str("</table>\n</section>\n");
+    }
+
     if !report.limitations.is_empty() {
         out.push_str("<section id=\"limitations\"><h2>Limitations</h2>\n<ul>\n");
         for limitation in &report.limitations {
@@ -192,6 +205,7 @@ table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}
 th,td{border:1px solid #ccc;padding:.35rem .6rem;text-align:left;vertical-align:top}
 th{background:#f4f4f4;font-weight:600}
 .hash{font-family:ui-monospace,monospace;font-size:.8em;word-break:break-all}
+.note{white-space:pre-wrap;width:60%}
 .finding{border-left:4px solid #ccc;padding:.5rem 1rem;margin:1rem 0;background:#fafafa}
 .finding.critical{border-color:#b00020}
 .finding.significant{border-color:#d66b00}

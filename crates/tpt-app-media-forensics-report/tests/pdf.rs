@@ -53,7 +53,7 @@ fn finding(index: u8) -> Finding {
 
 fn report(count: usize) -> Report {
     Report {
-        schema_version: 1,
+        schema_version: tpt_app_media_forensics_report::REPORT_SCHEMA_VERSION,
         case_name: "Case Alpha".to_owned(),
         case_id: "case:00000000-0000-0000-0000-000000000001".to_owned(),
         case_description: Some("A description.".to_owned()),
@@ -69,6 +69,7 @@ fn report(count: usize) -> Report {
         evidence: Vec::new(),
         methodology: methodology(),
         limitations: vec!["Audio was not decoded.".to_owned()],
+        notes: Vec::new(),
         validation: None,
     }
 }

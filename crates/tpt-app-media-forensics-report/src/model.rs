@@ -147,6 +147,72 @@ pub struct AssetSummary {
     pub stream_count: usize,
 }
 
+/// The report format version this build writes.
+///
+/// A constant rather than a literal at each construction site: adding a field to
+/// [`Report`] without bumping this would let a consumer read a report it cannot
+/// fully understand and treat the missing field as "nothing was recorded" rather
+/// than "this build did not know about it". Version 2 added `notes` (spec §65).
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
+
+/// One analyst note, as carried into a report (spec §65).
+///
+/// A distinct type from the store's `StoredNote` so the report format does not
+/// inherit a database's row id and timestamp semantics. The report carries what
+/// was written and where it applied, not the storage details behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    /// What kind of thing the note is about, e.g. `"asset"` or `"finding"`.
+    ///
+    /// `None` for a case-level note, which is a real observation an analyst makes
+    /// about the whole case.
+    pub subject_kind: Option<String>,
+    /// Which subject, when the note is attached to one.
+    pub subject_id: Option<String>,
+    /// The analyst's text, verbatim.
+    pub body: String,
+}
+
+impl Note {
+    /// Builds a note attached to a subject.
+    #[must_use]
+    pub fn on(
+        subject_kind: impl Into<String>,
+        subject_id: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            subject_kind: Some(subject_kind.into()),
+            subject_id: Some(subject_id.into()),
+            body: body.into(),
+        }
+    }
+
+    /// Builds a case-level note.
+    #[must_use]
+    pub fn case(body: impl Into<String>) -> Self {
+        Self {
+            subject_kind: None,
+            subject_id: None,
+            body: body.into(),
+        }
+    }
+
+    /// Returns what the note is about, for display.
+    #[must_use]
+    pub fn subject_label(&self) -> String {
+        match (&self.subject_kind, &self.subject_id) {
+            (Some(kind), Some(id)) => format!("{kind} {id}"),
+            // A note naming half its subject should never have been written, but a
+            // report read from an older or hand-edited file could contain one. It is
+            // labelled as ambiguous rather than silently treated as case-level.
+            (Some(kind), None) => format!("{kind} (subject not identified)"),
+            (None, Some(id)) => format!("{id} (kind not identified)"),
+            (None, None) => "case".to_owned(),
+        }
+    }
+}
+
 /// A complete forensic report (spec §59).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
@@ -168,6 +234,15 @@ pub struct Report {
     pub methodology: Methodology,
     /// Stated limitations, e.g. measurements that could not be taken.
     pub limitations: Vec<String>,
+    /// Analyst notes, in the order they were written (spec §65).
+    ///
+    /// A reviewer's conclusions are part of the record, so a report that omits
+    /// them describes the engine's work without the human judgement layered on top.
+    /// Rendered after the findings and before the limitations: a reader wants the
+    /// observations first, then what someone concluded about them, then what the
+    /// engine could not measure.
+    #[serde(default)]
+    pub notes: Vec<Note>,
     /// Present for a validation report (spec §68), absent for a forensic one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationResult>,

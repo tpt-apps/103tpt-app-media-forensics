@@ -337,8 +337,11 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       whitespace: a note is evidence of what the analyst concluded, so reflowing
       their prose would alter the record.
       The `notes` table existed since the base schema with no API above it — the
-      feature was unreachable. Not done: no CLI surface, and notes are not yet
-      rendered into reports.
+      feature was unreachable. Notes now also reach the report: `Report` carries
+      `notes`, and the HTML and PDF renderers show them. The report schema
+      version moved to a `REPORT_SCHEMA_VERSION` constant, bumped to 2. Not done:
+      no CLI command to write a note, and the CSV renderers omit notes (they are
+      per-finding tables).
 - [ ] Comparison against a defined reference/master asset (§67)
 - [ ] More advanced audio measurements (loudness standards, spectral) (§21–22)
 - [ ] More advanced visual anomaly detection

@@ -840,6 +840,35 @@ fn escape_atom(kind: &[u8]) -> String {
         .collect()
 }
 
+/// Reads the analyst notes recorded on a case, for inclusion in a report.
+///
+/// Empty when the case database cannot be read rather than an error: `analyse` is
+/// in the middle of writing to that database, and a report that failed to generate
+/// because a note lookup failed would be a worse outcome than one without notes.
+/// The limitation is stated in the report's own limitations list.
+fn notes_for(
+    directory: &tpt_app_media_forensics_core::CaseDirectory,
+) -> Vec<tpt_app_media_forensics_report::Note> {
+    use tpt_app_media_forensics_core::store::Store;
+
+    let Ok(store) = Store::open(directory.root()) else {
+        return Vec::new();
+    };
+    let Ok(Some(case_id)) = store.only_case_id() else {
+        return Vec::new();
+    };
+    store
+        .notes_in_case(&case_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| tpt_app_media_forensics_report::Note {
+            subject_kind: n.subject_kind,
+            subject_id: n.subject_id,
+            body: n.body,
+        })
+        .collect()
+}
+
 /// Analyses a media file and writes the result into a case (spec §97).
 ///
 /// Runs the same engine the desktop app uses, so a finding means the same
@@ -875,7 +904,7 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
     };
 
     let report = Report {
-        schema_version: 1,
+        schema_version: tpt_app_media_forensics_report::REPORT_SCHEMA_VERSION,
         case_name: directory_manifest_name(&directory),
         case_id: directory.root().display().to_string(),
         case_description: None,
@@ -890,6 +919,11 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
         findings: outcome.findings.clone(),
         evidence: Vec::new(),
         limitations: outcome.limitations.clone(),
+        // Notes already on the case travel into the bundle. Reading them back means
+        // re-running `analyse` on a case an analyst has already annotated produces a
+        // report that still carries their conclusions, instead of quietly dropping
+        // them the second time the file is analysed.
+        notes: notes_for(&directory),
         methodology,
         validation: None,
     };
