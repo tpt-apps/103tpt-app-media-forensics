@@ -327,7 +327,18 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       was rejected by the database. `insert_finding` had no test coverage at all,
       which is how a fully broken path stayed green — now pinned by round-trip
       tests for each verdict state.
-- [ ] Analyst notes on asset/stream/timestamp/frame/finding/evidence (§65)
+- [x] Analyst notes on asset/stream/timestamp/frame/finding/evidence (§65)
+      `Store::add_note` / `notes_on` / `notes_in_case`. A note names both the kind
+      and the id of its subject, or neither — half a subject is refused rather
+      than stored, because it would let a later reader attach the analyst's
+      conclusion to the wrong thing. Case-level notes (`None`/`None`) are
+      allowed and included in the case listing.
+      Bodies are stored byte for byte, including line endings and trailing
+      whitespace: a note is evidence of what the analyst concluded, so reflowing
+      their prose would alter the record.
+      The `notes` table existed since the base schema with no API above it — the
+      feature was unreachable. Not done: no CLI surface, and notes are not yet
+      rendered into reports.
 - [ ] Comparison against a defined reference/master asset (§67)
 - [ ] More advanced audio measurements (loudness standards, spectral) (§21–22)
 - [ ] More advanced visual anomaly detection

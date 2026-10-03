@@ -452,6 +452,29 @@ impl Store {
     }
 }
 
+/// One analyst note, as stored (spec §65).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredNote {
+    /// Row identifier, unique within the case.
+    pub id: i64,
+    /// What kind of thing the note is about, e.g. `"asset"` or `"finding"`.
+    pub subject_kind: Option<String>,
+    /// Which one, when the note is attached to a subject.
+    pub subject_id: Option<String>,
+    /// The analyst's text, stored verbatim.
+    pub body: String,
+    /// When the note was written, in Unix seconds.
+    pub created_at: i64,
+}
+
+impl StoredNote {
+    /// Whether this note is attached to a specific subject.
+    #[must_use]
+    pub fn is_attached(&self) -> bool {
+        self.subject_kind.is_some() && self.subject_id.is_some()
+    }
+}
+
 /// One reviewer verdict, as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredReview {
@@ -657,6 +680,106 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Records an analyst note against a subject (spec §65).
+    ///
+    /// `subject_kind` and `subject_id` identify what the note is about, e.g. an
+    /// asset or a finding. Both are optional together: a note with neither is a
+    /// case-level note, which is a real thing an analyst writes ("the client
+    /// disputes the timestamp"), while a note with one but not the other would name
+    /// a subject ambiguously. That pairing is rejected rather than stored.
+    ///
+    /// The body is stored verbatim, including its line endings and internal
+    /// formatting. A note is evidence of what the analyst concluded, and
+    /// "helpfully" reflowing their prose would alter the record (spec §77).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`rusqlite::Error::InvalidParameterName`] if only one of
+    /// `subject_kind`/`subject_id` is supplied, and an error if the case does not
+    /// exist.
+    ///
+    /// `created_at` is supplied rather than read from the clock so the store stays
+    /// deterministic and a caller can record the true wall-clock time (spec §77):
+    /// the store has no notion of "now" and asserting one would make two identical
+    /// runs differ. A caller-chosen time is not a fabrication risk here because the
+    /// note body is the analyst's, not the engine's observation.
+    pub fn add_note(
+        &self,
+        case_id: &str,
+        subject_kind: Option<&str>,
+        subject_id: Option<&str>,
+        body: &str,
+        created_at: i64,
+    ) -> rusqlite::Result<i64> {
+        match (subject_kind, subject_id) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "a note must name both the kind and the id of its subject, or neither"
+                        .to_owned(),
+                ));
+            }
+            _ => {}
+        }
+
+        self.connection.execute(
+            "INSERT INTO notes (case_id, subject_kind, subject_id, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![case_id, subject_kind, subject_id, body, created_at],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Returns the notes attached to one subject, oldest first.
+    ///
+    /// Ordering is by row id rather than timestamp so two notes written in the same
+    /// second still come back in the order they were written.
+    pub fn notes_on(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+    ) -> rusqlite::Result<Vec<StoredNote>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, subject_kind, subject_id, body, created_at FROM notes \
+             WHERE subject_kind = ?1 AND subject_id = ?2 ORDER BY id",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![subject_kind, subject_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredNote {
+                id: row.get(0)?,
+                subject_kind: row.get(1)?,
+                subject_id: row.get(2)?,
+                body: row.get(3)?,
+                created_at: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Returns every note in a case, oldest first.
+    ///
+    /// Case-level notes included, so a report or a UI showing "what the analyst
+    /// said about this case" does not silently omit the observations that were not
+    /// attached to one subject.
+    pub fn notes_in_case(&self, case_id: &str) -> rusqlite::Result<Vec<StoredNote>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, subject_kind, subject_id, body, created_at FROM notes \
+             WHERE case_id = ?1 ORDER BY id",
+        )?;
+        let mut rows = stmt.query([case_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredNote {
+                id: row.get(0)?,
+                subject_kind: row.get(1)?,
+                subject_id: row.get(2)?,
+                body: row.get(3)?,
+                created_at: row.get(4)?,
+            });
         }
         Ok(out)
     }

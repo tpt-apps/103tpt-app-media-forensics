@@ -665,3 +665,164 @@ fn a_transaction_commits_when_the_closure_succeeds() {
 
     assert_eq!(store.count("cases").expect("counted"), 2);
 }
+
+#[test]
+fn a_note_can_be_attached_to_an_asset() {
+    let store = seeded_store();
+    let id = store
+        .add_note(
+            "case-1",
+            Some("asset"),
+            Some(&asset_id().to_string()),
+            "Frame rate looks wrong for the delivery spec.",
+            1_700_000_900,
+        )
+        .expect("a note must be recordable");
+
+    let notes = store
+        .notes_on("asset", &asset_id().to_string())
+        .expect("notes read");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].id, id);
+    assert!(notes[0].is_attached());
+    assert_eq!(
+        notes[0].body,
+        "Frame rate looks wrong for the delivery spec."
+    );
+}
+
+#[test]
+fn a_case_level_note_needs_no_subject() {
+    // "The client disputes the timestamp" is about the case, not one asset. That is
+    // a real thing analysts write, so it must be storable.
+    let store = seeded_store();
+    store
+        .add_note(
+            "case-1",
+            None,
+            None,
+            "Client disputes the timestamp.",
+            1_700_000_900,
+        )
+        .expect("a case-level note must be recordable");
+
+    let notes = store.notes_in_case("case-1").expect("notes read");
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].is_attached());
+}
+
+#[test]
+fn a_note_naming_only_half_its_subject_is_refused() {
+    // A note with a kind but no id names a subject ambiguously; storing it would let
+    // a later reader attach the conclusion to the wrong thing.
+    let store = seeded_store();
+    assert!(
+        store
+            .add_note("case-1", Some("asset"), None, "half a subject", 1)
+            .is_err(),
+        "kind without id must be refused"
+    );
+    assert!(
+        store
+            .add_note("case-1", None, Some("a1"), "half a subject", 1)
+            .is_err(),
+        "id without kind must be refused"
+    );
+    assert_eq!(store.count("notes").expect("counted"), 0);
+}
+
+#[test]
+fn notes_are_returned_in_the_order_they_were_written() {
+    // Ordered by row id, not timestamp: two notes in the same second must still come
+    // back in write order.
+    let store = seeded_store();
+    let subject = asset_id().to_string();
+    for body in ["first", "second", "third"] {
+        store
+            .add_note("case-1", Some("asset"), Some(&subject), body, 1_700_000_000)
+            .expect("note");
+    }
+
+    let notes = store.notes_on("asset", &subject).expect("notes read");
+    let bodies: Vec<&str> = notes.iter().map(|n| n.body.as_str()).collect();
+    assert_eq!(bodies, vec!["first", "second", "third"]);
+}
+
+#[test]
+fn notes_on_one_subject_do_not_appear_on_another() {
+    let store = seeded_store();
+    store
+        .add_note(
+            "case-1",
+            Some("asset"),
+            Some(&asset_id().to_string()),
+            "about the asset",
+            1_700_000_900,
+        )
+        .expect("note");
+
+    assert!(
+        store
+            .notes_on("finding", "f-other")
+            .expect("notes read")
+            .is_empty(),
+        "a note on an asset must not appear under a finding"
+    );
+}
+
+#[test]
+fn a_case_listing_includes_both_attached_and_case_level_notes() {
+    // A report showing "what the analyst said about this case" must not silently
+    // drop the observations that were not attached to one subject.
+    let store = seeded_store();
+    store
+        .add_note("case-1", None, None, "case level", 1_700_000_800)
+        .expect("case note");
+    store
+        .add_note(
+            "case-1",
+            Some("asset"),
+            Some(&asset_id().to_string()),
+            "asset level",
+            1_700_000_900,
+        )
+        .expect("asset note");
+
+    let notes = store.notes_in_case("case-1").expect("notes read");
+    assert_eq!(notes.len(), 2, "both notes must be listed");
+    assert_eq!(notes[0].body, "case level");
+    assert_eq!(notes[1].body, "asset level");
+}
+
+#[test]
+fn a_note_body_is_stored_verbatim() {
+    // A note is evidence of what the analyst concluded. Reflowing their prose or
+    // trimming their whitespace would alter the record.
+    let store = seeded_store();
+    let body = "  line one\r\n\n\tline two with trailing space   ";
+    store
+        .add_note("case-1", None, None, body, 1_700_000_900)
+        .expect("note");
+
+    let notes = store.notes_in_case("case-1").expect("notes read");
+    assert_eq!(
+        notes[0].body, body,
+        "the analyst's text must survive byte for byte"
+    );
+}
+
+#[test]
+fn notes_from_one_case_are_invisible_to_another() {
+    let store = seeded_store();
+    store
+        .upsert_case("case-2", "Second", None)
+        .expect("second case");
+    store
+        .add_note("case-1", None, None, "about case one", 1_700_000_900)
+        .expect("note");
+
+    assert!(
+        store.notes_in_case("case-2").expect("reads").is_empty(),
+        "a note must not leak across cases"
+    );
+}

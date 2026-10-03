@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Analyst notes: a note with half a subject names nothing
+- §65 done. `Store::add_note`, `notes_on`, `notes_in_case`, and `StoredNote` in
+  `-core/src/store/mod.rs`. The `notes` table and its index existed since the base
+  schema and had **no API at all** — the feature was unreachable
+- **A note names both the kind and the id of its subject, or neither.** A note with
+  `subject_kind` but no `subject_id` names a subject ambiguously, and storing it
+  would let a later reader attach the analyst's conclusion to the wrong thing. That
+  pairing is rejected rather than stored. Case-level notes are legitimate ("the
+  client disputes the timestamp"), so `None`/`None` is allowed
+- **A note body is stored byte for byte.** A note is evidence of what the analyst
+  concluded; reflowing their prose or trimming whitespace would alter the record.
+  Pinned by a test using a body with CRLF, a blank line, a tab, and trailing
+  spaces
+- `notes_in_case` includes both attached and case-level notes, so a report showing
+  "what the analyst said about this case" does not silently drop the observations
+  that were not attached to one subject
+- Ordered by row id rather than timestamp: two notes written in the same second
+  still come back in write order
+- `created_at` is supplied rather than read from the clock. My first draft of the
+  doc comment claimed the engine recorded the time "because a caller-chosen time
+  would let a note predate the analysis" — that contradicts the signature, and the
+  argument was wrong: the store has no notion of "now", asserting one would make two
+  identical runs differ, and the note body is the analyst's own text
+
 #### Three more bugs, all found by writing tests for untested functions
 - Last session's review bug made me check every store method for coverage. Seven had
   none. Writing tests for them turned up **three more real bugs** — so the pattern
