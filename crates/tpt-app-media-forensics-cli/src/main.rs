@@ -906,6 +906,7 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
             "analysis_fingerprint": fingerprint,
             "finding_count": outcome.findings.len(),
             "findings": outcome.findings,
+            "timeline": outcome.timeline,
             "encoder_indicators": outcome.fingerprint,
             "limitations": outcome.limitations,
             "bundle_files": manifest.files,
@@ -937,6 +938,14 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
                 finding.rule_id,
                 finding.observation.summary
             );
+        }
+        // The placement qualifier travels with each timecode, so an inferred
+        // position is never read as a measured one.
+        if !outcome.timeline.is_empty() {
+            println!("Timeline       {} observations", outcome.timeline.len());
+            for line in outcome.timeline.describe() {
+                println!("  {line}");
+            }
         }
         // Each indicator is printed with what it does not establish. A declared
         // tag shown on its own invites a reader to treat "Lavf58" as proof of

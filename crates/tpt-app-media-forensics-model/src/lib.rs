@@ -27,6 +27,7 @@ pub mod finding;
 pub mod id;
 pub mod media;
 pub mod time;
+pub mod timeline;
 
 pub use analysis::{
     AnalysisRecord, AnalysisStatus, AnalysisVersion, CacheKey, ProfileFingerprint,
@@ -47,3 +48,4 @@ pub use media::{
     StreamAnalysis, StreamKind, StreamTiming, VideoFormat,
 };
 pub use time::{MediaTime, Rational, Timebase};
+pub use timeline::{Placement, Timeline, TimelineEntry, TimelineSource};

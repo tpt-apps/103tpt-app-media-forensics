@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### The timeline sorted its own provenance, and ranked a weaker claim above a stronger one
+- The unified error timeline (spec §31) merges structural damage, timestamp
+  anomalies, and positioned findings into one ordered list. Every entry carries its
+  source and a `Placement` of `Measured`, `Inferred`, or `Unplaced`, because the
+  three disagree about how much their timecode can be trusted: a structural
+  defect's time comes from accumulating sample sizes, while a timestamp anomaly's
+  comes from the sample's own stamp
+- The first sort key included `placement as u8`, which orders `Measured` before
+  `Inferred`. At equal timestamps that put a weaker placement claim ahead of an
+  exactly-measured one. Two tests caught it: an inferred entry at 100 ms displaced
+  a measured entry, and a placed entry sorted ahead of an unplaced one that was
+  supposed to come last
+- Placement is now data on the entry, not a ranking of it. The key is time, source,
+  reference, summary
+- An observation with no position is `Unplaced` and sorts **last**, never at
+  `00:00:00`. Findings without a position are kept rather than dropped: the
+  timeline must account for every finding, or it disagrees with the findings list
+  printed above it
+- Two things are deliberately absent rather than approximated. Timestamp gaps and
+  overlaps carry a *size*, not a time, and `TimestampReport` does not retain the
+  timestamps it scanned — placing them would need a second pass over the file, so
+  they stay off the timeline instead of landing at an invented instant. And a
+  cache hit serves an empty timeline with a stated limitation, rather than
+  pretending the cached findings carry positions they were not stored with
+
 #### Loudness range, and why its unit is LU rather than LUFS
 - `loudness_range` per EBU Tech 3342: the 10th to 95th percentile of 3-second
   short-term loudness. This completes §22

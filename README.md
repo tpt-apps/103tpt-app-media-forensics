@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   630 passing
+tests   642 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -52,8 +52,10 @@ one that names the gap:
 
 - **Container inspection** — boxes, streams, timebase, duration consistency,
   malformed structures, truncation, trailing data
-- **Error timeline** — structural damage located by byte offset and placed at a
-  media time, so a finding says *where* the file stops being sound
+- **Error timeline** — structural damage, timestamp anomalies and positioned
+  findings merged into one ordered list, each labelled with whether its position
+  was measured, inferred, or unavailable, so a finding says *where* it sits and
+  how confidently that place is known
 - **Edit lists** — a track's declared start delay read from `elst`, so a stream
   that does not begin at zero is reported rather than assumed to
 - **Video analysis** — structure, GOP layout, duplicate and near-duplicate

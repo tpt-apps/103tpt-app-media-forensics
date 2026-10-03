@@ -176,19 +176,29 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       **Not yet done:** decode-level and packet-level corruption (a valid
       container holding undecodable samples), and graceful continuation *within*
       Tier-2 decoding rather than around the container.
-- [~] Implement error/anomaly timeline (§31)
-      **Damage now lands on the timeline.** `SampleIndex` in `-container` maps a
-      byte offset to the sample containing it, and `CONTAINER.TRUNCATED_MEDIA`
-      sets `timeline_start` to that sample's presentation time. Verified on a real
-      truncated file: the finding reports `00:00:00.280` and names the stream.
-      The placement carries its provenance — offsets are *inferred* by accumulating
-      sample sizes, not read from `stco`, and the finding says so. With no sample
-      index (file above the sampling bound) the finding carries a byte offset and
-      **no** timecode, because a fabricated `00:00:00` would read as a measured
-      position.
-      **Not yet done:** a unified timeline type merging damage with timestamp
-      anomalies and codec errors; the `mdat` anchor walk stops at `moov`, so a file
-      with `mdat` before `moov` gets no placement.
+- [x] Implement error/anomaly timeline (§31)
+      **The unified timeline now exists**: `-model/src/timeline.rs` plus
+      `build_timeline` in the pipeline. It merges three sources into one ordered
+      list — structural damage (placed through the sample index), timestamp
+      anomalies (placed at the sample index the scanner knew), and rule findings
+      (placed where their rule put them) — and every entry carries the *source* and
+      a `Placement` of `Measured` / `Inferred` / `Unplaced`.
+      That distinction is the whole point: a structural defect's timecode comes
+      from accumulating sample sizes, while a timestamp anomaly's comes from the
+      sample's own stamp, and rendering both as `00:00:10` would let an inference
+      be quoted as a measurement. `describe()` prints `inferred` next to the
+      timecode.
+      An observation with no position becomes `Unplaced` and sorts **last**, never
+      at `00:00:00`. Findings without a position are kept, not dropped — the
+      timeline must account for every finding or it disagrees with the list above
+      it.
+      Ordering is total and deterministic (time, source, reference) so two runs
+      produce identical reports per spec §77.
+      **Two things deliberately not done.** Timestamp gaps and overlaps carry a
+      *size*, not a time, and `TimestampReport` does not retain the timestamps it
+      scanned — placing them would need a second scan, so they stay off the
+      timeline rather than at a fabricated instant. And `mdat`-before-`moov` files
+      still get no placement, because the anchor walk stops at `moov`.
 - [x] Define Finding model with severity + evidence + confidence (§34)
       `-model/src/finding.rs`; duplicated in Phase 0 above, left ticked there
       too rather than removed, since both lines refer to the same type

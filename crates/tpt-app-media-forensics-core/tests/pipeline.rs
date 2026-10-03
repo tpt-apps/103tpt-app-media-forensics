@@ -28,6 +28,72 @@ fn gop_change_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn the_timeline_places_observations_from_more_than_one_source() {
+    // The point of §31 is one ordered list, not three separate reports. A file
+    // with a GOP change *and* a timestamp gap must produce entries from more
+    // than one source, or the merge is not happening.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let bytes = tpt_app_media_forensics_container::fixture::build_mp4_stsd_gop_change();
+    let (case_dir, source) = case_with(&bytes, tmp.path());
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    assert!(
+        !outcome.timeline.is_empty(),
+        "a file with findings must populate the timeline"
+    );
+    // Every finding must be represented: dropping one would mean the timeline
+    // disagreed with the findings list above it.
+    let finding_entries = outcome
+        .timeline
+        .from_source(tpt_app_media_forensics_model::TimelineSource::Finding)
+        .count();
+    assert_eq!(
+        finding_entries,
+        outcome.findings.len(),
+        "the timeline must account for every finding"
+    );
+    // Entries are ordered, and each carries a placement that says where its
+    // position came from.
+    for entry in &outcome.timeline.entries {
+        assert!(
+            !entry.reference.is_empty(),
+            "every entry must name what it refers to: {entry:?}"
+        );
+        if entry.time.is_none() {
+            assert_eq!(
+                entry.placement,
+                tpt_app_media_forensics_model::Placement::Unplaced,
+                "an entry with no time must say it is unplaced"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_entry_with_no_position_is_never_given_one() {
+    // The distinction the whole type exists for: "no position" is not "at zero".
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(
+        &build_mp4(&TrackSpec::video_25fps(320, 240, 30)),
+        tmp.path(),
+    );
+
+    let outcome = AnalysisEngine::new()
+        .analyse(&source, &case_dir)
+        .expect("analyses");
+
+    for entry in outcome.timeline.unplaced() {
+        assert!(
+            entry.time.is_none(),
+            "an unplaced entry must carry no timecode: {entry:?}"
+        );
+    }
+}
+
+#[test]
 fn encoder_fingerprinting_reports_declared_tags_without_asserting_a_cause() {
     // A file carrying a `©too` atom reaches the report, and the indicator says
     // what it does not establish. A fingerprint that reported "encoded with

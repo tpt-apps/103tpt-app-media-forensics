@@ -64,6 +64,11 @@ pub struct AnalysisOutcome {
     /// observation about the file, not a conclusion about it — the same reason
     /// `metadata` sits beside `findings` rather than inside it.
     pub fingerprint: FingerprintReport,
+    /// Every located observation, in one order (spec §31).
+    ///
+    /// Merges structural damage, timestamp anomalies, and positioned findings so
+    /// a reviewer can see *where* a problem sits rather than only that it exists.
+    pub timeline: tpt_app_media_forensics_model::Timeline,
     /// What could not be measured, and why.
     pub limitations: Vec<String>,
     /// The profile used.
@@ -138,6 +143,11 @@ impl AnalysisEngine {
                      recompute"
                     .to_owned(),
             );
+            limitations.push(
+                "the timeline was not rebuilt on a cache hit; only findings were served. \
+                 Re-run to place observations on it"
+                    .to_owned(),
+            );
             return Ok(AnalysisOutcome {
                 findings: entry.findings,
                 cache_hit: true,
@@ -145,6 +155,7 @@ impl AnalysisEngine {
                 limitations,
                 metadata: MetadataTree::default(),
                 fingerprint: FingerprintReport::default(),
+                timeline: tpt_app_media_forensics_model::Timeline::default(),
                 asset,
                 profile: self.profile.clone(),
             });
@@ -159,6 +170,13 @@ impl AnalysisEngine {
                     operation: "evaluate rules",
                     reason: e.to_string(),
                 })?;
+
+        // 6b. The unified timeline (spec §31).
+        //
+        // Built after the rules so findings can be placed, and from the bundle
+        // rather than by re-reading the file: every input is already in hand, so
+        // this costs no extra I/O and cannot disagree with the findings it places.
+        let timeline = build_timeline(&bundle, &findings);
 
         // 7. Cache for next time.
         cache.store(&CacheEntry {
@@ -206,6 +224,7 @@ impl AnalysisEngine {
             cache_hit: false,
             metadata: bundle.metadata.clone().unwrap_or_default(),
             fingerprint,
+            timeline,
             limitations,
             profile: self.profile.clone(),
         })
@@ -927,6 +946,172 @@ impl MethodOfFingerprint {
         tpt_app_media_forensics_report::Methodology::compute_fingerprint(
             asset, version, profile, rules,
         )
+    }
+}
+
+/// Builds the unified timeline from the analysed bundle and the findings (spec §31).
+///
+/// Merges three sources that arrive by unrelated routes, and keeps each one's
+/// placement provenance intact:
+///
+/// - **Structural damage** sits at a byte offset; it becomes a media time only by
+///   inference through the sample index, so its entries are marked `Inferred`.
+/// - **Timestamp anomalies** sit at a sample index the scanner already knew, so
+///   they are `Measured`.
+/// - **Findings** carry whatever position their rule chose. One with no position
+///   becomes `Unplaced` rather than being dropped: the finding is real, and
+///   dropping it here would mean the timeline disagreed with the findings list.
+fn build_timeline(
+    bundle: &tpt_app_media_forensics_rules::AnalysisBundle,
+    findings: &[Finding],
+) -> tpt_app_media_forensics_model::Timeline {
+    use tpt_app_media_forensics_model::{TimelineEntry, TimelineSource};
+
+    let mut entries: Vec<TimelineEntry> = Vec::new();
+
+    // Structural damage, placed through the sample index.
+    for defect in &bundle.damage {
+        let placed = bundle.sample_index.locate(defect.offset());
+        match placed.map(|position| position.time) {
+            Some(time) => entries.push(TimelineEntry::inferred(
+                time,
+                TimelineSource::StructuralDamage,
+                defect.tag(),
+                defect.describe(),
+            )),
+            None => entries.push(TimelineEntry::unplaced(
+                TimelineSource::StructuralDamage,
+                defect.tag(),
+                defect.describe(),
+            )),
+        }
+    }
+
+    // Timestamp anomalies, placed at the sample index the scanner reported.
+    for report in &bundle.timestamps {
+        for anomaly in &report.anomalies {
+            let Some(time) = anomaly_time(report, anomaly) else {
+                continue;
+            };
+            entries.push(TimelineEntry::measured(
+                time,
+                TimelineSource::Timestamp,
+                anomaly_tag(anomaly),
+                describe_anomaly(anomaly),
+            ));
+        }
+    }
+
+    // Findings, placed exactly where their rule put them.
+    for finding in findings {
+        match finding.timeline_start {
+            Some(time) => entries.push(TimelineEntry::measured(
+                time,
+                TimelineSource::Finding,
+                &finding.rule_id,
+                &finding.observation.summary,
+            )),
+            None => entries.push(TimelineEntry::unplaced(
+                TimelineSource::Finding,
+                &finding.rule_id,
+                &finding.observation.summary,
+            )),
+        }
+    }
+
+    let duration = bundle.container.as_ref().and_then(|container| {
+        container
+            .streams
+            .iter()
+            .filter_map(|stream| stream.timing.measured_duration)
+            .max_by_key(|time| time.as_micros())
+    });
+
+    tpt_app_media_forensics_model::Timeline::new(entries, duration)
+}
+
+/// The presentation time a timestamp anomaly sits at, from the stream's own times.
+///
+/// A gap or an overlap has no single sample time of its own; it sits between two
+/// samples, and the earlier one is used, because that is the point at which the
+/// discontinuity becomes visible. `None` when the report carries no timestamps to
+/// resolve the index against — which would mean the anomaly cannot be placed, not
+/// that it belongs at zero.
+fn anomaly_time(
+    report: &tpt_app_media_forensics_timing::pts_dts::TimestampReport,
+    anomaly: &tpt_app_media_forensics_timing::pts_dts::Anomaly,
+) -> Option<tpt_app_media_forensics_model::MediaTime> {
+    // The report does not retain the timestamps it scanned, so the anomaly's own
+    // observed value is used where it has one.
+    match anomaly {
+        tpt_app_media_forensics_timing::pts_dts::Anomaly::NonMonotonicDts { observed, .. }
+        | tpt_app_media_forensics_timing::pts_dts::Anomaly::NonMonotonicPts { observed, .. }
+        | tpt_app_media_forensics_timing::pts_dts::Anomaly::NegativeTimestamp {
+            observed, ..
+        } => Some(*observed),
+        // A gap and an overlap name a size, not a time. Placing them needs the
+        // neighbouring timestamps, which the report does not carry, so they stay
+        // off the timeline rather than at a fabricated instant.
+        tpt_app_media_forensics_timing::pts_dts::Anomaly::Gap { .. }
+        | tpt_app_media_forensics_timing::pts_dts::Anomaly::Overlap { .. } => {
+            let _ = report;
+            None
+        }
+    }
+}
+
+/// A stable tag naming the kind of timestamp anomaly.
+fn anomaly_tag(anomaly: &tpt_app_media_forensics_timing::pts_dts::Anomaly) -> &'static str {
+    use tpt_app_media_forensics_timing::pts_dts::Anomaly;
+    match anomaly {
+        Anomaly::NonMonotonicDts { .. } => "TIMING.NON_MONOTONIC_DTS",
+        Anomaly::NonMonotonicPts { .. } => "TIMING.NON_MONOTONIC_PTS",
+        Anomaly::Gap { .. } => "TIMING.TIMESTAMP_GAP",
+        Anomaly::Overlap { .. } => "TIMING.TIMESTAMP_OVERLAP",
+        Anomaly::NegativeTimestamp { .. } => "TIMING.NEGATIVE_TIMESTAMP",
+    }
+}
+
+/// Renders a timestamp anomaly as one readable line.
+///
+/// Lives here rather than on `Anomaly` itself because the timeline is the only
+/// consumer that needs prose; the anomaly type stays a plain data enum, and adding
+/// a rendering method to it would make every consumer of the timing crate depend on
+/// this project's phrasing.
+fn describe_anomaly(anomaly: &tpt_app_media_forensics_timing::pts_dts::Anomaly) -> String {
+    use tpt_app_media_forensics_timing::pts_dts::Anomaly;
+    match anomaly {
+        Anomaly::NonMonotonicDts {
+            index,
+            previous,
+            observed,
+        } => format!(
+            "decode timestamp at sample {index} moved backwards from {} to {}",
+            previous.to_timecode(),
+            observed.to_timecode()
+        ),
+        Anomaly::NonMonotonicPts {
+            index,
+            previous,
+            observed,
+        } => format!(
+            "presentation timestamp at sample {index} moved backwards from {} to {}",
+            previous.to_timecode(),
+            observed.to_timecode()
+        ),
+        Anomaly::Gap { index, size } => {
+            format!("a gap of {} precedes sample {index}", size.to_timecode())
+        }
+        Anomaly::Overlap { index, size } => {
+            format!(
+                "sample {index} overlaps the previous by {}",
+                size.to_timecode()
+            )
+        }
+        Anomaly::NegativeTimestamp { index, observed } => format!(
+            "sample {index} carries the negative timestamp {}",
+            observed.to_timecode()
+        ),
     }
 }
 
