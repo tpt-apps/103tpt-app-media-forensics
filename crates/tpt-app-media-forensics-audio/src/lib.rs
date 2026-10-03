@@ -1,8 +1,9 @@
 //! Audio analysis (spec §19-§22).
 //!
 //! Covers codec and channel description, silence, clipping, DC offset, dynamic
-//! range, loudness, and spectral content. Loudness *range* (EBU R128 LRA) is
-//! still absent; everything else named here is implemented.
+//! range, loudness and loudness range, and spectral content. Everything named
+//! here is implemented; the limitations are the ones recorded alongside each
+//! measurement rather than gaps in this list.
 //!
 //! # Methodology must be reported
 //!
@@ -21,7 +22,7 @@ pub use decode::{
     decode as decode_audio, decode_opus_packets, is_decodable as is_audio_decodable, AudioDecode,
     AudioDecodeError, DecodeLimits as AudioDecodeLimits,
 };
-pub use loudness::{integrated_loudness, LoudnessError, SPECIFIED_SAMPLE_RATE};
+pub use loudness::{integrated_loudness, loudness_range, LoudnessError, SPECIFIED_SAMPLE_RATE};
 pub use measurement::{
     amplitude_to_dbfs, find_silence, level_stats, LevelStats, Measurement, Methodology,
     SilenceRegion,

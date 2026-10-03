@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   618 passing
+tests   630 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -62,7 +62,8 @@ one that names the gap:
   container's own declarations, plus HDR static metadata (mastering display,
   content light level) where present
 - **Audio analysis** — channels, silence, clipping, DC offset, dynamic range,
-  loudness, and spectral content (peak frequency, centroid, flatness)
+  integrated loudness and loudness range, and spectral content (peak frequency,
+  centroid, flatness)
 - **Timestamp forensics** — PTS/DTS monotonicity, gaps, overlaps, edit lists,
   A/V offset and drift
 - **Metadata analysis** — structured extraction plus consistency cross-checks

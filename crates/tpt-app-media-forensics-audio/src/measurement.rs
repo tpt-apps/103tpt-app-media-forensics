@@ -23,6 +23,14 @@ pub enum Methodology {
     /// Integrated loudness per ITU-R BS.1770-4, gated, with K-weighting.
     /// Equivalent to EBU R128 integrated loudness.
     ItuBs1770_4,
+    /// Loudness range per EBU Tech 3342: 10th to 95th percentile of 3-second
+    /// short-term loudness.
+    ///
+    /// A separate variant from `ItuBs1770_4` rather than a reuse of it: LRA and
+    /// integrated loudness are different quantities computed with different
+    /// windows, and printing one under the other's name would make two
+    /// incompatible numbers look comparable.
+    EbuR128Lra,
     /// Sample-peak / true-peak style level measurement relative to full scale.
     Dbfs,
     /// A detection threshold on sample amplitude.
@@ -51,6 +59,9 @@ impl Methodology {
     pub const fn citation(self) -> &'static str {
         match self {
             Self::ItuBs1770_4 => "ITU-R BS.1770-4 / EBU R128",
+            Self::EbuR128Lra => {
+                "EBU Tech 3342 loudness range, 10th-95th percentile of 3s short-term loudness"
+            }
             Self::Dbfs => "dB relative to digital full scale",
             Self::AmplitudeThreshold => "sample amplitude threshold",
             Self::SampleMean => "arithmetic mean of signed samples",
@@ -99,6 +110,9 @@ impl Measurement {
     pub fn describe(&self) -> String {
         let unit = match self.methodology {
             Methodology::ItuBs1770_4 => " LUFS",
+            // LU, not LUFS: LRA is a *range* between two loudness figures, and
+            // "LUFS" would present a span as if it were an absolute level.
+            Methodology::EbuR128Lra => " LU",
             Methodology::Dbfs => " dBFS",
             Methodology::AmplitudeThreshold
             | Methodology::SampleMean

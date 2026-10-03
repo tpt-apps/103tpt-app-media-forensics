@@ -102,23 +102,31 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       every file — each had tests, all of which hand-built the bundle. Verified
       now against real Opus decoded from a real WebM file.
 - [x] Implement spectral analysis (FFT) and loudness-range measurement
-      **FFT is done**; loudness *range* (EBU R128 LRA) is not.
-      `-audio/src/spectral.rs`: 2048-point Hann-windowed FFT at 50% overlap,
-      reporting peak frequency, spectral centroid, Wiener flatness, and
-      low/high energy ratios. Every figure carries
-      `Methodology::HannWindowFft`, because spec §21 forbids reporting a number
-      without the method behind it and a spectrum with different window
-      parameters is a different measurement, not a rougher one. The window's
-      1.5-bin equivalent noise bandwidth is reported so a reader knows what one
-      bin is worth.
+      **Both halves are now done**, completing §22.
+      **FFT:** `-audio/src/spectral.rs`, 2048-point Hann-windowed FFT at 50%
+      overlap, reporting peak frequency, spectral centroid, Wiener flatness, and
+      low/high energy ratios. Every figure carries `Methodology::HannWindowFft`,
+      because spec §21 forbids reporting a number without the method behind it
+      and a spectrum with different window parameters is a different measurement,
+      not a rougher one. The window's 1.5-bin equivalent noise bandwidth is
+      reported so a reader knows what one bin is worth.
       Two decisions worth recording: energy is accumulated in linear power rather
       than dB, because summing decibels depends on how many bins you added; and
-      floored bins count as *no* energy rather than as a very quiet level,
-      because converting them back to linear magnitude and summing invented
-      enough power for digital silence to report a spectral centroid. Both were
-      caught by tests written for the obvious behaviour.
-      **Not done:** loudness range (EBU R128 short-term loudness range), which is
-      the remaining half of §22.
+      floored bins count as *no* energy rather than as a very quiet level, because
+      converting them back to linear magnitude and summing invented enough power
+      for digital silence to report a spectral centroid. Both were caught by tests
+      written for the obvious behaviour.
+      **Loudness range:** `loudness_range` in `-audio/src/loudness.rs`, per EBU
+      Tech 3342 — the 10th to 95th percentile of 3-second short-term loudness.
+      Reuses the existing BS.1770-4 K-weighting; `block_loudness_series` was
+      generalised over window length rather than duplicated. The same -70 LUFS
+      absolute gate applies, without which silent blocks would drag the 10th
+      percentile to the floor and a silent file would report a huge range.
+      `Methodology::EbuR128Lra` is a *separate* variant from `ItuBs1770_4` and
+      renders in **LU, not LUFS** — a range printed as LUFS presents a span as an
+      absolute level. A 2-second file gets `TooShortForShortTerm`, distinct from
+      `TooShort`, because it is long enough for integrated loudness and too short
+      for LRA and saying so is the point.
 - [x] Implement A/V synchronisation analysis (§23) — initial offset, final
       offset, and drift measured over the span
       **Note:** spec §23 names `tpt-av-sync` for this, but that crate is a CRDT

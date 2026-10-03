@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Loudness range, and why its unit is LU rather than LUFS
+- `loudness_range` per EBU Tech 3342: the 10th to 95th percentile of 3-second
+  short-term loudness. This completes §22
+- It reuses the existing BS.1770-4 K-weighting rather than duplicating it:
+  `block_loudness_series` was generalised over window length. Integrated loudness
+  uses 400 ms blocks, LRA uses 3 s, and both step at 75 % overlap
+- `Methodology::EbuR128Lra` is a separate variant from `ItuBs1770_4`, and renders
+  in **LU**, not LUFS. LRA is a span between two loudness figures; printing it as
+  LUFS presents a range as though it were an absolute level, and a reader would
+  compare it against a delivery target it cannot be compared against
+- The -70 LUFS absolute gate applies here too. Without it, silent blocks between
+  passages drag the 10th percentile to the floor and a silent file reports an
+  enormous range. A file that is silent throughout reports 0 LU, not 70
+- `TooShortForShortTerm` is distinct from `TooShort` because a 2-second file is
+  long enough for integrated loudness and too short for LRA. One shared message
+  would hide that the two measurements need different amounts of audio
+- LRA cannot see anything shorter than 3 seconds. A click or a sub-3-second edit
+  is invisible to it, and the window length is stated with the figure so a reader
+  knows what the measurement could not have observed
+
 #### The dBFS floor was inventing energy, and digital silence reported a centroid
 - Every bin below a threshold was floored at -200 dBFS rather than reporting
   `-inf`. That is right on its own: `-inf` propagates into any sum computed from
