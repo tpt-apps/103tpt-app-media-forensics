@@ -430,7 +430,7 @@ impl Store {
         // The table name cannot be a bound parameter. It comes from engine code
         // and a test, never from analyst input, so it is validated rather than
         // interpolated blindly.
-        const TABLES: [&str; 9] = [
+        const TABLES: [&str; 10] = [
             "cases",
             "assets",
             "analyses",
@@ -438,6 +438,7 @@ impl Store {
             "findings",
             "finding_reviews",
             "evidence",
+            "rule_results",
             "reports",
             "notes",
         ];
@@ -721,10 +722,16 @@ impl Store {
     }
 
     /// Returns the most recent analysis in a case, if any.
+    ///
+    /// Ordered by `started_at`, not by `id`. An analysis id is derived from the
+    /// asset content and cache key, so it carries no chronological meaning:
+    /// ordering by it returns whichever run happens to hash lowest, which for a
+    /// re-analysis of the same file is the *older* run. `id` breaks ties so two
+    /// runs started in the same second still come back in a stable order (§77).
     pub fn latest_analysis(&self, case_id: &str) -> rusqlite::Result<Option<StoredAnalysis>> {
         let mut stmt = self.connection.prepare(
     "SELECT id, case_id, asset_id, cache_key, finding_count, rule_count, profile, profile_fingerprint, rule_set_fingerprint, started_at FROM analyses \
-     WHERE case_id = ?1 ORDER BY id LIMIT 1",
+     WHERE case_id = ?1 ORDER BY started_at DESC, id DESC LIMIT 1",
 )?;
         let mut rows = stmt.query([case_id])?;
         let Some(row) = rows.next()? else {
@@ -744,15 +751,26 @@ impl Store {
         }))
     }
 
-    /// Returns the case identifier recorded for a case directory.
+    /// Returns the case identifier when the database holds exactly one case.
+    ///
+    /// `None` both when the database is empty and when it holds several. That is
+    /// the point of the method: a CLI using it to skip a `--case` argument must be
+    /// given nothing when the choice is ambiguous. Returning the first case
+    /// regardless would silently pick one, which in a forensic tool is worse than
+    /// refusing.
     pub fn only_case_id(&self) -> rusqlite::Result<Option<String>> {
         let mut stmt = self
             .connection
-            .prepare("SELECT id FROM cases ORDER BY id LIMIT 1")?;
+            .prepare("SELECT id FROM cases ORDER BY id LIMIT 2")?;
         let mut rows = stmt.query([])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row.get(0)?)),
-            None => Ok(None),
+
+        let Some(first) = rows.next()? else {
+            return Ok(None);
+        };
+        let first: String = first.get(0)?;
+        if rows.next()?.is_some() {
+            return Ok(None);
         }
+        Ok(Some(first))
     }
 }

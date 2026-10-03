@@ -474,3 +474,194 @@ fn recording_a_review_leaves_the_observation_untouched() {
         "the engine's own words must survive a review"
     );
 }
+
+#[test]
+fn a_report_is_recorded_against_its_case() {
+    let store = seeded_store();
+    let id = store
+        .insert_report("case-1", Some("an1"), "pdf", "reports/a1.pdf", "d1")
+        .expect("a report must be recordable");
+
+    let (format, path, digest): (String, String, String) = store
+        .connection()
+        .query_row(
+            "SELECT format, relative_path, sha256 FROM reports WHERE id = ?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("report row exists");
+
+    assert_eq!(format, "pdf");
+    assert_eq!(path, "reports/a1.pdf");
+    assert_eq!(digest, "d1");
+}
+
+#[test]
+fn regenerating_the_same_report_updates_its_digest_rather_than_duplicating_it() {
+    let store = seeded_store();
+    let first = store
+        .insert_report("case-1", Some("an1"), "pdf", "reports/a1.pdf", "d1")
+        .expect("first report");
+    let second = store
+        .insert_report("case-1", Some("an1"), "pdf", "reports/a1.pdf", "d2")
+        .expect("regenerated report");
+
+    assert_eq!(first, second, "the same report must keep its identifier");
+    assert_eq!(store.count("reports").expect("counted"), 1);
+    let digest: String = store
+        .connection()
+        .query_row("SELECT sha256 FROM reports WHERE id = ?1", [&first], |r| {
+            r.get(0)
+        })
+        .expect("report row exists");
+    assert_eq!(digest, "d2", "the newer digest must win");
+}
+
+#[test]
+fn a_report_with_no_analysis_is_recorded() {
+    // A report generated from a case rather than a single run has no analysis to
+    // point at. The column is nullable for exactly that reason.
+    let store = seeded_store();
+    store
+        .insert_report("case-1", None, "json", "reports/case.json", "d1")
+        .expect("a case-level report must be recordable");
+
+    assert_eq!(store.count("reports").expect("counted"), 1);
+}
+
+#[test]
+fn the_latest_analysis_is_returned_by_start_time() {
+    let store = seeded_store();
+    let later = StoredAnalysis {
+        id: "an2".to_owned(),
+        cache_key: "k2".to_owned(),
+        started_at: 1_700_000_500,
+        ..StoredAnalysis {
+            id: "an1".to_owned(),
+            case_id: "case-1".to_owned(),
+            asset_id: asset_id().to_string(),
+            cache_key: "k".to_owned(),
+            finding_count: 1,
+            rule_count: 1,
+            profile: "default".to_owned(),
+            profile_fingerprint: "pf".to_owned(),
+            rule_set_fingerprint: "rs".to_owned(),
+            started_at: 1_700_000_000,
+        }
+    };
+    store.insert_analysis(&later).expect("second analysis");
+
+    let latest = store
+        .latest_analysis("case-1")
+        .expect("reads")
+        .expect("a case with analyses has a latest");
+    assert_eq!(
+        latest.started_at, 1_700_000_500,
+        "the newest run must win, not the alphabetically first id"
+    );
+}
+
+#[test]
+fn a_case_with_no_analyses_has_no_latest() {
+    let store = Store::open_in_memory().expect("opens");
+    store.upsert_case("empty", "Empty", None).expect("case");
+    assert!(
+        store.latest_analysis("empty").expect("reads").is_none(),
+        "no run means no latest run, not an error"
+    );
+}
+
+#[test]
+fn rules_that_raised_nothing_are_still_recorded() {
+    // A case shows what was considered, so a rule that ran and found nothing is
+    // part of the record (spec §35).
+    let store = seeded_store();
+    let rules: Vec<String> = ["VIDEO.A", "VIDEO.B", "AUDIO.C"]
+        .iter()
+        .map(|r| (*r).to_owned())
+        .collect();
+    store
+        .insert_rule_results("an1", &rules)
+        .expect("rules recorded");
+
+    assert_eq!(store.count("rule_results").expect("counted"), 3);
+}
+
+#[test]
+fn recording_the_same_rule_twice_does_not_duplicate_it() {
+    let store = seeded_store();
+    let rules = vec!["VIDEO.A".to_owned()];
+    store.insert_rule_results("an1", &rules).expect("first");
+    store.insert_rule_results("an1", &rules).expect("second");
+
+    assert_eq!(
+        store.count("rule_results").expect("counted"),
+        1,
+        "a re-run must not inflate the count of rules considered"
+    );
+}
+
+#[test]
+fn the_only_case_id_is_reported_when_there_is_exactly_one() {
+    let store = seeded_store();
+    assert_eq!(
+        store.only_case_id().expect("reads").as_deref(),
+        Some("case-1")
+    );
+}
+
+#[test]
+fn there_is_no_only_case_id_when_a_database_holds_several() {
+    // A caller using this to skip a `--case` argument must be given nothing when the
+    // choice is ambiguous, rather than one arbitrary case.
+    let store = seeded_store();
+    store
+        .upsert_case("case-2", "Second", None)
+        .expect("second case");
+
+    assert!(
+        store.only_case_id().expect("reads").is_none(),
+        "two cases means the choice is not determined"
+    );
+}
+
+#[test]
+fn an_empty_database_has_no_only_case_id() {
+    let store = Store::open_in_memory().expect("opens");
+    assert!(store.only_case_id().expect("reads").is_none());
+}
+
+#[test]
+fn a_transaction_rolls_back_on_failure() {
+    let mut store = seeded_store();
+    let result = store.transaction(|tx| {
+        tx.execute(
+            "INSERT INTO cases (id, name) VALUES ('case-2', 'Partial')",
+            [],
+        )?;
+        Err::<(), rusqlite::Error>(rusqlite::Error::QueryReturnedNoRows)
+    });
+
+    assert!(
+        result.is_err(),
+        "the closure failed, so the transaction must"
+    );
+    assert_eq!(
+        store.count("cases").expect("counted"),
+        1,
+        "the case written before the failure must not survive"
+    );
+}
+
+#[test]
+fn a_transaction_commits_when_the_closure_succeeds() {
+    let mut store = seeded_store();
+    store
+        .transaction(|tx| {
+            tx.execute("INSERT INTO cases (id, name) VALUES ('case-2', 'Good')", [])?;
+            Ok(())
+        })
+        .expect("commits");
+
+    assert_eq!(store.count("cases").expect("counted"), 2);
+}

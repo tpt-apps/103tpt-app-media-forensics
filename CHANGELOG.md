@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Three more bugs, all found by writing tests for untested functions
+- Last session's review bug made me check every store method for coverage. Seven had
+  none. Writing tests for them turned up **three more real bugs** — so the pattern
+  generalises: a `pub fn` with no test is an unknown, not an assumed-correct one
+- **`latest_analysis` ordered by `id`, not time.** An analysis id is derived from
+  asset content plus cache key, so it carries no chronological meaning — ordering by
+  it returns whichever run hashes lowest, which for a re-analysis of the same file
+  is the *older* run. Now `ORDER BY started_at DESC, id DESC`, with `id` breaking
+  ties so same-second runs stay stable
+- **`only_case_id` did not check that there was only one.** Named for exactly that
+  guarantee, it returned the first case regardless of how many existed. A CLI using
+  it to skip a `--case` argument would have silently analysed the wrong case. Now
+  fetches two and returns `None` if a second exists — refusing beats guessing in a
+  forensic tool
+- **`count`'s table allowlist was missing `rule_results`.** The table exists and is
+  written by `insert_rule_results`, but counting it returned
+  `InvalidParameterName("unknown table")`. The allowlist was correct in spirit and
+  had drifted from the schema
+- Also pinned: report regeneration updates its digest rather than duplicating the
+  row, a report with no analysis is recordable, re-recording a rule does not inflate
+  the rule count, and both transaction outcomes (commit and rollback)
+
 #### The review workflow could never have worked on any file
 - **Bug: `insert_finding` omitted `analysis_id` from its review insert.** The
   column is `NOT NULL`, so *every* reviewed finding was rejected by the database
