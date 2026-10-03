@@ -43,6 +43,7 @@ use crate::acquisition;
 use crate::cache::{AnalysisCache, CacheEntry};
 use crate::case_dir::CaseDirectory;
 use crate::error::CoreError;
+use crate::progress::{ProgressTracker, Stage};
 use crate::store::{Store, StoredAnalysis, StoredAsset};
 
 /// What an analysis produced.
@@ -121,9 +122,33 @@ impl AnalysisEngine {
         source: &Path,
         case_dir: &CaseDirectory,
     ) -> Result<AnalysisOutcome, CoreError> {
+        self.analyse_with(source, case_dir, &ProgressTracker::none())
+    }
+
+    /// Analyses `source`, reporting progress and honouring cancellation.
+    ///
+    /// The same work [`AnalysisEngine::analyse`] does, with a caller-visible
+    /// progress callback and a cancellation token. `analyse` delegates here with
+    /// a silent tracker, so the common path carries no cost and the two cannot
+    /// drift apart in what they compute.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`AnalysisEngine::analyse`] returns, plus
+    /// [`CoreError::Cancelled`] when the tracker is cancelled at a stage boundary.
+    /// A cancelled analysis writes nothing to the case database.
+    pub fn analyse_with(
+        &self,
+        source: &Path,
+        case_dir: &CaseDirectory,
+        progress: &ProgressTracker,
+    ) -> Result<AnalysisOutcome, CoreError> {
+        progress.stage_started(Stage::Acquisition, None, None)?;
+
         // 1. Acquire: hashes and filesystem facts, read-only.
         let asset = acquisition::acquire_asset(source, MediaType::Container)?;
         let mut limitations = Vec::new();
+        progress.stage_finished(Stage::Acquisition)?;
 
         // 2. Cache key: asset content, engine behaviour, profile, rule set.
         let cache_key = CacheKey {
@@ -161,8 +186,9 @@ impl AnalysisEngine {
             });
         }
 
-        let bundle = self.run_stages(source, asset.id, &mut limitations)?;
+        let bundle = self.run_stages(source, asset.id, &mut limitations, progress)?;
         // 6. Rules.
+        progress.stage_started(Stage::Rules, None, None)?;
         let findings =
             self.rules
                 .evaluate(&bundle, &self.profile)
@@ -179,6 +205,7 @@ impl AnalysisEngine {
         let timeline = build_timeline(&bundle, &findings);
 
         // 7. Cache for next time.
+        progress.stage_finished(Stage::Rules)?;
         cache.store(&CacheEntry {
             key: cache_key.clone(),
             findings: findings.clone(),
@@ -195,7 +222,9 @@ impl AnalysisEngine {
         //    without re-analysing. A cache hit deliberately skips this: the
         //    record already exists, and findings are append-only (spec §66).
         if !cache_hit {
+            progress.stage_started(Stage::Persist, None, None)?;
             self.persist(case_dir, &asset, &cache_key, &findings)?;
+            progress.stage_finished(Stage::Persist)?;
         }
 
         // Encoder indicators are derived from the metadata tree and the keyframe
@@ -244,7 +273,10 @@ impl AnalysisEngine {
         source: &Path,
         asset_id: tpt_app_media_forensics_model::AssetId,
         limitations: &mut Vec<String>,
+        progress: &ProgressTracker,
     ) -> Result<AnalysisBundle, CoreError> {
+        progress.stage_started(Stage::ContainerInspection, None, None)?;
+
         // 4. Container inspection.
         //
         // Only the header is read here, and only for the formats that support a
@@ -566,7 +598,7 @@ impl AnalysisEngine {
         };
 
         let mut limitations = Vec::new();
-        match self.run_stages(source, asset.id, &mut limitations) {
+        match self.run_stages(source, asset.id, &mut limitations, &ProgressTracker::none()) {
             Ok(bundle) => (bundle, limitations),
             Err(error) => (
                 empty_bundle(asset.id),

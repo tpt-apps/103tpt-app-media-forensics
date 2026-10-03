@@ -51,6 +51,19 @@ pub enum CoreError {
         bytes_read: u64,
     },
 
+    /// The analysis was cancelled by the caller.
+    ///
+    /// Distinct from an I/O failure: nothing went wrong with the file, the caller
+    /// asked the engine to stop. Carrying it as its own variant is what lets a
+    /// caller retry a cancelled run without treating it as a corrupt asset, and
+    /// lets the CLI report "cancelled" rather than "failed".
+    ///
+    /// Nothing is written to the case database when this is returned. A partial
+    /// analysis record that looked complete would be worse than none, because a
+    /// report built from it would assert measurements never taken.
+    #[error("the analysis was cancelled")]
+    Cancelled,
+
     /// A case directory is missing expected structure.
     #[error("case directory is not initialised: {0}")]
     CaseDirectoryNotInitialised(PathBuf),

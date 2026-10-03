@@ -241,9 +241,28 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       **Bounded memory is done** — acquisition and the container paths read
       through fixed-size buffers with no whole-file allocation, and acquisition
       detects a source changing size mid-read rather than recording a hash of a
-      moving target. **Background workers, cancellation and progress reporting
-      are not:** `-core` has no progress or cancellation type at all, so
-      `docs/architecture.md` no longer claims them.
+      moving target.
+      **Progress and cancellation are now done.** `-core/src/progress.rs`:
+      `Stage` (8 stages, one ordered list so ordinals cannot drift),
+      `Progress::Started`/`Finished` with an optional completed/total pair,
+      `Cancellation` (an `Arc<AtomicBool>` that clones share rather than copy),
+      and `ProgressTracker` which reports *and* checks at each boundary.
+      `AnalysisEngine::analyse_with` is the new entry point; `analyse` delegates
+      to it with a silent tracker, so the common path costs nothing and the two
+      cannot diverge.
+      **Not done: background workers.** The engine is synchronous by design and
+      nothing spawns a runtime — adding async would be a large change for one
+      feature. Callers wanting a UI can run `analyse_with` on their own thread.
+      Cancellation is therefore *cooperative and coarse*: a cancel request during
+      a 90-second decode is observed when that decode returns, because the
+      decoder has no cancellation hook. That limitation is documented on the
+      module and on `Stage`, and `CoreError::Cancelled` is its own variant so a
+      caller can retry without treating it as a corrupt asset. A cancelled run
+      writes nothing to the case database — a partial analysis record that looked
+      complete would be worse than none.
+      Progress deliberately reports no ETA: an estimate on a feature-length master
+      would be wrong by minutes and reads as a promise the engine cannot make.
+      Fractional progress appears only where a total is genuinely known.
 - [ ] Implement file-to-file comparison engine (duration, streams, codec,
       colour, audio, metadata, timestamps, scene structure) (§38–40)
 - [ ] Implement search over case data (§41)

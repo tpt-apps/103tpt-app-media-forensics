@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Progress and cancellation: what is and is not interruptible
+- `-core/src/progress.rs` adds `Stage`, `Progress`, `Cancellation`, and
+  `ProgressTracker`. `Cancellation` is an `Arc<AtomicBool>` that clones *share*
+  rather than copy, so a UI holding a token can stop the worker holding the
+  original. `AnalysisEngine::analyse_with` is the new entry point; `analyse`
+  delegates to it with a silent tracker so the common path costs nothing and the
+  two cannot diverge in what they compute
+- Stage ordinals come from one ordered list rather than numbers hard-coded at each
+  call site. Hard-coded numbers drift, and a progress bar that reaches 100% before
+  the last stage starts is worse than no bar
+- `CoreError::Cancelled` is its own variant, not an I/O failure. Nothing went wrong
+  with the file — the caller asked the engine to stop — and a caller should be able
+  to retry without concluding the asset is corrupt
+- A cancelled analysis writes **nothing** to the case database. A partial
+  analysis record that looked complete would be worse than no record, because a
+  report built from it would assert measurements the engine never took
+- The honest limitation, stated rather than papered over: cancellation is
+  cooperative and coarse. A cancel during a 90-second decode is observed when that
+  decode returns, because the decoder has no cancellation hook. Background workers
+  are **not** implemented — the engine is synchronous by design and nothing spawns a
+  runtime
+- Progress reports no ETA. An estimate on a feature-length master would be wrong
+  by minutes and would read as a commitment the engine cannot make. Fractional
+  progress appears only where a total is genuinely known
+- A cancelled stage is not announced as having started. A progress bar counting a
+  stage that never ran is a small lie about what the engine did
+
 #### Frame timestamps were off by a factor of a million
 - The decoder's `Timestamp` carries a rational time base `(num, den)` meaning
   `num/den` seconds per tick. The first version of `media_time` passed

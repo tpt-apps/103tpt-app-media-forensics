@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   657 passing
+tests   672 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -77,6 +77,9 @@ one that names the gap:
 - **Rule-driven findings** — severity, confidence, timeline placement, and an
   explanation of what was observed and what it does not establish
 - **Reports** — PDF, HTML, JSON, CSV, all reproducible
+- **Progress and cancellation** — stage-by-stage progress with an honest
+  cancellation token; a cancelled run writes nothing rather than leaving a
+  partial record that looks complete
 
 ### Planned, not built
 

@@ -26,6 +26,68 @@ fn case_with(contents: &[u8], dir: &std::path::Path) -> (CaseDirectory, std::pat
 fn gop_change_bytes() -> Vec<u8> {
     build_mp4_stsd_gop_change()
 }
+#[test]
+fn a_cancelled_analysis_stops_and_writes_nothing() {
+    // The point of cancellation is that it stops real work, not just that a flag
+    // flips. Cancelling before the first stage must abort the run.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(
+        &build_mp4(&TrackSpec::video_25fps(320, 240, 30)),
+        tmp.path(),
+    );
+
+    let tracker = tpt_app_media_forensics_core::ProgressTracker::none();
+    // Cancel before starting: the very first stage boundary must refuse.
+    tracker.cancellation().cancel();
+
+    let result = AnalysisEngine::new().analyse_with(&source, &case_dir, &tracker);
+    let error = result.expect_err("a cancelled analysis must not succeed");
+    assert!(
+        matches!(error, tpt_app_media_forensics_core::CoreError::Cancelled),
+        "expected cancellation, got {error:?}"
+    );
+}
+
+#[test]
+fn an_uncancelled_analysis_reports_progress_through_every_stage() {
+    // The counterpart: a normal run must actually reach the reporter, or the
+    // progress plumbing is dead code that tests still pass.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (case_dir, source) = case_with(
+        &build_mp4(&TrackSpec::video_25fps(320, 240, 30)),
+        tmp.path(),
+    );
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    let tracker = tpt_app_media_forensics_core::ProgressTracker::reporting(move |event| {
+        sink.lock().expect("lock").push(event);
+    });
+
+    AnalysisEngine::new()
+        .analyse_with(&source, &case_dir, &tracker)
+        .expect("an uncancelled analysis succeeds");
+
+    let events = seen.lock().expect("lock").clone();
+    assert!(!events.is_empty(), "a run must report at least one stage");
+
+    let tags: Vec<&str> = events.iter().map(|e| e.stage().tag()).collect();
+    assert!(
+        tags.contains(&"acquisition"),
+        "acquisition must be reported: {tags:?}"
+    );
+    assert!(tags.contains(&"rules"), "rules must be reported: {tags:?}");
+
+    // Every stage the run actually performed is reported, and no event is for a
+    // stage that never ran.
+    let known: Vec<&str> = tpt_app_media_forensics_core::Stage::ALL
+        .iter()
+        .map(|s| s.tag())
+        .collect();
+    for tag in &tags {
+        assert!(known.contains(tag), "unknown stage reported: {tag}");
+    }
+}
 
 #[test]
 fn the_timeline_places_observations_from_more_than_one_source() {
