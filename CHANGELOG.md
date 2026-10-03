@@ -4,6 +4,100 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### The decoder does not tell you when it drops a frame
+- Completing §30 meant writing decode-failure detection, and the first version of
+  it counted `Err` from the decoder. Testing against real AV1 showed that **the
+  decoder never returns one**: flipping the bytes of a single packet in a
+  nine-packet stream yields eight frames and no error, and a stream of pure
+  garbage yields zero frames and still no error. The first implementation would
+  have reported both files as perfectly clean while measuring nothing at all —
+  the exact failure this product exists to prevent, arrived at by checking the
+  wrong signal
+- **Silence is now read as damage.** A *keyframe* producing no frame is
+  unambiguous: a keyframe references nothing, so no reordering buffer or missing
+  reference can explain it. A *predicted* frame producing nothing genuinely can
+  be reordering, so it is not judged from the return value at all — it is caught
+  by reconciling the **gaps in the recovered frame indices**, which is observable
+  without knowing anything about the decoder's internals
+- **One lost packet is one defect.** A dropped keyframe is diagnosable by both
+  paths; the keyframe diagnosis wins because it says more, and the weaker
+  reconciliation reason stands down. Without that, spec §30's summary line —
+  "Analysis completed with 17 recoverable decode errors" — would have been
+  inflated by counting some packets twice
+- Three tests encode the measurement itself, not just the behaviour: corrupt a
+  predicted frame, corrupt a keyframe, and assert a clean stream stays clean. The
+  last matters most — a detector that fires on intact media is worse than none
+
+#### Graceful continuation is resynchronisation, not persistence
+- `-video::decode::decode_resilient` replaces the stop-at-first-error path. Spec
+  §30 asks that "a scan should continue after recoverable errors", and the
+  previous behaviour answered the *other* question — how much could be decoded —
+  so one corrupt frame near the start ended the examination and said nothing
+  about the rest of the file
+- **It skips to the next keyframe rather than carrying on.** A predicted frame is
+  decoded *from* other frames, so once one is lost, every later predicted frame
+  would be built on a picture that does not exist. Decoding them anyway produces
+  output that decodes without error and is wrong — the worst outcome available
+  here, because a scene-change or near-duplicate finding computed from it reads
+  as a measurement
+- **`scene::analyse` now refuses to compare across a gap.** This was a live bug
+  the moment recovery existed: the analyser walks `windows(2)`, so with frames
+  `[0, 2, 3, …]` it compared frame 0 against frame 2 and measured the difference
+  across one lost frame as a single step. On any real cut that is a large,
+  confident scene change that is an artefact of the recovery rather than an
+  observation about the media. Skipped pairs are counted in
+  `SceneReport::comparisons_skipped` and surfaced as a limitation, so "this file
+  has no scene changes" and "this file could not be examined everywhere" do not
+  read identically
+
+#### Packet-layer corruption, without a decoder
+- `-container/src/packets.rs` asks what is wrong with the *access units* the box
+  list points at. Two typed defects: an access unit containing no bytes, and a
+  sample index declaring more samples than can be read — which is how a truncated
+  file looks from the index even when every box is well-formed
+- **Decoder-free on purpose.** A check that needed a decoder would silently skip
+  every H.264, HEVC and AAC track, which is precisely the set a working
+  professional is most likely to hand over. It also cannot be wrong for the wrong
+  reason: a decode failure is ambiguous between damaged media and a decoder
+  limitation, while "this access unit contains no bytes" is not
+- **A count mismatch is only damage in ISO-BMFF.** There `packet_count` is read
+  from `stsz`; in Matroska it is measured from the packets themselves and agrees
+  by construction, so the defect cannot fire. Stated in the type's documentation
+  rather than left to be discovered
+- **A small sample is not damage.** A low-bitrate frame is legitimately a few
+  dozen bytes. Only zero is impossible, and a threshold below that would report
+  ordinary content as broken — there is a test pinning it
+
+#### Three severities, because these are three different problems
+- `CONTAINER.TRUNCATED_MEDIA` stays Critical/High: declared media is *absent*, so
+  every measurement from the file is partial by construction
+- `CONTAINER.UNREADABLE_PACKET` and `VIDEO.DECODE_FAILURE` are
+  Significant/High: the bytes are present and unusable, a lesser and genuinely
+  different problem from absence
+- Neither new rule asserts a cause. A decode failure is consistent with
+  corruption, a truncated tail, and an encoding the decoder does not implement,
+  and a test asserts the findings never name one of them
+
+#### Two new rules, and the guard that caught both
+- `CONTAINER.UNREADABLE_PACKET` and `VIDEO.DECODE_FAILURE` bring the built-in set
+  to twenty-nine. `docs/rules.md` and the README's rule count were already out of
+  step with the code before this change — the README said 26 while twenty-seven
+  were registered — and both now say 29
+- The stage guard required a fixture for each new rule, as it should: it caught
+  that `CONTAINER.UNREADABLE_PACKET` was unfireable on any file the project
+  owned. `truncated.mp4` reaches it through the sample index, and a new
+  `decode-failure.webm` reaches the decode rule
+- **`decode-failure.webm` is the same stream as `video.av1.webm` with one
+  packet's bytes flipped**, so the pair differs by the damage and nothing else.
+  It is also the case the structural scan cannot see at all: every box parses, no
+  data is missing, and only asking a decoder to make a picture of the samples
+  reveals the defect. Built from real encoded bytes, because a stub payload is
+  undecodable for the uninteresting reason that it was never anything else
+- `no-duration.webm` also fires the decode rule, and that is recorded rather than
+  suppressed. Its video blocks are 32-byte stubs — the project ships no VP9
+  encoder — so they genuinely do not decode and the finding is *true*.
+  Suppressing it would have meant weakening the detector to keep a test quiet
+
 #### `acquire` created a case the database did not know about
 - Writing the `note` command surfaced a gap two sessions in the making:
   `CaseDirectory::create` wrote the manifest but never a `cases` row. `analyze` was

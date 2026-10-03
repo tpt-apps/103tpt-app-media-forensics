@@ -296,6 +296,134 @@ impl ForensicRule for StructuralDefect {
     }
 }
 
+/// Reports access units that cannot be decoded, found without a decoder.
+///
+/// The packet-layer counterpart to [`StructuralDefect`]. That rule reports what is
+/// wrong with the file's *boxes*; this reports what is wrong with the *samples*
+/// those boxes point at, which a well-formed box list says nothing about. A file
+/// can be structurally perfect and still carry an access unit with no bytes in it.
+pub struct UnreadablePacket;
+
+impl ForensicRule for UnreadablePacket {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::PacketDamage]
+    }
+    fn id(&self) -> &'static str {
+        "CONTAINER.UNREADABLE_PACKET"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether any access unit contains no bytes, or whether the container's \
+         sample index declares more samples than could be read."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A sample the index points at cannot be turned into media. Content the \
+         file describes is therefore not usable, and the measurements drawn from \
+         the rest of that track cover only what was readable."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        bundle
+            .packet_damage
+            .iter()
+            .map(|defect| {
+                finding(
+                    self.id(),
+                    bundle,
+                    // Significant rather than Warning. Truncation is graded
+                    // Critical because the bytes are *absent*; here they are
+                    // present but unusable, a different and lesser problem. It is
+                    // still more than a curiosity: a track with an unreadable
+                    // access unit cannot be examined in full.
+                    Severity::Significant,
+                    // High. An access unit with zero bytes is read directly from
+                    // the file and needs no interpretation, and it holds whether
+                    // the cause was corruption, a failed copy, or a muxer bug.
+                    // What the *cause* was is not claimed anywhere.
+                    Confidence::High,
+                    format!("Access unit cannot be decoded ({})", defect.tag()),
+                    vec![defect.describe()],
+                    // Placement is the sample's own timestamp, so this is measured
+                    // where the sample carries a time and absent where the defect
+                    // describes a whole stream.
+                    defect.time(),
+                )
+            })
+            .collect()
+    }
+}
+/// Reports packets a decoder rejected or dropped while recovering.
+///
+/// Separate from [`UnreadablePacket`] because the evidence differs in kind. That
+/// rule measures the file's own bytes and needs no decoder, so it covers H.264
+/// and AAC tracks this engine deliberately never decodes. This one reports what a
+/// verified decoder could and could not make of the bitstream — a stronger
+/// statement about the encoded data, available only for royalty-free codecs.
+pub struct DecodeFailure;
+
+impl ForensicRule for DecodeFailure {
+    fn required_inputs(&self) -> &'static [BundleInput] {
+        &[BundleInput::DecodeDamage]
+    }
+    fn id(&self) -> &'static str {
+        "VIDEO.DECODE_FAILURE"
+    }
+    fn what_it_checks(&self) -> &'static str {
+        "Whether any packet the decoder was given produced no frame, was rejected \
+         outright, or was skipped while resynchronising after an earlier failure."
+    }
+    fn why_it_matters(&self) -> &'static str {
+        "A packet that will not decode is a gap in the examination. Frames either \
+         side of it were still measured, but any pixel analysis spanning the gap \
+         was skipped rather than guessed at, so that region of the file is less \
+         thoroughly examined than the rest."
+    }
+    fn evaluate(&self, bundle: &AnalysisBundle, _profile: &RuleProfile) -> Vec<Finding> {
+        bundle
+            .decode_damage
+            .iter()
+            .enumerate()
+            .map(|(position, defect)| {
+                let mut measurements = vec![defect.describe()];
+
+                // Spec §30's own summary wording, attached to the first finding so
+                // it is stated exactly once rather than repeated per defect.
+                if position == 0 {
+                    measurements.push(format!(
+                        "Analysis completed with {} recoverable decode error(s). Decoding \
+                         continued past each one rather than stopping at the first.",
+                        bundle.decode_damage.len()
+                    ));
+                }
+
+                finding(
+                    self.id(),
+                    bundle,
+                    // Significant. The pixels exist and are undecodable, so this is
+                    // a real defect in the media rather than a structural
+                    // curiosity — but the rest of the track was still analysed,
+                    // which is what separates it from the Critical grade given to
+                    // truncation.
+                    Severity::Significant,
+                    // High, and deliberately so. The decoder is verified
+                    // pixel-exact, and the packet demonstrably yielded no frame
+                    // while its neighbours did, so the observation rests on
+                    // nothing more than a measurement. It says nothing about
+                    // *why* the packet failed: that could be corruption, a
+                    // truncated tail, or an encoding the decoder does not
+                    // implement, and this rule distinguishes none of them.
+                    Confidence::High,
+                    format!("Packet could not be decoded ({})", defect.tag()),
+                    measurements,
+                    // A packet index is not a timecode. Left unplaced rather than
+                    // pinned to zero, so no fabricated `00:00:00` reaches the
+                    // timeline; the packet number above is the position an
+                    // analyst can actually act on.
+                    None,
+                )
+            })
+            .collect()
+    }
+}
+
 /// Reports a change in GOP length at a located position.
 pub struct GopLengthChange;
 
@@ -1648,6 +1776,7 @@ pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
         Box::new(DeclaredTrackMismatch),
         Box::new(DeclaredVsMeasuredMismatch),
         Box::new(DuplicateFrameRun),
+        Box::new(DecodeFailure),
         Box::new(StructuralDefect),
         Box::new(FrameRateChange),
         Box::new(GopLengthChange),
@@ -1664,5 +1793,6 @@ pub fn builtin_rules() -> Vec<Box<dyn ForensicRule>> {
         Box::new(StreamStartOffset),
         Box::new(TimestampGap),
         Box::new(TruncatedMedia),
+        Box::new(UnreadablePacket),
     ]
 }

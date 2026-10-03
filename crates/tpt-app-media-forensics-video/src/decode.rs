@@ -137,6 +137,160 @@ impl std::fmt::Display for DecodeAbort {
 
 impl std::error::Error for DecodeAbort {}
 
+/// A recoverable fault encountered while decoding, recorded rather than fatal.
+///
+/// # Why this is a type and not a string
+///
+/// Spec §30 asks the report to say "Analysis completed with 17 recoverable
+/// decode errors". Counting is the easy half. What makes the statement worth
+/// anything is that the errors can be told apart: a packet the decoder *rejected*
+/// is different from a frame whose pixel layout was unusable, and both are
+/// different from a run of frames skipped because their references were lost.
+/// A free-text string collapses all three into one number an analyst cannot act
+/// on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeDamage {
+    /// The decoder rejected this packet.
+    ///
+    /// The strongest statement in this type: a verified, pixel-exact decoder
+    /// could not parse bytes a container presents as a valid access unit.
+    ///
+    /// Still not a statement about *why*. A rejected packet is consistent with
+    /// corruption, with a truncated tail, and with an encoding the decoder does
+    /// not implement, and nothing here distinguishes them.
+    PacketFailed {
+        /// Index of the packet within the stream, zero-based.
+        packet: usize,
+        /// Whether the failed packet was a random-access point.
+        ///
+        /// Load-bearing for everything that follows: a keyframe is independent,
+        /// so the decoder resynchronises at the next one. A *predicted* frame
+        /// that fails destroys the reference the following frames are built on.
+        is_key_frame: bool,
+        /// What the decoder reported.
+        reason: String,
+    },
+
+    /// Frames skipped while waiting to resynchronise.
+    ///
+    /// Produced when a predicted frame fails. Its reference is gone, so every
+    /// later predicted frame would decode against a picture that no longer
+    /// exists — and would produce something that *looks* like a frame.
+    ///
+    /// Recording the span rather than silently dropping the packets is the whole
+    /// point: an analyst reading "decoded 40 frames" must be able to find out
+    /// that 12 more were present and could not be used.
+    LostReference {
+        /// Index of the first packet skipped.
+        from_packet: usize,
+        /// How many packets were skipped before the next keyframe.
+        skipped: usize,
+    },
+
+    /// A frame decoded but could not be used.
+    ///
+    /// The decoder succeeded and the result was still unusable — an unsupported
+    /// pixel format, or a buffer shorter than the frame's own dimensions.
+    UnusableFrame {
+        /// Index of the packet that produced it.
+        packet: usize,
+        /// Why it could not be used.
+        reason: String,
+    },
+}
+
+impl DecodeDamage {
+    /// Returns the stable tag used in rule IDs and report output.
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::PacketFailed { .. } => "packet_failed",
+            Self::LostReference { .. } => "lost_reference",
+            Self::UnusableFrame { .. } => "unusable_frame",
+        }
+    }
+
+    /// The packet index this defect sits at.
+    #[must_use]
+    pub fn packet(&self) -> usize {
+        match self {
+            Self::PacketFailed { packet, .. } | Self::UnusableFrame { packet, .. } => *packet,
+            Self::LostReference { from_packet, .. } => *from_packet,
+        }
+    }
+
+    /// Whether this defect means a frame the file describes could not be read.
+    ///
+    /// Always true, and that is the difference from structural damage. There,
+    /// appended bytes are present-but-unexplained. Here every variant is a case
+    /// where an access unit the container declares could not be turned into an
+    /// image.
+    #[must_use]
+    pub fn is_missing_data(&self) -> bool {
+        true
+    }
+
+    /// Renders the damage as a single line for an anomaly list.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::PacketFailed {
+                packet,
+                is_key_frame,
+                reason,
+            } => format!(
+                "packet {packet} ({}) was rejected by the decoder: {reason}",
+                if *is_key_frame { "keyframe" } else { "predicted" }
+            ),
+            Self::LostReference {
+                from_packet,
+                skipped,
+            } => format!(
+                "{skipped} packet(s) from index {from_packet} were skipped: they are predicted \
+                 frames whose reference was lost, and decoding them would have produced pictures \
+                 built on a frame that does not exist"
+            ),
+            Self::UnusableFrame { packet, reason } => {
+                format!("packet {packet} decoded to a frame that could not be used: {reason}")
+            }
+        }
+    }
+}
+
+/// The outcome of a resilient decode: what was recovered, what was not, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DecodeRun {
+    /// Frames that decoded cleanly and could be used.
+    ///
+    /// Each frame's `index` is the **packet** index it came from, so a gap in
+    /// those values marks frames that were lost. Consumers comparing a frame to
+    /// its predecessor must honour that gap rather than treating this vector as
+    /// contiguous — see `-video::scene`.
+    pub frames: Vec<DecodedFrame>,
+    /// Every recoverable fault, in the order encountered.
+    pub damage: Vec<DecodeDamage>,
+    /// Why the run ended, when it ended early.
+    ///
+    /// `None` means the stream was fully processed. A run that *stopped* still
+    /// returns every frame and every fault it recovered, because a partial decode
+    /// of a damaged file is still evidence about it.
+    pub stopped: Option<DecodeError>,
+}
+
+impl DecodeRun {
+    /// Number of recoverable faults, for the spec §30 summary line.
+    #[must_use]
+    pub fn recoverable_error_count(&self) -> usize {
+        self.damage.len()
+    }
+
+    /// Whether the run completed with no fault of any kind.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.damage.is_empty() && self.stopped.is_none()
+    }
+}
+
 /// A decoder for one of the supported royalty-free codecs.
 enum Backend {
     Vp9(Box<Vp9Decoder>),
@@ -349,6 +503,265 @@ impl DecodeSession {
         Ok(frames)
     }
 
+    /// Decodes as much of the stream as possible, recording faults as it goes.
+    ///
+    /// This is the entry point an examination uses, and the one that implements
+    /// spec §30's requirement that "a scan should continue after recoverable
+    /// errors". [`Self::decode_prefix`] returns at the first bad packet, which
+    /// was a reasonable reading of "how much can I decode" and the wrong one for
+    /// "what is wrong with this file": a single corrupt frame near the start
+    /// silently ends the examination and reports nothing about the rest.
+    ///
+    /// # What continuing actually means
+    ///
+    /// Resynchronisation, not persistence. When a packet fails the decoder's
+    /// reference state is gone for good: a predicted frame is decoded *from*
+    /// other frames, so once one is lost, every later predicted frame would be
+    /// built on a picture that does not exist. Feeding them anyway produces
+    /// output that decodes without error and is nevertheless wrong — and a
+    /// plausible-looking wrong frame is the worst outcome this engine can
+    /// produce, because a scene-change or near-duplicate finding computed from it
+    /// reads as a measurement.
+    ///
+    /// So after a failure the session **skips forward to the next keyframe**,
+    /// where decoding is self-contained and the pixels really are the media's.
+    /// The skipped span is recorded as [`DecodeDamage::LostReference`] rather
+    /// than dropped, so a gap between recovered frames is visible in the report
+    /// instead of being a silent hole in a frame count.
+    ///
+    /// # What it never does
+    ///
+    /// It never guesses. Frames it could not decode are not interpolated,
+    /// repeated from the previous frame, or substituted from elsewhere — every
+    /// number downstream comes only from frames that genuinely decoded.
+    #[must_use]
+    pub fn decode_resilient(&mut self, packets: &[(Vec<u8>, bool)]) -> DecodeRun {
+        let mut run = DecodeRun::default();
+        // Packet whose failure we are still recovering from. `None` means the
+        // decoder is in sync and every packet can be attempted.
+        let mut lost_from: Option<usize> = None;
+
+        for (index, (data, is_key_frame)) in packets.iter().enumerate() {
+            if self.decoded >= self.limits.max_frames {
+                run.stopped = Some(DecodeError::LimitReached {
+                    limit: "the frame limit",
+                    decoded: self.decoded,
+                });
+                break;
+            }
+
+            // Resynchronising: wait for a keyframe. Anything skipped here is
+            // still accounted for, so the frame count can always be reconciled
+            // against the packet count.
+            if lost_from.is_some() && !is_key_frame {
+                continue;
+            }
+
+            let packet = Packet {
+                pts: Timestamp::new(index as i64, self.timebase),
+                dts: Timestamp::new(index as i64, self.timebase),
+                data: data.clone(),
+                stream_index: 0,
+                is_key_frame: *is_key_frame,
+            };
+
+            match decode_guarded(&mut self.backend, &packet) {
+                Ok(Some(frame)) => {
+                    self.decoded += 1;
+                    // A clean keyframe closes the previous loss, whatever the size
+                    // of the span that led here.
+                    if let Some(from) = lost_from.take() {
+                        run.damage.push(DecodeDamage::LostReference {
+                            from_packet: from,
+                            skipped: index.saturating_sub(from),
+                        });
+                    }
+                    self.retain(index, *is_key_frame, frame, &mut run);
+                    // `retain` sets `stopped` when the in-memory limit is hit, so
+                    // the check belongs here rather than at the top of the loop:
+                    // the frame count has not moved, and only `retain` knows.
+                    if run.stopped.is_some() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    // The decoder produced no picture and reported no error.
+                    //
+                    // This is not hypothetical, and it is the single most
+                    // important thing this module knows about the decoders behind
+                    // it: feeding an AV1 stream with one packet's bytes flipped
+                    // yields 8 frames from 9 packets, with **no error anywhere**.
+                    // Pure garbage yields 0 frames from 5 packets, still no error.
+                    // A build that only counted `Err` would report such a file as
+                    // perfectly clean while measuring nothing at all.
+                    //
+                    // So silence is read as damage, with one soundness guard: only
+                    // a **keyframe** counts. A keyframe is self-contained by
+                    // definition — it references nothing — so a decoder emitting no
+                    // picture for one cannot be holding it back for reordering or
+                    // waiting on a reference. A *predicted* frame yielding nothing
+                    // is genuinely ambiguous, and is left unrecorded rather than
+                    // guessed at.
+                    if *is_key_frame {
+                        run.damage.push(DecodeDamage::PacketFailed {
+                            packet: index,
+                            is_key_frame: true,
+                            reason: "the decoder produced no frame for a keyframe. A keyframe \
+                                     references no other frame, so there is no reordering or \
+                                     missing-reference reason for it to yield nothing; the \
+                                     packet was not decodable"
+                                .to_owned(),
+                        });
+                        // A keyframe is self-contained, so losing it leaves the
+                        // decoder in sync — the next keyframe needs nothing from it.
+                        // `lost_from` is deliberately not set.
+                    }
+                }
+                Err(error) => {
+                    run.damage.push(DecodeDamage::PacketFailed {
+                        packet: index,
+                        is_key_frame: *is_key_frame,
+                        reason: error.detail,
+                    });
+
+                    // A failed *keyframe* still leaves the decoder in sync — it is
+                    // self-contained, so the next one needs nothing from it. A
+                    // failed *predicted* frame destroys the reference chain, so
+                    // the frames after it must not be attempted.
+                    if !*is_key_frame && lost_from.is_none() {
+                        lost_from = Some(index);
+                    }
+                }
+            }
+        }
+
+        // A loss still open at the end of the stream never found its keyframe.
+        // Recorded so the skipped tail is accounted for; dropping it would let a
+        // run report a clean finish over a truncated track.
+        if let Some(from) = lost_from {
+            run.damage.push(DecodeDamage::LostReference {
+                from_packet: from,
+                skipped: packets.len().saturating_sub(from),
+            });
+        }
+
+        Self::reconcile(&mut run, packets.len());
+        run
+    }
+
+    /// Finds packets that vanished without the decoder saying so.
+    ///
+    /// The decoder behind this session does not report undecodable packets: an
+    /// AV1 stream with one packet's bytes flipped yields eight frames from nine
+    /// packets and raises nothing at all. The `Ok(None)` arm catches that when
+    /// the victim is a keyframe, but a **predicted** frame dropped the same way is
+    /// indistinguishable from reordering at the call site — and ignoring that case
+    /// would mean reporting a damaged file as clean.
+    ///
+    /// So the gap is used as the evidence instead. Every recovered frame carries
+    /// the packet index it came from, so a hole in that sequence is a packet that
+    /// was presented and produced no picture. That is observable without knowing
+    /// anything about the decoder's internals, which is what makes it a sound
+    /// check rather than a guess.
+    ///
+    /// Deliberately **not** recorded for spans already accounted for by
+    /// [`DecodeDamage::LostReference`]: this session skipped those packets itself,
+    /// knows exactly which ones, and has already said so. Recording them twice
+    /// would inflate the count spec §30 asks the report to print.
+    fn reconcile(run: &mut DecodeRun, packet_count: usize) {
+        // Spans this session skipped deliberately, as (first, last) inclusive.
+        let explained: Vec<(usize, usize)> = run
+            .damage
+            .iter()
+            .filter_map(|d| match d {
+                DecodeDamage::LostReference {
+                    from_packet,
+                    skipped,
+                } => Some((
+                    *from_packet,
+                    from_packet.saturating_add(*skipped).saturating_sub(1),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        let mut missing: Vec<usize> = Vec::new();
+        let mut expected = 0usize;
+        for frame in &run.frames {
+            while expected < frame.index {
+                missing.push(expected);
+                expected = expected.saturating_add(1);
+            }
+            expected = frame.index.saturating_add(1);
+        }
+        // A trailing gap means the decoder stopped emitting before the stream
+        // ended, which is the same kind of loss.
+        while expected < packet_count {
+            missing.push(expected);
+            expected = expected.saturating_add(1);
+        }
+
+        for packet in missing {
+            if explained
+                .iter()
+                .any(|(first, last)| packet >= *first && packet <= *last)
+            {
+                continue;
+            }
+            // Already named by the `Ok(None)` arm. One lost packet is one defect,
+            // and spec §30 has the report print a *count* of them — counting it
+            // twice would inflate a number an analyst is meant to rely on. The
+            // keyframe diagnosis is kept because it says more, so the weaker
+            // reconciliation reason stands down rather than the other way round.
+            if run.damage.iter().any(|d| d.packet() == packet) {
+                continue;
+            }
+            run.damage.push(DecodeDamage::PacketFailed {
+                packet,
+                is_key_frame: false,
+                reason: "the decoder returned no frame for this packet and reported no error. \
+                         Neighbouring packets did produce frames, so this one was presented and \
+                         dropped rather than never read"
+                    .to_owned(),
+            });
+        }
+    }
+
+    /// Reduces one decoded frame into the run, recording it or stopping on it.
+    ///
+    /// Split out so the body of [`Self::decode_resilient`] reads as the
+    /// resynchronisation policy rather than as buffer management.
+    fn retain(
+        &mut self,
+        index: usize,
+        is_key_frame: bool,
+        frame: VideoFrame,
+        run: &mut DecodeRun,
+    ) {
+        let Some(reduced) = reduce(index, is_key_frame, frame) else {
+            run.damage.push(DecodeDamage::UnusableFrame {
+                packet: index,
+                reason: "the decoder produced a frame this build cannot use: an unsupported \
+                         pixel format, or a buffer shorter than the frame's own dimensions"
+                    .to_owned(),
+            });
+            return;
+        };
+
+        if run.frames.len() >= self.limits.max_frames_in_memory {
+            // The frame decoded but there is nowhere to put it. Reported as the
+            // limit it is rather than as a second defect, so that one cause is
+            // not counted twice, and the frame is kept so the count of what was
+            // recovered stays honest.
+            run.stopped = Some(DecodeError::LimitReached {
+                limit: "the in-memory frame limit",
+                decoded: run.frames.len(),
+            });
+        }
+
+        run.frames.push(reduced);
+    }
+
     /// Decodes the packets and returns whatever succeeded, plus why it stopped.
     ///
     /// Unlike [`Self::decode_all`], a limit or a decode failure ends the session
@@ -510,7 +923,275 @@ mod tests {
         assert!(error.to_string().contains("avc1"));
     }
 
+    /// Encodes `count` real AV1 frames with a keyframe every 3, as a GOP holding
+    /// both keyframe and predicted packets.
+    ///
+    /// Real encoded bytes, because the defect pinned here is a property of the
+    /// decoder's *behaviour* on damaged input. Synthetic frames would let a
+    /// regression in the detector pass without ever touching a real bitstream.
+    fn encode_av1_gop(count: usize) -> Vec<(Vec<u8>, bool)> {
+        use tpt_kinetix_av1::{Av1Encoder, Av1EncoderConfig};
+        use tpt_kinetix_core::frame::VideoFrame;
+        use tpt_kinetix_core::pixel_format::PixelFormat;
+        use tpt_kinetix_core::timestamp::Timestamp;
+
+        const W: u32 = 64;
+        const H: u32 = 48;
+
+        let picture = |level: u8| {
+            let (w, h) = (W as usize, H as usize);
+            let mut data = vec![0u8; w * h + (w * h) / 2];
+            for y in 0..h {
+                for x in 0..w {
+                    data[y * w + x] = (level as usize + x + y) as u8;
+                }
+            }
+            for sample in data.iter_mut().skip(w * h) {
+                *sample = 128;
+            }
+            VideoFrame {
+                pts: Timestamp::new(0, (1, 1000)),
+                dts: Timestamp::new(0, (1, 1000)),
+                data,
+                width: W,
+                height: H,
+                pixel_format: PixelFormat::Yuv420p,
+                is_key_frame: true,
+            }
+        };
+
+        let mut encoder = Av1Encoder::new(&Av1EncoderConfig {
+            width: W,
+            height: H,
+            bitrate: 0,
+            quantizer: 80,
+            speed: 10,
+            keyframe_interval: 3,
+        })
+        .expect("encoder");
+
+        let mut packets = Vec::new();
+        for index in 0..count {
+            if let Some(packet) = encoder
+                .encode_frame(&picture((index * 30) as u8))
+                .expect("encodes")
+            {
+                packets.push((packet.data, packet.is_key_frame));
+            }
+        }
+        packets.extend(
+            encoder
+                .flush()
+                .expect("flush")
+                .into_iter()
+                .map(|p| (p.data, p.is_key_frame)),
+        );
+        packets
+    }
+
     #[test]
+    fn a_corrupt_packet_is_found_although_the_decoder_reports_nothing() {
+        // The regression this module's whole design turns on.
+        //
+        // The AV1 decoder does **not** report undecodable packets. Measured
+        // directly: flipping the bytes of one packet in a nine-packet AV1 stream
+        // yields eight frames and no error; pure garbage yields zero frames and
+        // no error. A scheme built on `Err` alone would call both files clean
+        // while measuring nothing, so detection rests on the gap in the recovered
+        // frame indices instead.
+        let gop = encode_av1_gop(9);
+        assert!(
+            gop.iter().any(|(_, key)| !key),
+            "the fixture must contain predicted frames"
+        );
+
+        let mut session = DecodeSession::open("av01", DecodeLimits::default()).expect("decoder");
+        let clean = session.decode_resilient(&gop);
+        assert_eq!(
+            clean.frames.len(),
+            gop.len(),
+            "a clean stream decodes fully"
+        );
+        assert!(clean.is_clean(), "a clean stream reports nothing: {clean:?}");
+
+        let victim = gop
+            .iter()
+            .position(|(_, key)| !*key)
+            .expect("a predicted frame");
+        let mut broken = gop.clone();
+        for byte in broken[victim].0.iter_mut().skip(3) {
+            *byte ^= 0xFF;
+        }
+
+        let mut session = DecodeSession::open("av01", DecodeLimits::default()).expect("decoder");
+        let run = session.decode_resilient(&broken);
+
+        assert!(
+            run.frames.len() < broken.len(),
+            "the corrupt packet should not have produced a frame"
+        );
+        assert!(
+            run.damage.iter().any(|d| d.packet() == victim),
+            "the silently dropped packet at {victim} must be reported: {:?}",
+            run.damage
+        );
+        assert!(!run.is_clean(), "a damaged file may never read as clean");
+
+        // The gap has to survive into the frames themselves, or the scene
+        // analyser cannot know not to compare across it.
+        let indices: Vec<usize> = run.frames.iter().map(|f| f.index).collect();
+        assert!(
+            !indices.contains(&victim),
+            "the dropped frame must not appear: {indices:?}"
+        );
+    }
+
+    #[test]
+    fn one_lost_packet_is_reported_once() {
+        // The count in spec §30's summary line must not be inflated. A keyframe
+        // the decoder silently drops is diagnosable twice — once by the keyframe
+        // rule, once by the index gap — and has to collapse to one defect.
+        let gop = encode_av1_gop(9);
+        let victim = gop
+            .iter()
+            .position(|(_, key)| *key)
+            .expect("a keyframe");
+        let mut broken = gop.clone();
+        for byte in broken[victim].0.iter_mut().skip(3) {
+            *byte ^= 0xFF;
+        }
+
+        let mut session = DecodeSession::open("av01", DecodeLimits::default()).expect("decoder");
+        let run = session.decode_resilient(&broken);
+
+        let reports = run
+            .damage
+            .iter()
+            .filter(|d| d.packet() == victim)
+            .count();
+        assert_eq!(
+            reports, 1,
+            "one lost packet is one defect: {:?}",
+            run.damage
+        );
+    }
+
+    #[test]
+    fn a_stream_that_decodes_fully_is_never_reconciled_into_damage() {
+        // The negative guard. `reconcile` compares the highest recovered index
+        // against the packet count, so a decoder that legitimately holds a frame
+        // back could be mistaken for a dropped one. A clean run must stay clean.
+        let gop = encode_av1_gop(6);
+        let mut session = DecodeSession::open("av01", DecodeLimits::default()).expect("decoder");
+        let run = session.decode_resilient(&gop);
+
+        assert_eq!(run.frames.len(), gop.len());
+        assert!(run.damage.is_empty(), "{:?}", run.damage);
+    }
+
+    #[test]
+    fn a_clean_stream_produces_no_damage_and_no_stop() {
+        // The common path must report nothing at all, or every report carries a
+        // corruption section that means nothing.
+        let mut session = DecodeSession::open("av01", DecodeLimits::default())
+            .expect("av01 is decodable");
+        let run = session.decode_resilient(&[]);
+
+        assert!(run.is_clean(), "{run:?}");
+        assert_eq!(run.recoverable_error_count(), 0);
+        assert!(run.frames.is_empty());
+    }
+
+    #[test]
+    fn garbage_packets_are_recorded_rather_than_returned_as_errors() {
+        // Bytes that are not AV1 at all. The point is that the caller gets a
+        // *report*, not an `Err`: one corrupt file must not end an examination.
+        let mut session = DecodeSession::open("av01", DecodeLimits::default())
+            .expect("av01 is decodable");
+        let packets: Vec<(Vec<u8>, bool)> = (0..3)
+            .map(|_| (vec![0xABu8; 64], true))
+            .collect();
+
+        let run = session.decode_resilient(&packets);
+        assert!(
+            !run.damage.is_empty(),
+            "undecodable bytes must be recorded: {run:?}"
+        );
+        assert!(run.frames.is_empty(), "nothing decoded, nothing claimed");
+        assert!(!run.is_clean());
+    }
+
+    #[test]
+    fn damage_describes_itself_and_names_its_packet() {
+        let damage = DecodeDamage::PacketFailed {
+            packet: 7,
+            is_key_frame: false,
+            reason: "bitstream error".to_owned(),
+        };
+        assert_eq!(damage.tag(), "packet_failed");
+        assert_eq!(damage.packet(), 7);
+        assert!(damage.describe().contains("predicted"));
+        assert!(damage.describe().contains("7"));
+        assert!(damage.is_missing_data());
+    }
+
+    #[test]
+    fn every_damage_variant_is_distinguishable() {
+        // Spec §30's "17 recoverable decode errors" is only useful if the errors
+        // can be told apart, so the three variants must not collapse.
+        let variants = [
+            DecodeDamage::PacketFailed {
+                packet: 1,
+                is_key_frame: true,
+                reason: "x".to_owned(),
+            },
+            DecodeDamage::LostReference {
+                from_packet: 2,
+                skipped: 5,
+            },
+            DecodeDamage::UnusableFrame {
+                packet: 3,
+                reason: "x".to_owned(),
+            },
+        ];
+        let tags: std::collections::BTreeSet<_> =
+            variants.iter().map(DecodeDamage::tag).collect();
+        assert_eq!(tags.len(), 3, "each variant needs its own tag");
+        for damage in &variants {
+            assert!(!damage.describe().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_lost_reference_names_the_frames_it_cost() {
+        let damage = DecodeDamage::LostReference {
+            from_packet: 4,
+            skipped: 9,
+        };
+        let text = damage.describe();
+        assert!(text.contains('9'), "{text}");
+        assert!(text.contains('4'), "{text}");
+    }
+
+    #[test]
+    fn the_frame_limit_stops_the_run_but_keeps_what_was_recovered() {
+        // A bounded run must say it was bounded. Returning the frames with no
+        // indication the stream continued would read as a complete analysis.
+        let mut session = DecodeSession::open("av01", DecodeLimits {
+            max_frames: 0,
+            max_frames_in_memory: 8,
+        })
+        .expect("av01 is decodable");
+
+        let run = session.decode_resilient(&[(vec![0u8; 8], true)]);
+        assert!(matches!(
+            run.stopped,
+            Some(DecodeError::LimitReached { .. })
+        ));
+        assert!(!run.is_clean());
+    }
+
+#[test]
     fn errors_describe_themselves() {
         // These strings reach the report, so they must name the condition.
         assert!(DecodeError::NotPixelExact {

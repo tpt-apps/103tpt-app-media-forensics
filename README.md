@@ -16,7 +16,7 @@ It is not a media player, and it is not an AI deepfake detector.
 
 **Phase 1 — MVP, in progress.** The engine is implemented and working end to
 end: acquisition, container inspection, GOP/duplicate/timestamp/metadata
-analysis, structural damage detection, 26 built-in rules, case persistence, and
+analysis, structural damage detection, 29 built-in rules, case persistence, and
 PDF/HTML/JSON/CSV reports.
 MP4 and Matroska/WebM containers are analysed. Opus is decoded from bare Ogg
 streams and from demuxed packets inside a container; **Vorbis is decoded from
@@ -52,6 +52,12 @@ one that names the gap:
 
 - **Container inspection** — boxes, streams, timebase, duration consistency,
   malformed structures, truncation, trailing data
+- **Corruption detection** — structural damage from an independent walk of the
+  box list, packet damage found *without a decoder* (so it also covers the
+  H.264 and AAC tracks this engine never decodes), and decode damage from Tier-2.
+  Decoding continues past each recoverable error and resynchronises at the next
+  keyframe rather than interpolating across the gap, and the report states how
+  many errors it recovered from
 - **Error timeline** — structural damage, timestamp anomalies and positioned
   findings merged into one ordered list, each labelled with whether its position
   was measured, inferred, or unavailable, so a finding says *where* it sits and

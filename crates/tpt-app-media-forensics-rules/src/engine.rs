@@ -50,6 +50,8 @@ pub fn empty_bundle(asset_id: AssetId) -> AnalysisBundle {
         damage: Vec::new(),
         sample_index: tpt_app_media_forensics_container::SampleIndex::default(),
         bitrate: None,
+        packet_damage: Vec::new(),
+        decode_damage: Vec::new(),
     }
 }
 
@@ -105,6 +107,19 @@ pub struct AnalysisBundle {
     /// were recoverable — a rate needs two points. That is different from an
     /// empty `anomalies` list, which means the file was measured and held steady.
     pub bitrate: Option<tpt_app_media_forensics_video::bitrate::BitrateReport>,
+    /// Access units that are unusable, found without a decoder (spec §30).
+    ///
+    /// A `Vec` rather than `Option`, for the same reason as `damage`: empty means
+    /// the packets were scanned and none was defective, which is a measurement a
+    /// report can rely on. `Option` would conflate "clean" with "not looked at".
+    pub packet_damage: Vec<tpt_app_media_forensics_container::PacketDamage>,
+    /// Packets a decoder rejected or silently dropped (spec §30).
+    ///
+    /// Empty whenever Tier-2 did not run, which is the common case for the
+    /// patent-encumbered codecs this engine deliberately never decodes. That is
+    /// why the packet-layer check above exists: it covers those files, this one
+    /// cannot.
+    pub decode_damage: Vec<tpt_app_media_forensics_video::DecodeDamage>,
 }
 
 /// A piece of analysis a rule depends on.
@@ -149,6 +164,10 @@ pub enum BundleInput {
     SampleIndex,
     /// Compression and bitrate analysis (spec §28-§29).
     Bitrate,
+    /// Decoder-free access-unit defects (spec §30).
+    PacketDamage,
+    /// Decoder-reported packet damage (spec §30).
+    DecodeDamage,
 }
 
 impl BundleInput {
@@ -168,6 +187,8 @@ impl BundleInput {
         Self::Damage,
         Self::SampleIndex,
         Self::Bitrate,
+        Self::PacketDamage,
+        Self::DecodeDamage,
     ];
 
     /// The stable tag used in diagnostics and in the guard's messages.
@@ -188,6 +209,8 @@ impl BundleInput {
             Self::Damage => "damage",
             Self::SampleIndex => "sample_index",
             Self::Bitrate => "bitrate",
+            Self::PacketDamage => "packet_damage",
+            Self::DecodeDamage => "decode_damage",
         }
     }
 
@@ -219,6 +242,8 @@ impl BundleInput {
             Self::Damage => !bundle.damage.is_empty(),
             Self::SampleIndex => !bundle.sample_index.is_empty(),
             Self::Bitrate => bundle.bitrate.is_some(),
+            Self::PacketDamage => !bundle.packet_damage.is_empty(),
+            Self::DecodeDamage => !bundle.decode_damage.is_empty(),
         }
     }
 }

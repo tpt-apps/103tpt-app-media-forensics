@@ -532,6 +532,20 @@ impl AnalysisEngine {
         // `TIMING.AV_SYNC_DRIFT` never fired on any file.
         self.run_av_sync(&inspection, &mut bundle, limitations);
 
+        // 5c-iv. Packet-layer damage (spec §30), decoder-free.
+        //
+        // Runs over the samples already read, so it costs no additional I/O, and
+        // it is deliberately decoder-free: a check that needed a decoder would
+        // skip every H.264 and AAC track, which is precisely the set a working
+        // professional most often hands over.
+        if let (Some(samples), Some(inspection)) =
+            (samples_for_tier_two.as_deref(), inspection.as_ref())
+        {
+            bundle.packet_damage = tpt_app_media_forensics_container::scan_packets(
+                samples, inspection,
+            );
+        }
+
         // Metadata lives in moov, which was already read for inspection, so this
         // costs nothing extra and never touches the media data.
         // 5b. Tier-2: pixel-level analysis (spec §16-§18).
@@ -852,13 +866,31 @@ impl AnalysisEngine {
             }
         };
 
-        let (frames, stopped) = session.decode_prefix(&packets);
-        if let Some(error) = stopped {
+        let run = session.decode_resilient(&packets);
+
+        // Spec §30's summary line, in its own wording: the scan continued past
+        // each fault rather than stopping at the first. Stated as a limitation
+        // because it changes how every other Tier-2 number reads — the pixels
+        // exist but were not all recoverable.
+        if run.recoverable_error_count() > 0 {
             limitations.push(format!(
-                "Tier-2 pixel analysis covered {} frames before stopping: {error}",
-                frames.len()
+                "Analysis completed with {} recoverable decode error(s); {} of {} packets \
+                 decoded to usable frames",
+                run.recoverable_error_count(),
+                run.frames.len(),
+                packets.len()
             ));
         }
+        bundle.decode_damage = run.damage;
+
+        if let Some(error) = run.stopped {
+            limitations.push(format!(
+                "Tier-2 pixel analysis covered {} frames before stopping: {error}",
+                run.frames.len()
+            ));
+        }
+
+        let frames = run.frames;
 
         if frames.len() < 2 {
             limitations.push(format!(
@@ -868,7 +900,16 @@ impl AnalysisEngine {
             return;
         }
 
-        bundle.scene = Some(scene::analyse(&frames));
+        let scene = scene::analyse(&frames);
+        if scene.comparisons_skipped > 0 {
+            limitations.push(format!(
+                "{} frame pair(s) could not be compared because frames were lost between them; \
+                 no difference was measured across a gap rather than interpolating one",
+                scene.comparisons_skipped
+            ));
+        }
+        bundle.scene = Some(scene);
+
         bundle.near_duplicates = Some(near_duplicate::analyse(
             &frames,
             self.profile.near_duplicate_window,
@@ -1017,6 +1058,38 @@ fn build_timeline(
                 defect.describe(),
             )),
         }
+    }
+
+    // Packet-layer damage: placed at the sample's own time, which is measured,
+    // and left unplaced when the defect describes a whole stream rather than a
+    // moment.
+    for defect in &bundle.packet_damage {
+        match defect.time() {
+            Some(time) => entries.push(TimelineEntry::measured(
+                time,
+                TimelineSource::PacketDamage,
+                defect.tag(),
+                defect.describe(),
+            )),
+            None => entries.push(TimelineEntry::unplaced(
+                TimelineSource::PacketDamage,
+                defect.tag(),
+                defect.describe(),
+            )),
+        }
+    }
+
+    // Decoder damage carries a packet index, not a time. The index was built per
+    // stream in the same order the packets were fed, so the position is real —
+    // but it is a *packet number*, and rendering it as a timecode would invent
+    // one. Kept unplaced, with the packet index in the summary, which is the
+    // position an analyst can actually use to seek.
+    for defect in &bundle.decode_damage {
+        entries.push(TimelineEntry::unplaced(
+            TimelineSource::DecodeDamage,
+            defect.tag(),
+            defect.describe(),
+        ));
     }
 
     // Timestamp anomalies, placed at the sample index the scanner reported.

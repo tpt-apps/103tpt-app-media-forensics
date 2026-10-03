@@ -162,20 +162,58 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       because a step aligned to a window edge is the signature of a splice.
       Keyframe count rides with each finding — a keyframe-free window is a
       different observation from one where content stopped changing.
-- [~] Implement corruption detection with graceful continuation (§30)
-      **Structural damage detection is in**, in `-container/src/damage.rs`. A
-      shallow independent walk of the top-level box list, separate from the
-      demuxer, because the demuxer reports success for everything before the
-      bytes stopped making sense and so has by construction lost the boundary.
-      Four typed defects: truncation, trailing data, impossible box size, and a
+- [x] Implement corruption detection with graceful continuation (§30)
+      **Three layers now**, because "corruption" is three different questions
+      and answering only the first left the two a decode could see unanswered.
+      **Structural** damage is in `-container/src/damage.rs`: a shallow
+      independent walk of the top-level box list, separate from the demuxer,
+      because the demuxer reports success for everything before the bytes
+      stopped making sense and so has by construction lost the boundary. Four
+      typed defects — truncation, trailing data, impossible box size, and a
       non-printable box type (the signature of a reader that has lost sync).
-      Two rules grade them, deliberately at different severities —
-      `CONTAINER.TRUNCATED_MEDIA` is Critical/High because declared media is
-      missing, `CONTAINER.STRUCTURAL_DEFECT` is Warning/Medium because appended
-      data does not mean content is absent.
-      **Not yet done:** decode-level and packet-level corruption (a valid
-      container holding undecodable samples), and graceful continuation *within*
-      Tier-2 decoding rather than around the container.
+      **Packet** damage is in `-container/src/packets.rs`: what is wrong with the
+      *access units* those boxes point at, which a well-formed box list says
+      nothing about. Two typed defects — an access unit with no bytes, and an
+      index promising more samples than can be read. It is deliberately
+      **decoder-free**, so it also covers the H.264 and AAC tracks this engine
+      never decodes; a decoder-based check would skip exactly the files a
+      working professional most often hands over. **Decode** damage is in
+      `-video/src/decode.rs`, and it is where spec §30's "a scan should continue
+      after recoverable errors" is actually implemented — see below.
+      Five rules grade them at three severities: `CONTAINER.TRUNCATED_MEDIA`
+      (Critical/High — declared media is *absent*), `CONTAINER.UNREADABLE_PACKET`
+      and `VIDEO.DECODE_FAILURE` (Significant/High — present but unusable, so a
+      lesser and genuinely different problem), and `CONTAINER.STRUCTURAL_DEFECT`
+      (Warning/Medium — appended data does not mean content is absent).
+
+      **Graceful continuation means resynchronising, not persisting.** After a
+      decode failure the session skips forward to the next keyframe rather than
+      feeding the following predicted frames: their reference is gone, and
+      decoding them anyway produces output that *looks* like a frame and is
+      wrong. A plausible-looking wrong frame is the worst outcome this engine
+      can produce, because a scene-change finding computed from it reads as a
+      measurement. The skipped span is recorded as `LostReference` so the gap is
+      visible rather than a silent hole in a frame count. `scene::analyse`
+      refuses to compare across that gap — comparing frames 5 and 12 would
+      measure seven frames of elapsed footage and report it as one step, which on
+      any real cut is a large confident scene change that is an artefact of the
+      recovery.
+
+      **The decoder does not report undecodable packets.** Found by measurement,
+      not by reading the source: flipping one packet's bytes in a nine-packet AV1
+      stream yields eight frames and **no error**, and pure garbage yields zero
+      frames and still no error. A scheme built on `Err` alone would have called
+      both files clean while measuring nothing at all. So silence is read as
+      damage — for a **keyframe** only, since a keyframe is self-contained and
+      cannot be withheld for reordering — and a predicted frame dropped the same
+      way is caught by reconciling the gaps in the recovered frame indices. Both
+      paths dedupe against each other, so one lost packet is one defect and the
+      count spec §30 asks the report to print is not inflated.
+
+      **Still not done:** audio decode errors are not a typed defect yet — the
+      audio decoder's failure is still recorded as a limitation string rather than
+      routed through the same `DecodeDamage` type, and spec §30 lists audio decode
+      errors alongside the video ones.
 - [x] Implement error/anomaly timeline (§31)
       **The unified timeline now exists**: `-model/src/timeline.rs` plus
       `build_timeline` in the pipeline. It merges three sources into one ordered

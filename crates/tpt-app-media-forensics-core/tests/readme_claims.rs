@@ -77,7 +77,7 @@ macro_rules! claimed_exist {
 /// This is the check that would have caught the stale claims found by hand:
 /// colour/HDR (no reader populates `ColourInfo`), spectral (no FFT in the audio
 /// crate), and progress/cancellation (no such code in `-core`).
-const CLAIMED_EXIST: [(&str, &str, &str); 19] = claimed_exist![
+const CLAIMED_EXIST: [(&str, &str, &str); 21] = claimed_exist![
     (
         "container inspection",
         "../../tpt-app-media-forensics-container/src/mp4.rs",
@@ -168,6 +168,20 @@ const CLAIMED_EXIST: [(&str, &str, &str); 19] = claimed_exist![
         "error timeline",
         "../../tpt-app-media-forensics-container/src/damage.rs",
         "pub fn locate"
+    ),
+    // Claimed as "Corruption detection" in the README. The three layers are
+    // separate capabilities and all three are checked: the decoder-free packet
+    // scan is the one a decoder-based implementation would silently skip, and
+    // `decode_resilient` is the continuation the claim describes.
+    (
+        "packet damage",
+        "../../tpt-app-media-forensics-container/src/packets.rs",
+        "pub fn scan_packets"
+    ),
+    (
+        "decoding continues past each recoverable error",
+        "../../tpt-app-media-forensics-video/src/decode.rs",
+        "pub fn decode_resilient"
     ),
     // Claimed as "Edit lists" in the README. `parse_edit_lists` is what reads
     // `elst`; before it existed, `edit_list_offset` was `None` for every file.

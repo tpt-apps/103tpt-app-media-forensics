@@ -259,6 +259,20 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     // the analysers running.
     put("video.av1.webm", &av1_webm(dir));
 
+    // The same stream with one packet's bytes damaged (spec §30).
+    //
+    // `video.av1.webm` and this differ by one corrupted packet and nothing else,
+    // which is what makes the pair evidence for the decode-damage check: the
+    // clean file produces no `VIDEO.DECODE_FAILURE`, and this one does. A pair of
+    // unrelated fixtures could not show that.
+    //
+    // It is also the case the structural scan cannot see. The container is
+    // entirely well-formed here — no truncation, no trailing bytes, no impossible
+    // box — so `CONTAINER.TRUNCATED_MEDIA` and `CONTAINER.STRUCTURAL_DEFECT` both
+    // stay silent, and only asking a decoder to make a picture of the samples
+    // reveals the defect.
+    put("decode-failure.webm", &decode_failure_webm());
+
     // Structural damage (spec §30): a well-formed MP4 with its `mdat` cut short.
     //
     // Built by truncation rather than as its own fixture builder, because the
@@ -273,6 +287,20 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut truncated = build_mp4(&TrackSpec::video_25fps(640, 480, 50));
     truncated.truncate(truncated.len() / 2);
     put("truncated.mp4", &truncated);
+
+    // Truncation is also a *packet*-layer condition, and this fixture is the
+    // only thing that reaches `CONTAINER.UNREADABLE_PACKET`.
+    //
+    // The file is built for the box-level rule: its `mdat` is cut short, so
+    // `CONTAINER.TRUNCATED_MEDIA` fires on the box walk. But the `stsz` entry
+    // count survives in the header, promising 50 samples, while only some can be
+    // read back. That disagreement is a second, independent observation of the
+    // same truncation — seen from the sample index rather than the box list — and
+    // reporting both is honest rather than redundant, because only one of the two
+    // covers a file whose *boxes* are entirely intact.
+    //
+    // The complementary case — a structurally perfect container whose samples
+    // still will not decode — is `decode-failure.webm`.
 
     // Bitrate drop (§28-§29). Every other fixture gives each sample the same
     // 100 bytes, so the corpus as a whole holds one flat bitrate and
@@ -360,6 +388,56 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// Encodes real AV1 frames and wraps them in a WebM container.
 fn av1_webm(dir: &std::path::Path) -> Vec<u8> {
+    let payloads = av1_payloads();
+    let blocks: Vec<(u16, bool, Vec<u8>)> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (u16::try_from(i * 33).unwrap_or(u16::MAX), true, p.clone()))
+        .collect();
+    let _ = dir;
+    build_webm("V_AV1", 1, &blocks)
+}
+
+/// Encodes real AV1, damages one packet, and wraps the result in WebM.
+///
+/// This is the file `VIDEO.DECODE_FAILURE` is actually for: **a valid container
+/// holding undecodable samples.** Every box parses, the track declares a real
+/// AV1 codec, and the sample table is intact — so the structural scan finds
+/// nothing and `CONTAINER.TRUNCATED_MEDIA` does not fire. The defect is only
+/// visible once a decoder is asked to make a picture of it.
+///
+/// Built from real encoded bytes rather than stubs because that is the only way to
+/// distinguish "this packet is corrupt" from "these bytes were never video": a
+/// stub payload is undecodable for the uninteresting reason that it was never
+/// anything else. Corrupting one real packet leaves its neighbours decoding
+/// normally, which is precisely the condition the engine's index-gap check is
+/// built to notice.
+fn decode_failure_webm() -> Vec<u8> {
+    let payloads = av1_payloads();
+    assert!(payloads.len() > 2, "the encoder must produce a stream to damage");
+
+    let mut blocks: Vec<(u16, bool, Vec<u8>)> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (u16::try_from(i * 33).unwrap_or(u16::MAX), true, p.clone()))
+        .collect();
+
+    // An interior packet, so the damage is a hole rather than a truncated head.
+    let victim = 1;
+    // Field 2 is the payload; field 1 is the keyframe flag.
+    for byte in blocks[victim].2.iter_mut().skip(3) {
+        *byte ^= 0xFF;
+    }
+
+    build_webm("V_AV1", 1, &blocks)
+}
+
+/// The raw AV1 packet payloads the AV1 encoder produces for the fixture above.
+///
+/// Split out so `av1_webm` and `decode_failure_webm` encode the *same* stream and
+/// differ only in what is done to it. Without that, the two fixtures could differ
+/// by encoder nondeterminism rather than by the condition under test.
+fn av1_payloads() -> Vec<Vec<u8>> {
     use tpt_kinetix_av1::{Av1Encoder, Av1EncoderConfig};
     use tpt_kinetix_core::frame::VideoFrame;
     use tpt_kinetix_core::pixel_format::PixelFormat;
@@ -380,13 +458,10 @@ fn av1_webm(dir: &std::path::Path) -> Vec<u8> {
 
     let mut payloads = Vec::new();
     for index in 0..8u8 {
-        let w = W as usize;
-        let h = H as usize;
+        let (w, h) = (W as usize, H as usize);
         let mut data = vec![0u8; w * h + (w * h) / 2];
         for y in 0..h {
             for x in 0..w {
-                // A moving gradient keeps the image non-uniform, so the
-                // analysers see structure rather than a flat field.
                 data[y * w + x] = ((index as usize * 30) + x + y) as u8;
             }
         }
@@ -415,14 +490,7 @@ fn av1_webm(dir: &std::path::Path) -> Vec<u8> {
             .map(|p| p.data),
     );
     assert!(!payloads.is_empty(), "the AV1 encoder produced nothing");
-
-    let blocks: Vec<(u16, bool, Vec<u8>)> = payloads
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (u16::try_from(i * 33).unwrap_or(u16::MAX), true, p.clone()))
-        .collect();
-    let _ = dir;
-    build_webm("V_AV1", 1, &blocks)
+    payloads
 }
 
 /// Inputs no rule requires, and so nothing is obliged to populate.
@@ -556,6 +624,8 @@ fn input_name(input: BundleInput) -> &'static str {
         BundleInput::Damage => "Damage",
         BundleInput::SampleIndex => "SampleIndex",
         BundleInput::Bitrate => "Bitrate",
+        BundleInput::PacketDamage => "PacketDamage",
+        BundleInput::DecodeDamage => "DecodeDamage",
     }
 }
 
@@ -1279,6 +1349,13 @@ fn a_rule_fires_only_on_files_built_for_its_condition() {
         ("audio-inaudible.webm", "AUDIO.SILENCE_REGION"),
         ("audio.webm", "AUDIO.SILENCE_REGION"),
         ("video.av1.webm", "VIDEO.SCENE_CHANGE"),
+        // Two conditions, both real and both a property of this one file. The
+        // `mdat` is cut short, so the box walk sees a truncated box *and* the
+        // `stsz` entry count promises more samples than can be read back. The
+        // second is the only way to reach `CONTAINER.UNREADABLE_PACKET`, and it
+        // is a genuinely different observation: it comes from the sample index,
+        // not the box list.
+        ("truncated.mp4", "CONTAINER.UNREADABLE_PACKET"),
         // The gradient in this fixture translates by 30 units per frame, so
         // consecutive frames are similar without being identical. That is a real
         // near-duplicate run, not an accident of the fixture: any moving-content
@@ -1300,6 +1377,25 @@ fn a_rule_fires_only_on_files_built_for_its_condition() {
         // This fixture exists for the colour layer and nothing else: a `colr`
         // box naming BT.2020 and PQ, with no `mdcv` or `clli` beside it.
         ("hdr-signalling-only.mp4", "VIDEO.HDR_METADATA_MISSING"),
+        // Also correct, and a direct consequence of §30's decode-damage check:
+        // this fixture's video blocks are 32-byte stubs rather than real VP9,
+        // because the project ships no VP9 encoder. They are therefore genuinely
+        // undecodable, and `VIDEO.DECODE_FAILURE` saying so is a *true* finding
+        // about the fixture rather than a false one about the engine. It is
+        // recorded rather than suppressed, because suppressing it would mean
+        // weakening the decoder check to keep a test quiet.
+        //
+        // The fixture built for this condition on purpose is `decode-failure.webm`,
+        // which carries real AV1 with specific packets damaged.
+        ("no-duration.webm", "VIDEO.DECODE_FAILURE"),
+        // Purpose-built for this rule, and paired with `video.av1.webm` above it:
+        // identical stream, one damaged packet.
+        ("decode-failure.webm", "VIDEO.DECODE_FAILURE"),
+        // Same reason as `video.av1.webm` above: the fixture's content is a
+        // gradient shifting 30 levels per frame, so consecutive frames are
+        // similar without being identical. A real near-duplicate run, and a
+        // property of the content rather than of the damage.
+        ("decode-failure.webm", "VIDEO.NEAR_DUPLICATE_FRAME"),
     ];
 
     for path in corpus(dir.path()) {

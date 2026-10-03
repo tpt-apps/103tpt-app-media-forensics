@@ -102,7 +102,7 @@ fn keyed_bytes() -> Vec<u8> {
 #[test]
 fn the_full_rule_set_is_registered() {
     let ids = builtin_rules().iter().map(|r| r.id()).collect::<Vec<_>>();
-    assert_eq!(ids.len(), 27, "expected the complete rule set, got {ids:?}");
+    assert_eq!(ids.len(), 29, "expected the complete rule set, got {ids:?}");
     assert_eq!(
         ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
         ids.len(),
@@ -777,6 +777,7 @@ fn the_documented_rule_set_matches_the_registered_rules() {
         "CONTAINER.NO_USABLE_STREAMS",
         "CONTAINER.STRUCTURAL_DEFECT",
         "CONTAINER.TRUNCATED_MEDIA",
+        "CONTAINER.UNREADABLE_PACKET",
         "VIDEO.ALL_FRAMES_KEYFRAMES",
         "VIDEO.BITRATE_DROP",
         "VIDEO.SINGLE_KEYFRAME",
@@ -786,6 +787,7 @@ fn the_documented_rule_set_matches_the_registered_rules() {
         "VIDEO.DUPLICATE_FRAME_RUN",
         "VIDEO.SCENE_CHANGE",
         "VIDEO.NEAR_DUPLICATE_FRAME",
+        "VIDEO.DECODE_FAILURE",
         "AUDIO.CLIPPING",
         "AUDIO.DC_OFFSET",
         "AUDIO.SILENCE_REGION",
@@ -808,7 +810,7 @@ fn the_documented_rule_set_matches_the_registered_rules() {
         registered, expected,
         "docs/rules.md must list exactly the rules in builtin_rules()"
     );
-    assert_eq!(DOCUMENTED.len(), 27, "the shipped count is 27 rules");
+    assert_eq!(DOCUMENTED.len(), 29, "the shipped count is 29 rules");
 }
 
 #[test]
@@ -821,4 +823,250 @@ fn rule_ids_are_unique() {
     let before = sorted.len();
     sorted.dedup();
     assert_eq!(before, sorted.len(), "duplicate rule ID registered");
+}
+
+// ---------------------------------------------------------------------------
+// §30 decode-level and packet-level corruption
+// ---------------------------------------------------------------------------
+
+/// A bundle whose packet scan has run over real samples, as the pipeline does.
+fn bundle_with_packet_damage(bytes: &[u8]) -> AnalysisBundle {
+    let mut bundle = bundle_with_container(bytes.to_vec());
+    if let Some(inspection) = &bundle.container {
+        let samples =
+            tpt_app_media_forensics_container::read_samples(bytes.to_vec()).expect("reads samples");
+        bundle.packet_damage = tpt_app_media_forensics_container::scan_packets(&samples, inspection);
+    }
+    bundle
+}
+
+#[test]
+fn a_clean_file_reports_no_packet_damage() {
+    // The negative case. A scan that fired on a well-formed file would make
+    // `CONTAINER.UNREADABLE_PACKET` fire on every asset in a case.
+    let bytes = clean_bytes();
+    let bundle = bundle_with_packet_damage(&bytes);
+    assert!(bundle.packet_damage.is_empty(), "{:?}", bundle.packet_damage);
+    assert!(run(&bundle, "CONTAINER.UNREADABLE_PACKET").is_empty());
+}
+
+#[test]
+fn a_truncated_file_reports_samples_the_index_still_promises() {
+    // The packet-layer view of the same truncation seen at the box layer. The
+    // evidence differs — the sample index rather than the box list — which is why
+    // it also covers a file whose boxes are entirely intact.
+    let mut bytes = build_mp4(&TrackSpec::video_25fps(320, 240, 40));
+    bytes.truncate(bytes.len() * 2 / 3);
+
+    let bundle = bundle_with_packet_damage(&bytes);
+    assert!(
+        !bundle.packet_damage.is_empty(),
+        "an index promising more than it holds is damage: {:?}",
+        bundle.packet_damage
+    );
+
+    let findings = run(&bundle, "CONTAINER.UNREADABLE_PACKET");
+    assert!(!findings.is_empty(), "{findings:?}");
+    assert_eq!(findings[0].severity, Severity::Significant);
+    assert!(
+        findings[0]
+            .observation
+            .measurements
+            .iter()
+            .any(|m| m.contains("unaccounted for")),
+        "{:?}",
+        findings[0].observation.measurements
+    );
+}
+
+#[test]
+fn an_empty_access_unit_is_reported_at_its_own_timestamp() {
+    // The sample carries its own time, so the finding is placed by measurement —
+    // nothing is inferred and nothing is guessed.
+    use tpt_app_media_forensics_container::PacketDamage;
+    use tpt_app_media_forensics_model::MediaTime;
+
+    let mut bundle = bundle_with_container(clean_bytes());
+    bundle.packet_damage = vec![PacketDamage::EmptySample {
+        stream_index: 0,
+        frame_index: 7,
+        time: MediaTime::from_micros(280_000),
+    }];
+
+    let findings = run(&bundle, "CONTAINER.UNREADABLE_PACKET");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(
+        findings[0].timeline_start,
+        Some(MediaTime::from_micros(280_000)),
+        "a sample's own timestamp is a measured position"
+    );
+}
+
+#[test]
+fn a_stream_level_packet_finding_gets_no_timecode() {
+    // A count mismatch describes a whole stream. Parking it at 00:00:00 would
+    // read as a measured position and is not one.
+    use tpt_app_media_forensics_container::PacketDamage;
+
+    let mut bundle = bundle_with_container(clean_bytes());
+    bundle.packet_damage = vec![PacketDamage::DeclaredSampleCountMismatch {
+        stream_index: 0,
+        declared: 50,
+        recovered: 20,
+        missing: 30,
+    }];
+
+    let findings = run(&bundle, "CONTAINER.UNREADABLE_PACKET");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(
+        findings[0].timeline_start, None,
+        "a stream-level fact has no moment"
+    );
+    assert!(
+        findings[0]
+            .observation
+            .measurements
+            .iter()
+            .any(|m| m.contains('3') && m.contains("unaccounted")),
+        "{:?}",
+        findings[0].observation.measurements
+    );
+}
+#[test]
+fn decode_damage_is_reported_as_a_significant_finding() {
+    use tpt_app_media_forensics_video::DecodeDamage;
+
+    let mut bundle = bundle_with_container(clean_bytes());
+    bundle.decode_damage = vec![DecodeDamage::PacketFailed {
+        packet: 4,
+        is_key_frame: false,
+        reason: "bitstream error".to_owned(),
+    }];
+
+    let findings = run(&bundle, "VIDEO.DECODE_FAILURE");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].severity, Severity::Significant);
+    assert!(
+        findings[0].timeline_start.is_none(),
+        "a packet index is not a timecode"
+    );
+}
+
+#[test]
+fn decode_damage_states_the_spec_summary_line_exactly_once() {
+    // Spec §30 asks the report to say "Analysis completed with 17 recoverable
+    // decode errors". Stating it per defect would repeat the same count on every
+    // finding and read as several separate totals.
+    use tpt_app_media_forensics_video::DecodeDamage;
+
+    let mut bundle = bundle_with_container(clean_bytes());
+    bundle.decode_damage = vec![
+        DecodeDamage::PacketFailed {
+            packet: 1,
+            is_key_frame: false,
+            reason: "a".to_owned(),
+        },
+        DecodeDamage::PacketFailed {
+            packet: 2,
+            is_key_frame: false,
+            reason: "b".to_owned(),
+        },
+        DecodeDamage::LostReference {
+            from_packet: 3,
+            skipped: 5,
+        },
+    ];
+
+    let findings = run(&bundle, "VIDEO.DECODE_FAILURE");
+    assert_eq!(findings.len(), 3, "{findings:?}");
+
+    let saying_it: Vec<usize> = findings
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            f.observation
+                .measurements
+                .iter()
+                .any(|m| m.contains("recoverable decode error"))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        saying_it.len(),
+        1,
+        "the summary line must appear once, not once per defect"
+    );
+    assert!(
+        findings[saying_it[0]]
+            .observation
+            .measurements
+            .iter()
+            .any(|m| m.contains("3 recoverable decode error")),
+        "the count must be the real one: {:?}",
+        findings[saying_it[0]].observation.measurements
+    );
+}
+
+#[test]
+fn a_lost_reference_says_how_many_frames_it_cost() {
+    use tpt_app_media_forensics_video::DecodeDamage;
+
+    let mut bundle = bundle_with_container(clean_bytes());
+    bundle.decode_damage = vec![DecodeDamage::LostReference {
+        from_packet: 12,
+        skipped: 7,
+    }];
+
+    let findings = run(&bundle, "VIDEO.DECODE_FAILURE");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let measurements = &findings[0].observation.measurements;
+    assert!(
+        measurements.iter().any(|m| m.contains('7') && m.contains("skipped")),
+        "the finding must say how many frames the damage cost: {measurements:?}"
+    );
+}
+
+#[test]
+fn neither_new_rule_asserts_a_cause() {
+    use tpt_app_media_forensics_container::PacketDamage;
+    use tpt_app_media_forensics_video::DecodeDamage;
+
+    let mut bundle = bundle_with_container(clean_bytes());
+    bundle.packet_damage = vec![PacketDamage::DeclaredSampleCountMismatch {
+        stream_index: 0,
+        declared: 50,
+        recovered: 20,
+        missing: 30,
+    }];
+    bundle.decode_damage = vec![DecodeDamage::PacketFailed {
+        packet: 1,
+        is_key_frame: false,
+        reason: "bitstream error".to_owned(),
+    }];
+
+    for id in ["CONTAINER.UNREADABLE_PACKET", "VIDEO.DECODE_FAILURE"] {
+        for finding in run(&bundle, id) {
+            let text = format!(
+                "{} {:?}",
+                finding.observation.summary, finding.observation.measurements
+            )
+            .to_lowercase();
+            // The obvious stories. Naming one would assert something neither the
+            // container nor the decoder can establish.
+            for claim in [
+                "tamper",
+                "malicious",
+                "edited",
+                "spliced",
+                "re-mux",
+                "deliberate",
+                "fraud",
+            ] {
+                assert!(
+                    !text.contains(claim),
+                    "{id} asserts a cause it cannot support: {text}"
+                );
+            }
+        }
+    }
 }

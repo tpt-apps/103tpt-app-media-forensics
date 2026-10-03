@@ -40,6 +40,15 @@ pub struct SceneReport {
     pub differences: Vec<FrameDifference>,
     /// Frames examined.
     pub frames_examined: usize,
+    /// Pairs that were *not* compared because the frames are not adjacent in
+    /// the source stream.
+    ///
+    /// Non-zero means recoverable decode damage: frames were lost between two
+    /// recovered ones, so the difference across that gap is not measurable as a
+    /// single step. Reported rather than omitted so a reader can distinguish
+    /// "this file has no scene changes" from "this file could not be examined
+    /// everywhere", which would otherwise look identical in the findings.
+    pub comparisons_skipped: usize,
 }
 
 impl SceneReport {
@@ -70,19 +79,42 @@ impl SceneReport {
 /// a handful of levels is not.
 const SAMPLE_DELTA: u8 = 16;
 
-/// Measures the difference between every consecutive pair of frames.
+/// Measures the difference between every genuinely consecutive pair of frames.
+///
+/// # A gap in the frame list is not a scene change
 ///
 /// Frames of differing dimensions cannot be compared sample by sample, so a
 /// resolution change ends the scan and is reported through the frame count
 /// rather than being compared against misaligned pixels.
+///
+/// The same reasoning applies to a **gap in the indices**, and this is not
+/// hypothetical: [`crate::decode::DecodeSession::decode_resilient`] recovers from
+/// a corrupt packet by skipping forward to the next keyframe, so the frames it
+/// returns legitimately skip numbers. Comparing frame 5 against frame 12 would
+/// measure the difference over seven frames of elapsed footage and report it as
+/// a single step. On any real cut that reads as a large, confident scene change
+/// which is an artefact of the recovery, not an observation about the media —
+/// the exact failure mode this engine exists to avoid.
+///
+/// So a non-adjacent pair is skipped and counted in
+/// [`SceneReport::comparisons_skipped`], which is what lets a reader tell a
+/// quiet file from a partly-undecodable one.
 #[must_use]
 pub fn analyse(frames: &[DecodedFrame]) -> SceneReport {
     let mut differences = Vec::new();
+    let mut comparisons_skipped = 0usize;
 
     for pair in frames.windows(2) {
         let (previous, current) = (&pair[0], &pair[1]);
         if previous.width != current.width || previous.height != current.height {
             break;
+        }
+
+        // Not adjacent in the source stream, so the difference spans frames
+        // this analysis never saw. Not measurable as a single step.
+        if current.index != previous.index + 1 {
+            comparisons_skipped += 1;
+            continue;
         }
 
         let (mean_absolute, changed_fraction) = compare(&previous.luma, &current.luma);
@@ -96,6 +128,7 @@ pub fn analyse(frames: &[DecodedFrame]) -> SceneReport {
     SceneReport {
         differences,
         frames_examined: frames.len(),
+        comparisons_skipped,
     }
 }
 
@@ -193,6 +226,54 @@ mod tests {
         let changes = report.changes_above(100.0);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].index, 2, "the change is at the later frame");
+    }
+
+    #[test]
+    fn frames_separated_by_a_lost_reference_are_not_compared() {
+        // The case that makes the skip load-bearing. Frames 0 and 9 are black
+        // and white; comparing them would measure 255.0 and report a
+        // scene change — but frames 1 through 8 were never seen, so that number
+        // describes a gap in the analysis rather than anything about the media.
+        let frames = vec![uniform(0, 16, 16, 0), uniform(9, 16, 16, 255)];
+        let report = analyse(&frames);
+
+        assert!(
+            report.differences.is_empty(),
+            "a gap is not a step: {:?}",
+            report.differences
+        );
+        assert!(
+            report.changes_above(1.0).is_empty(),
+            "no fabricated scene change may reach the rule"
+        );
+        assert_eq!(report.comparisons_skipped, 1);
+        assert_eq!(report.frames_examined, 2);
+    }
+
+    #[test]
+    fn adjacent_frames_after_a_gap_still_compare_normally() {
+        // Recovery must not sterilise the analysis: once the stream is
+        // contiguous again, ordinary differences are measured as before.
+        let frames = vec![
+            uniform(0, 16, 16, 0),
+            uniform(9, 16, 16, 0), // gap: 1..=8 lost
+            uniform(10, 16, 16, 255),
+        ];
+        let report = analyse(&frames);
+
+        assert_eq!(report.comparisons_skipped, 1);
+        assert_eq!(report.differences.len(), 1, "only the adjacent pair compares");
+        assert_eq!(report.differences[0].index, 10);
+        assert!((report.differences[0].mean_absolute - 255.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_contiguous_run_skips_nothing() {
+        // The negative case: the common path must not start reporting skips.
+        let frames: Vec<DecodedFrame> = (0..5).map(|i| uniform(i, 16, 16, 100)).collect();
+        let report = analyse(&frames);
+        assert_eq!(report.comparisons_skipped, 0);
+        assert_eq!(report.differences.len(), 4);
     }
 
     /// Builds a frame with a bright band starting at `edge`.

@@ -33,6 +33,7 @@ pub mod error;
 pub mod fixture;
 pub mod mkv;
 pub mod mp4;
+pub mod packets;
 pub mod probe;
 
 pub use colr::{parse_track_colour, TrackColour};
@@ -58,4 +59,5 @@ pub use mp4::{
     read_samples_file, track_frame_info, ContainerInspection, SampleRecord, TrackFrameInfo,
     MAX_EXPANDED_SAMPLES, MAX_INSPECTED_BYTES, MAX_MOOV_BYTES, MAX_SAMPLED_BYTES,
 };
+pub use packets::{scan_packets, PacketDamage};
 pub use probe::{detect, detect_file, extension_matches, ContainerFormat, PROBE_BYTES};

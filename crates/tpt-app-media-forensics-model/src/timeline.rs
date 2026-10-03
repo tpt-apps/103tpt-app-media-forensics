@@ -69,6 +69,10 @@ pub enum TimelineSource {
     Timestamp,
     /// A rule finding carrying a timeline position (spec §34).
     Finding,
+    /// An access unit that cannot be decoded, found without a decoder (spec §30).
+    PacketDamage,
+    /// A packet a decoder rejected or silently dropped (spec §30).
+    DecodeDamage,
 }
 
 /// One event on the error and anomaly timeline.
