@@ -4,7 +4,10 @@
 //! the layout, pragmas, and round-trip behaviour are covered together rather
 //! than in isolation.
 
-use tpt_app_media_forensics_core::store::{Store, StoredAsset};
+use tpt_app_media_forensics_core::store::{Store, StoredAnalysis, StoredAsset};
+use tpt_app_media_forensics_model::{
+    AssetId, Confidence, Finding, FindingId, FindingStatus, Observation, Severity,
+};
 
 fn asset(id: &str, sha: &str) -> StoredAsset {
     StoredAsset {
@@ -176,4 +179,298 @@ fn the_database_does_not_touch_the_source_file() {
 
     assert_eq!(std::fs::read(&source).expect("reads"), before);
     assert!(case_dir.join("case.db").exists());
+}
+
+/// Builds a case with one asset, one analysis, and no findings.
+///
+/// The asset id is derived once and reused, because `insert_finding` writes
+/// `finding.asset_id` as a foreign key: a finding naming a different id than the
+/// asset row is rejected by the database, and that is the constraint under test
+/// rather than a mismatch to paper over.
+fn asset_id() -> AssetId {
+    AssetId::new_derived(&["a1"])
+}
+
+/// Builds a case with one asset, one analysis, and no findings.
+fn seeded_store() -> Store {
+    let store = Store::open_in_memory().expect("opens");
+    store.upsert_case("case-1", "Case", None).expect("case");
+    store
+        .insert_asset(&StoredAsset {
+            id: asset_id().to_string(),
+            case_id: "case-1".to_owned(),
+            name: "a1.mp4".to_owned(),
+            source_path: "C:\\evidence\\a1.mp4".to_owned(),
+            size_bytes: 4096,
+            sha256: Some("aa".to_owned()),
+            blake3: None,
+        })
+        .expect("asset");
+    store
+        .insert_analysis(&StoredAnalysis {
+            id: "an1".to_owned(),
+            case_id: "case-1".to_owned(),
+            asset_id: asset_id().to_string(),
+            cache_key: "k".to_owned(),
+            finding_count: 1,
+            rule_count: 1,
+            profile: "default".to_owned(),
+            profile_fingerprint: "pf".to_owned(),
+            rule_set_fingerprint: "rs".to_owned(),
+            started_at: 1_700_000_000,
+        })
+        .expect("analysis");
+    store
+}
+
+fn finding(status: FindingStatus) -> Finding {
+    Finding {
+        id: FindingId::new_derived(&["RULE.ONE", "a1"]),
+        rule_id: "RULE.ONE".to_owned(),
+        severity: Severity::Warning,
+        confidence: Confidence::High,
+        observation: Observation {
+            summary: "observed something".to_owned(),
+            measurements: vec!["1.0".to_owned()],
+        },
+        asset_id: asset_id(),
+        stream_id: None,
+        timeline_start: None,
+        timeline_end: None,
+        evidence: Vec::new(),
+        status,
+        review_note: (status != FindingStatus::New).then(|| "reviewer note".to_owned()),
+    }
+}
+
+#[test]
+fn a_new_finding_is_stored_without_a_review_row() {
+    let store = seeded_store();
+    store
+        .insert_finding("an1", &finding(FindingStatus::New))
+        .expect("a New finding has no review to record");
+
+    assert_eq!(store.count("findings").expect("counted"), 1);
+    assert_eq!(
+        store.count("finding_reviews").expect("counted"),
+        0,
+        "an unreviewed finding must not fabricate a review row"
+    );
+}
+
+#[test]
+fn a_reviewed_finding_is_stored_alongside_its_verdict() {
+    // `finding_reviews.analysis_id` is NOT NULL, so a verdict recorded without one
+    // is rejected by the database. Nothing in the pipeline reviewed a finding, so
+    // this path had never run before this test existed.
+    let store = seeded_store();
+    store
+        .insert_finding("an1", &finding(FindingStatus::Accepted))
+        .expect("a reviewed finding must persist its verdict");
+
+    assert_eq!(store.count("findings").expect("counted"), 1);
+    assert_eq!(store.count("finding_reviews").expect("counted"), 1);
+}
+
+#[test]
+fn each_verdict_state_round_trips() {
+    // Every state a reviewer can choose must survive a write. A state that only
+    // fails for one variant looks like a bug confined to a rare path.
+    for status in [
+        FindingStatus::Reviewed,
+        FindingStatus::Accepted,
+        FindingStatus::Rejected,
+        FindingStatus::RequiresInvestigation,
+    ] {
+        let store = seeded_store();
+        store
+            .insert_finding("an1", &finding(status))
+            .unwrap_or_else(|e| panic!("{status:?} must be storable: {e}"));
+        assert_eq!(
+            store.count("finding_reviews").expect("counted"),
+            1,
+            "{status:?} must record exactly one review"
+        );
+    }
+}
+
+#[test]
+fn a_review_does_not_change_the_stored_observation() {
+    let store = seeded_store();
+    let reviewed = finding(FindingStatus::Accepted);
+    store.insert_finding("an1", &reviewed).expect("stored");
+
+    let (summary, payload): (String, String) = store
+        .connection()
+        .query_row(
+            "SELECT summary, payload FROM findings WHERE id = ?1",
+            [reviewed.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("finding row exists");
+
+    assert_eq!(
+        summary, "observed something",
+        "the observation is untouched"
+    );
+    let decoded: Finding = serde_json::from_str(&payload).expect("payload parses");
+    assert_eq!(decoded.observation.summary, "observed something");
+    assert_eq!(decoded.status, FindingStatus::Accepted);
+    assert_eq!(decoded.review_note.as_deref(), Some("reviewer note"));
+}
+
+#[test]
+fn findings_are_read_back_with_their_verdicts() {
+    let store = seeded_store();
+    store
+        .insert_finding("an1", &finding(FindingStatus::Rejected))
+        .expect("stored");
+
+    let findings = store.findings_in_case("case-1").expect("case reads");
+    assert_eq!(findings.len(), 1);
+    assert_eq!(
+        findings[0].status,
+        FindingStatus::Rejected,
+        "a verdict recorded at insert time must be readable"
+    );
+}
+
+#[test]
+fn a_verdict_can_be_recorded_after_the_finding_was_stored() {
+    // The normal path: the engine writes New findings, and a reviewer decides
+    // later. A workflow that only worked if the verdict existed at insert time
+    // would be unusable.
+    let store = seeded_store();
+    let recorded = finding(FindingStatus::New);
+    store.insert_finding("an1", &recorded).expect("stored");
+
+    store
+        .record_review(
+            "an1",
+            &recorded.id.to_string(),
+            FindingStatus::Accepted,
+            Some("confirmed against the source"),
+            1_700_000_100,
+        )
+        .expect("a verdict against a stored finding must be accepted");
+
+    let reviews = store
+        .reviews_of(&recorded.id.to_string())
+        .expect("reviews read");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, "accepted");
+    assert_eq!(
+        reviews[0].note.as_deref(),
+        Some("confirmed against the source")
+    );
+}
+
+#[test]
+fn a_verdict_against_an_unknown_finding_is_refused() {
+    // Recording a verdict with no observation beside it would let a report claim a
+    // reviewer examined something that was never measured.
+    let store = seeded_store();
+    let result = store.record_review(
+        "an1",
+        "no-such-finding",
+        FindingStatus::Accepted,
+        None,
+        1_700_000_100,
+    );
+
+    assert!(result.is_err(), "a review of nothing must be refused");
+    assert_eq!(
+        store.count("finding_reviews").expect("counted"),
+        0,
+        "the refusal must not leave a review row behind"
+    );
+}
+
+#[test]
+fn repeated_verdicts_append_rather_than_replace() {
+    // Who concluded what, and when, is part of the record. Replacing the earlier
+    // verdict would erase a reviewer's earlier reasoning.
+    let store = seeded_store();
+    let recorded = finding(FindingStatus::New);
+    store.insert_finding("an1", &recorded).expect("stored");
+    let id = recorded.id.to_string();
+
+    store
+        .record_review(
+            "an1",
+            &id,
+            FindingStatus::RequiresInvestigation,
+            Some("need the source file"),
+            1_700_000_100,
+        )
+        .expect("first verdict");
+    store
+        .record_review(
+            "an1",
+            &id,
+            FindingStatus::Accepted,
+            Some("checked the source, it is real"),
+            1_700_000_200,
+        )
+        .expect("second verdict");
+
+    let reviews = store.reviews_of(&id).expect("reviews read");
+    assert_eq!(reviews.len(), 2, "both verdicts must survive");
+    assert_eq!(reviews[0].status, "requires-investigation");
+    assert_eq!(reviews[1].status, "accepted");
+}
+
+#[test]
+fn reviews_come_back_in_the_order_they_were_written() {
+    // Ordered by row id, not timestamp: two reviews in the same second must still
+    // come back in write order, or the history reads as if it happened backwards.
+    let store = seeded_store();
+    let recorded = finding(FindingStatus::New);
+    store.insert_finding("an1", &recorded).expect("stored");
+    let id = recorded.id.to_string();
+
+    for (i, status) in [
+        FindingStatus::Reviewed,
+        FindingStatus::Accepted,
+        FindingStatus::Rejected,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .record_review("an1", &id, status, None, 1_700_000_000)
+            .expect("verdict");
+        assert_eq!(
+            store.reviews_of(&id).expect("reviews").len(),
+            i + 1,
+            "each verdict must be readable immediately"
+        );
+    }
+
+    let reviews = store.reviews_of(&id).expect("reviews");
+    let statuses: Vec<&str> = reviews.iter().map(|r| r.status.as_str()).collect();
+    assert_eq!(statuses, vec!["reviewed", "accepted", "rejected"]);
+}
+
+#[test]
+fn recording_a_review_leaves_the_observation_untouched() {
+    let store = seeded_store();
+    let recorded = finding(FindingStatus::New);
+    store.insert_finding("an1", &recorded).expect("stored");
+
+    store
+        .record_review(
+            "an1",
+            &recorded.id.to_string(),
+            FindingStatus::Rejected,
+            Some("not applicable to this delivery"),
+            1_700_000_100,
+        )
+        .expect("verdict");
+
+    let findings = store.findings_in_case("case-1").expect("case reads");
+    assert_eq!(
+        findings[0].observation.summary, "observed something",
+        "the engine's own words must survive a review"
+    );
 }

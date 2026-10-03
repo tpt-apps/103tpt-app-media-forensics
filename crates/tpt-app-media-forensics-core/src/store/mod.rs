@@ -21,7 +21,7 @@ pub mod search;
 
 pub use search::{SearchQuery, SearchResult, SearchScope, SeverityFilter};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use tpt_app_media_forensics_model::time::MediaTime;
 
@@ -451,6 +451,17 @@ impl Store {
     }
 }
 
+/// One reviewer verdict, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReview {
+    /// The verdict, as a [`tpt_app_media_forensics_model::FindingStatus`] tag.
+    pub status: String,
+    /// The reviewer's note, if they wrote one.
+    pub note: Option<String>,
+    /// When the review was recorded, in Unix seconds.
+    pub reviewed_at: i64,
+}
+
 /// A stored analysis run, as read back from the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAnalysis {
@@ -558,10 +569,16 @@ impl Store {
         // The reviewer disposition lives in its own table (spec §66): a review must
         // never overwrite the observation, so it is recorded as a separate row.
         if finding.status != tpt_app_media_forensics_model::FindingStatus::New {
+            // `analysis_id` is part of the primary key of the finding itself, so it
+            // identifies *which run* is being reviewed. Omitting it left the column
+            // NULL and every reviewed finding was rejected by the database: the
+            // review workflow could not have worked on any file.
             self.connection.execute(
-                "INSERT INTO finding_reviews (finding_id, status, note) VALUES (?1, ?2, ?3)",
+                "INSERT INTO finding_reviews (finding_id, analysis_id, status, note) \
+                 VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![
                     finding.id.to_string(),
+                    analysis_id,
                     finding.status.tag(),
                     finding.review_note,
                 ],
@@ -569,6 +586,78 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    /// Records a reviewer's verdict against a finding (spec §66).
+    ///
+    /// Appends a row to `finding_reviews` and leaves the observation untouched, so
+    /// the original measurement remains exactly as the engine produced it. A
+    /// second review of the same finding appends a second row rather than
+    /// replacing the first: the history of who concluded what, and when, is part of
+    /// the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the finding does not exist in this analysis, or if the
+    /// database rejects the write. Recording a verdict against a finding that was
+    /// never stored is rejected rather than creating a review with no observation
+    /// beside it.
+    pub fn record_review(
+        &self,
+        analysis_id: &str,
+        finding_id: &str,
+        status: tpt_app_media_forensics_model::FindingStatus,
+        note: Option<&str>,
+        reviewed_at: i64,
+    ) -> rusqlite::Result<()> {
+        // Verified up front so the error names the real problem — a missing
+        // observation — rather than surfacing as an opaque constraint failure.
+        let exists: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM findings WHERE analysis_id = ?1 AND id = ?2",
+                rusqlite::params![analysis_id, finding_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if exists.is_none() {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "finding {finding_id} is not recorded in analysis {analysis_id}"
+            )));
+        }
+
+        self.connection.execute(
+            "INSERT INTO finding_reviews (finding_id, analysis_id, status, note, reviewed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![finding_id, analysis_id, status.tag(), note, reviewed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Returns every review of one finding, oldest first.
+    ///
+    /// Ordered by row id rather than by timestamp: two reviews recorded in the same
+    /// second must still come back in the order they were written, and a
+    /// same-second tie would otherwise leave the order to the database.
+    pub fn reviews_of(&self, finding_id: &str) -> rusqlite::Result<Vec<StoredReview>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT status, note, reviewed_at FROM finding_reviews \
+             WHERE finding_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([finding_id], |row| {
+            Ok(StoredReview {
+                status: row.get::<_, String>(0)?,
+                note: row.get::<_, Option<String>>(1)?,
+                reviewed_at: row.get(2)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Reads every finding in a case, most severe first.

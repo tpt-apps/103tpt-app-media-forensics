@@ -317,7 +317,16 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [ ] Delivery validation profiles (pass/fail/warn) (§68)
 - [ ] Custom user-defined profiles (§69) with profile versioning (§70)
 - [ ] Rule explainability output (what/why/observed/limitations) (§71)
-- [ ] Review workflow for findings (new/reviewed/accepted/rejected) (§66)
+- [x] Review workflow for findings (new/reviewed/accepted/rejected) (§66)
+      `Store::record_review` and `Store::reviews_of`; `FindingStatus` covers
+      `new`/`reviewed`/`accepted`/`rejected`/`requires-investigation`.
+      Reviews append and never overwrite the observation, so the engine's own
+      wording survives a reviewer's verdict, and repeated verdicts accumulate.
+      **Fixed a bug that made this unusable**: `insert_finding` omitted
+      `analysis_id` from its `finding_reviews` insert, so every reviewed finding
+      was rejected by the database. `insert_finding` had no test coverage at all,
+      which is how a fully broken path stayed green — now pinned by round-trip
+      tests for each verdict state.
 - [ ] Analyst notes on asset/stream/timestamp/frame/finding/evidence (§65)
 - [ ] Comparison against a defined reference/master asset (§67)
 - [ ] More advanced audio measurements (loudness standards, spectral) (§21–22)

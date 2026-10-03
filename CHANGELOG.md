@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### The review workflow could never have worked on any file
+- **Bug: `insert_finding` omitted `analysis_id` from its review insert.** The
+  column is `NOT NULL`, so *every* reviewed finding was rejected by the database
+  with `NOT NULL constraint failed: finding_reviews.analysis_id`. The entire §66
+  review workflow was non-functional, and no test caught it because
+  `insert_finding` had **no test coverage at all** — a green suite around an
+  unexercised function
+- `analysis_id` is part of the finding's primary key, so it identifies *which run*
+  is being reviewed. Passing it was the fix; the schema was right
+- **A regression test now pins this**: storing a reviewed finding must succeed, and
+  every verdict state (`Reviewed`, `Accepted`, `Rejected`,
+  `RequiresInvestigation`) must round-trip individually. A state that fails only for
+  one variant reads as a bug confined to a rare path
+- Added `record_review` and `reviews_of`. The workflow's normal path is the engine
+  writes `New` findings and a reviewer decides *later*, which previously had no API
+  at all — `insert_finding` could only record a verdict that already existed
+- **Repeated verdicts append rather than replace.** Who concluded what, and when, is
+  part of the record; overwriting the earlier verdict would erase a reviewer's
+  earlier reasoning
+- Reviews are ordered by row id, not timestamp: two reviews in the same second must
+  still come back in write order or the history reads as if it ran backwards
+- A verdict against a finding that was never stored is refused, so a report cannot
+  claim a reviewer examined something the engine never measured
+
 #### Search: SQLite compares by storage class, which fails silently
 - `-core/src/store/search.rs` implements search over case data (spec §41):
   `SearchQuery`, `SearchScope`, `SeverityFilter`, `SearchResult`. Scopes are
