@@ -11,6 +11,7 @@
 //! * `inspect` — print container and stream structure for a file
 //! * `analyze` — run the analysis engine over an asset
 //! * `report`  — generate a report from stored results
+//! * `note`    — record an analyst note against a case, asset, or finding
 //! * `batch`   — analyse every media file in a directory
 //!
 //! # Offline by design
@@ -115,6 +116,25 @@ enum Command {
         out: std::path::PathBuf,
     },
 
+    /// Record an analyst note against a case, asset, or finding.
+    Note {
+        /// Case directory produced by `acquire` or `analyze`.
+        #[arg(long)]
+        case_dir: std::path::PathBuf,
+        /// The note text. Read from stdin when omitted or given as `-`, so a
+        /// multi-paragraph note does not have to survive shell quoting.
+        #[arg(long, default_value = "-")]
+        body: String,
+        /// Kind of subject this note is about, e.g. `asset` or `finding`.
+        ///
+        /// Must be given together with `--subject`; neither alone is accepted.
+        #[arg(long)]
+        subject_kind: Option<String>,
+        /// Identifier of the subject, e.g. an asset id.
+        #[arg(long)]
+        subject: Option<String>,
+    },
+
     /// Analyse every media file found beneath a directory.
     Batch {
         /// Directory to scan recursively.
@@ -205,11 +225,90 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Analyze { path, case_dir } => analyse(path, case_dir, cli.json),
         Command::Report { case_dir, out } => generate_report(case_dir, out),
 
+        Command::Note {
+            case_dir,
+            body,
+            subject_kind,
+            subject,
+        } => add_note(
+            case_dir,
+            body,
+            subject_kind.as_deref(),
+            subject.as_deref(),
+            cli.json,
+        ),
+
         Command::Batch {
             directory,
             case_dir,
         } => run_batch(directory, case_dir, cli.json),
     }
+}
+
+/// Records an analyst note (spec §65).
+///
+/// Reads the body from stdin by default: a note is prose, often several
+/// paragraphs, and routing it through shell quoting risks silently mangling it.
+/// The store keeps the bytes verbatim, so nothing between this function and the
+/// database may normalise them.
+fn add_note(
+    case_dir: &std::path::Path,
+    body: &str,
+    subject_kind: Option<&str>,
+    subject: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use std::io::Read as _;
+    use tpt_app_media_forensics_core::store::Store;
+
+    let text = if body == "-" {
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("reading the note from stdin")?;
+        buffer
+    } else {
+        body.to_owned()
+    };
+
+    if text.trim().is_empty() {
+        // An empty note would be indistinguishable from "the analyst wrote
+        // nothing", which is a different record from "something was written".
+        anyhow::bail!("the note body is empty; refusing to record a note with no content");
+    }
+
+    let store = Store::open(case_dir)
+        .with_context(|| format!("{} is not a case directory", case_dir.display()))?;
+    let case_id = store
+        .only_case_id()
+        .context("reading the case record")?
+        .ok_or_else(|| anyhow::anyhow!("{} contains no case record", case_dir.display()))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let id = store
+        .add_note(&case_id, subject_kind, subject, &text, now)
+        .context("recording the note")?;
+
+    if json {
+        let value = serde_json::json!({
+            "note_id": id,
+            "case_id": case_id,
+            "subject_kind": subject_kind,
+            "subject_id": subject,
+            "bytes": text.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        match (subject_kind, subject) {
+            (Some(kind), Some(id)) => println!("Recorded note {id} on {kind}"),
+            _ => println!("Recorded note {id} on the case"),
+        }
+    }
+    Ok(())
 }
 
 /// Default GOP-length tolerance, in frames.

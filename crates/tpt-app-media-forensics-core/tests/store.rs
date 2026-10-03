@@ -4,9 +4,10 @@
 //! the layout, pragmas, and round-trip behaviour are covered together rather
 //! than in isolation.
 
+use tpt_app_media_forensics_core::case_dir::CaseDirectory;
 use tpt_app_media_forensics_core::store::{Store, StoredAnalysis, StoredAsset};
 use tpt_app_media_forensics_model::{
-    AssetId, Confidence, Finding, FindingId, FindingStatus, Observation, Severity,
+    AssetId, Case, Confidence, Finding, FindingId, FindingStatus, Observation, Severity,
 };
 
 fn asset(id: &str, sha: &str) -> StoredAsset {
@@ -808,6 +809,27 @@ fn a_note_body_is_stored_verbatim() {
     assert_eq!(
         notes[0].body, body,
         "the analyst's text must survive byte for byte"
+    );
+}
+
+#[test]
+fn a_new_case_is_readable_from_its_database_immediately() {
+    // `acquire` creates the case; `analyze` used to be the only thing that wrote a
+    // `cases` row. So an acquired-but-never-analysed case reported no case id, and
+    // every read path -- notes, reviews, reports -- treated it as empty.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = Case::new(
+        "Acquired Only".to_owned(),
+        Some("no analysis yet".to_owned()),
+    );
+    let root = dir.path().join("case.tptcase");
+    CaseDirectory::create(&root, &case).expect("creates case");
+
+    let store = tpt_app_media_forensics_core::store::Store::open(&root).expect("opens");
+    assert_eq!(
+        store.only_case_id().expect("reads").as_deref(),
+        Some(case.id.to_string().as_str()),
+        "a freshly acquired case must be visible in its own database"
     );
 }
 

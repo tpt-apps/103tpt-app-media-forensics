@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use tpt_app_media_forensics_model::{Case, CaseId, EntityKind};
 
 use crate::error::CoreError;
+use crate::store::Store;
 
 /// Directory name of the manifest file.
 const MANIFEST_FILE: &str = "manifest.json";
@@ -75,7 +76,41 @@ impl CaseDirectory {
 
         dir.ensure_layout()?;
         dir.write_manifest(case)?;
+        dir.record_case_row(case)?;
         Ok(dir)
+    }
+
+    /// Writes the case's identity into the case database.
+    ///
+    /// The manifest is the authority on what a case *is*, but the database is what
+    /// every read path goes through — findings, notes, reviews, reports. A case
+    /// created without a row here is one that `only_case_id` reports as absent and
+    /// that `load_report` refuses, even though the directory looks complete.
+    ///
+    /// Best-effort by design: a case whose database cannot be opened is still a
+    /// valid case directory, and refusing to create one because SQLite is
+    /// unavailable would make the on-disk record depend on a database that may be
+    /// rebuilt later. The row is written when the case is next analysed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the case database is present but rejects the write, which
+    /// means the case exists in two places that disagree.
+    fn record_case_row(&self, case: &Case) -> Result<(), CoreError> {
+        let store = match Store::open(self.root()) {
+            Ok(store) => store,
+            // A missing or unreadable database is not a failure here; see above.
+            Err(_) => return Ok(()),
+        };
+        store
+            .upsert_case(
+                &case.id.to_string(),
+                &case.name,
+                case.description.as_deref(),
+            )
+            .map_err(|e| CoreError::InvalidManifest {
+                reason: format!("recording the case in the database failed: {e}"),
+            })
     }
 
     /// Opens an existing case directory.

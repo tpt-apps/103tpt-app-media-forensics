@@ -40,7 +40,9 @@ fn help_lists_every_documented_subcommand() {
     let (ok, stdout, _) = split(output);
 
     assert!(ok);
-    for command in ["hash", "acquire", "inspect", "analyze", "report", "batch"] {
+    for command in [
+        "hash", "acquire", "inspect", "analyze", "report", "note", "batch",
+    ] {
         assert!(
             stdout.contains(command),
             "`{command}` is missing from the help output"
@@ -834,5 +836,275 @@ fn a_renamed_webm_file_is_reported_as_a_mismatch() {
     assert!(
         stderr.contains("DOES NOT MATCH") || stdout.contains("DOES NOT MATCH"),
         "the rename must be reported: {stdout}{stderr}"
+    );
+}
+
+/// Creates a case directory containing one real media file.
+fn acquired_case(dir: &Path) -> std::path::PathBuf {
+    let file = fixture(
+        dir,
+        "evidence.mp4",
+        &build_mp4(&TrackSpec::video_25fps(64, 48, 4)),
+    );
+    let parent = dir.join("out");
+    std::fs::create_dir_all(&parent).expect("creates parent");
+
+    let output = cli()
+        .args([
+            "acquire",
+            file.to_str().expect("utf-8 path"),
+            "--name",
+            "Note Case",
+            "--parent",
+            parent.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(output.status.success(), "acquire must succeed");
+
+    parent.join("case.tptcase")
+}
+
+/// Reads back every note recorded on a case.
+fn notes_in(case: &Path) -> Vec<tpt_app_media_forensics_core::store::StoredNote> {
+    let store = tpt_app_media_forensics_core::store::Store::open(case).expect("opens");
+    let case_id = store.only_case_id().expect("reads").expect("one case");
+    store.notes_in_case(&case_id).expect("reads")
+}
+
+#[test]
+fn a_note_is_recorded_and_read_back_verbatim() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = acquired_case(dir.path());
+
+    // Multi-line and with a trailing space: the store keeps the body verbatim, and
+    // routing prose through a shell argument risks mangling it.
+    let body = "First line.\r\nSecond line.   ";
+    let output = cli()
+        .args([
+            "note",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "--body",
+            body,
+            "--subject-kind",
+            "asset",
+            "--subject",
+            "asset-1",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+    assert!(ok, "the note must be recorded: {stderr}");
+    assert!(
+        stdout.contains("asset"),
+        "the subject is reported: {stdout}"
+    );
+
+    let recorded = notes_in(&case);
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].body, body,
+        "the body must survive byte for byte"
+    );
+    assert_eq!(recorded[0].subject_kind.as_deref(), Some("asset"));
+    assert_eq!(recorded[0].subject_id.as_deref(), Some("asset-1"));
+}
+
+#[test]
+fn a_case_level_note_needs_no_subject() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = acquired_case(dir.path());
+
+    let output = cli()
+        .args([
+            "note",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "--body",
+            "Client disputes the timestamp.",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+    assert!(ok, "a case-level note must be accepted: {stderr}");
+
+    let recorded = notes_in(&case);
+    assert_eq!(recorded.len(), 1);
+    assert!(
+        !recorded[0].is_attached(),
+        "no subject means a case-level note"
+    );
+}
+
+#[test]
+fn a_note_naming_only_half_its_subject_is_refused() {
+    // Accepting it would let a later reader attach the analyst's conclusion to the
+    // wrong thing.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = acquired_case(dir.path());
+    let case_str = case.to_str().expect("utf-8 path");
+
+    for args in [
+        vec![
+            "note",
+            "--case-dir",
+            case_str,
+            "--body",
+            "half",
+            "--subject-kind",
+            "asset",
+        ],
+        vec![
+            "note",
+            "--case-dir",
+            case_str,
+            "--body",
+            "half",
+            "--subject",
+            "asset-1",
+        ],
+    ] {
+        let output = cli().args(&args).output().expect("runs CLI");
+        let (ok, _, stderr) = split(output);
+        assert!(!ok, "half a subject must be refused: {stderr}");
+        assert!(
+            stderr.to_lowercase().contains("subject"),
+            "the error must name the problem: {stderr}"
+        );
+    }
+
+    assert!(
+        notes_in(&case).is_empty(),
+        "a refused note must not be recorded"
+    );
+}
+
+#[test]
+fn an_empty_note_is_refused() {
+    // An empty note is indistinguishable from "the analyst wrote nothing", which
+    // is a different record.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = acquired_case(dir.path());
+
+    let output = cli()
+        .args([
+            "note",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "--body",
+            "   ",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+    assert!(!ok, "an empty note must be refused: {stderr}");
+    assert!(notes_in(&case).is_empty());
+}
+
+#[test]
+fn a_note_json_output_is_valid_json() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = acquired_case(dir.path());
+
+    let output = cli()
+        .args([
+            "--json",
+            "note",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "--body",
+            "recorded",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+    assert!(ok, "{stderr}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(value["note_id"].is_i64(), "the note id is reported");
+    assert_eq!(value["subject_kind"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_note_against_a_non_case_directory_fails_with_a_diagnosable_message() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let output = cli()
+        .args([
+            "note",
+            "--case-dir",
+            dir.path().to_str().expect("utf-8 path"),
+            "--body",
+            "nowhere to put this",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "a plain directory is not a case");
+    assert!(
+        stderr.contains("case"),
+        "the error must say what was wrong: {stderr}"
+    );
+}
+
+#[test]
+fn notes_survive_into_a_generated_report() {
+    // The end-to-end claim: a note written through the CLI appears in the report
+    // produced afterwards. Each half was separately tested; this is what proves
+    // they are the same path.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = acquired_case(dir.path());
+    let case_str = case.to_str().expect("utf-8 path");
+    let media = dir.path().join("evidence.mp4");
+
+    let analysed = cli()
+        .args([
+            "analyze",
+            media.to_str().expect("utf-8 path"),
+            "--case-dir",
+            case_str,
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(
+        analysed.status.success(),
+        "analyze must succeed: {}",
+        String::from_utf8_lossy(&analysed.stderr)
+    );
+
+    let noted = cli()
+        .args([
+            "note",
+            "--case-dir",
+            case_str,
+            "--body",
+            "Client says this is the wrong master.",
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(noted.status.success(), "the note must be recorded");
+
+    let out = dir.path().join("report.html");
+    let reported = cli()
+        .args([
+            "report",
+            "--case-dir",
+            case_str,
+            "--out",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(
+        reported.status.success(),
+        "report must succeed: {}",
+        String::from_utf8_lossy(&reported.stderr)
+    );
+
+    let html = std::fs::read_to_string(&out).expect("reads report");
+    assert!(
+        html.contains("Client says this is the wrong master."),
+        "the note must reach the report"
     );
 }

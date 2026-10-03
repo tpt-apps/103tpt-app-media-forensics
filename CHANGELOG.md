@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### `acquire` created a case the database did not know about
+- Writing the `note` command surfaced a gap two sessions in the making:
+  `CaseDirectory::create` wrote the manifest but never a `cases` row. `analyze` was
+  the only thing that inserted one. So an **acquired-but-never-analysed case
+  reported no case id**, and every read path — notes, reviews, `load_report` —
+  treated that case as empty. `note` on a freshly acquired case failed with
+  "contains no case record"
+- `record_case_row` now writes the row at creation, best-effort: a case whose
+  database cannot be opened is still a valid case directory, and refusing to
+  create one because SQLite is unavailable would tie the on-disk record to a
+  database that may be rebuilt later. A database that is *present but rejects the
+  write* is an error, because that means the case exists in two places that
+  disagree
+- Pinned by a store test that creates a case and immediately reads it back
+
+#### The `note` command
+- Closes the write-side gap left when notes landed: the store could hold them and
+  the report could show them, but nothing could write one without a database client
+- `--body` defaults to `-` (stdin) because a note is prose, often several
+  paragraphs, and routing it through shell quoting risks silently mangling it. The
+  store keeps bytes verbatim, so nothing in the path may normalise them
+- An empty body is refused. An empty note is indistinguishable from "the analyst
+  wrote nothing", which is a different record
+- `--subject-kind` and `--subject` must be given together or not at all, enforced
+  by `add_note`; the CLI test asserts the error *names* the problem rather than
+  failing with a bare constraint message
+- One test runs the whole path — `acquire`, `analyze`, `note`, `report` — and
+  asserts the note appears in the generated HTML. Each half was separately tested;
+  this is what proves they are the same path, which is exactly what the
+  `record_case_row` bug was not
+
 #### Analyst notes reach the report — and the schema version says so
 - Closes the gap noted when notes landed: `Report` now carries `notes`, and both
   the HTML and PDF renderers show them. A report that omitted a reviewer's

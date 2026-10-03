@@ -339,9 +339,13 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       The `notes` table existed since the base schema with no API above it — the
       feature was unreachable. Notes now also reach the report: `Report` carries
       `notes`, and the HTML and PDF renderers show them. The report schema
-      version moved to a `REPORT_SCHEMA_VERSION` constant, bumped to 2. Not done:
-      no CLI command to write a note, and the CSV renderers omit notes (they are
-      per-finding tables).
+      version moved to a `REPORT_SCHEMA_VERSION` constant, bumped to 2. The write
+      path is closed too: a `note` CLI subcommand records a note from a `--body`
+      argument or stdin, with optional `--subject-kind`/`--subject` (which must be
+      given together). **Fixed along the way:** `CaseDirectory::create` never
+      wrote a `cases` row — only `analyze` did — so an acquired-but-never-analysed
+      case reported no case id and every read path treated it as empty. Not done:
+      the CSV renderers omit notes (they are per-finding tables).
 - [ ] Comparison against a defined reference/master asset (§67)
 - [ ] More advanced audio measurements (loudness standards, spectral) (§21–22)
 - [ ] More advanced visual anomaly detection
