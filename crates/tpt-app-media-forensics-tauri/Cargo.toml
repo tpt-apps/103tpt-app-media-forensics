@@ -12,18 +12,78 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/tpt-apps/tpt-app-media-forensics"
 homepage = "https://github.com/tpt-apps/tpt-app-media-forensics"
 publish = false
+# The desktop binary. The library target exists so the view models can be
+# tested without building a webview: `cargo test` in this directory runs the
+# whole screen layer headlessly, which is what the deterministic engine crates
+# gate on and what keeps a UI change from being unverifiable.
+default-run = "tpt-app-media-forensics-tauri"
+
+[[bin]]
+name = "tpt-app-media-forensics-tauri"
+path = "src/main.rs"
+
+[build-dependencies]
+# Generates the context the macros expand against, and validates
+# `tauri.conf.json` at compile time rather than at first window paint.
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# The runtime and its webview backend. Version 2 is pinned to the 2.x line:
+# the IPC macro and capability model changed across 1.x -> 2.x, and an unpinned
+# dependency would let a future major silently change what every command in this
+# crate compiles to.
+tauri = { version = "2", features = [] }
+# Folder pickers for opening a case directory and adding source media. The app
+# writes only inside a case directory, so a path always originates from a
+# dialog rather than from free text (spec §11).
+tauri-plugin-dialog = "2"
+
 # The shell depends on the engine crates, never the reverse: the media engine
 # must stay independent of Tauri so the CLI and any future service reuse it
 # identically (spec §78).
 tpt-app-media-forensics-model = { path = "../tpt-app-media-forensics-model" }
 tpt-app-media-forensics-core = { path = "../tpt-app-media-forensics-core" }
 tpt-app-media-forensics-report = { path = "../tpt-app-media-forensics-report" }
+# Reached through for the types the screens display. These are the same
+# measurement types the rules consume, so a number shown in the GUI is the same
+# number the rules decided on. Depending on them here does not make the GUI an
+# analyser: nothing in this crate computes a measurement.
+tpt-app-media-forensics-container = { path = "../tpt-app-media-forensics-container" }
+tpt-app-media-forensics-video = { path = "../tpt-app-media-forensics-video" }
+tpt-app-media-forensics-audio = { path = "../tpt-app-media-forensics-audio" }
+tpt-app-media-forensics-metadata = { path = "../tpt-app-media-forensics-metadata" }
+tpt-app-media-forensics-timing = { path = "../tpt-app-media-forensics-timing" }
+# The whole-file comparison aggregate (`-rules::comparison`). Its per-stream
+# half lives in `-model`, but the aggregate needs `MetadataTree`, `SceneReport`
+# and `SilenceRegion`, which is why it cannot live in the model crate. The
+# comparison screen displays the engine's own tolerances rather than deriving
+# its own.
+tpt-app-media-forensics-rules = { path = "../tpt-app-media-forensics-rules" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
+# `Store`'s public API returns `rusqlite::Result`, so the read paths in this
+# crate handle that error type directly rather than routing every failure
+# through the pipeline's `CoreError`. Pinned to the same 0.32 line as the engine
+# so both crates link one bundled SQLite rather than two copies of it.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+# Fixtures for the corrupt-media screen tests (spec §75): a truncated container,
+# a file whose declared structure is nonsense, and an empty file all have to
+# reach every screen without taking the process down.
+tempfile = "3"
+# The AV1 encoder, for one purpose: proving the viewer can decode *real* pixels.
+# A frame-decoding test fed synthetic frames would prove nothing about the path
+# a file actually takes - compressed bytes in, pixels out - and the whole
+# question of whether the pixel inspector can be wired at all turns on whether a
+# genuine encoded stream survives the trip. The foundation ships this encoder
+# backed by rav1e, so the fixture needs no ffmpeg on the build machine.
+# Dev-only: nothing in the shipped binary encodes anything.
+tpt-kinetix-av1 = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "28cefd802f7d4684057c5765aeb1c7edf086a10e" }
+# `VideoFrame`, `PixelFormat` and `Timestamp` for building the encoder input.
+tpt-kinetix-core = { git = "https://github.com/tpt-solutions/tpt-kinetix", rev = "28cefd802f7d4684057c5765aeb1c7edf086a10e" }
 
 [lints.rust]
 missing_docs = "warn"

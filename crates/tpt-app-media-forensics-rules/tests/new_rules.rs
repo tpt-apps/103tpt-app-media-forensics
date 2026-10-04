@@ -51,6 +51,18 @@ fn run(bundle: &AnalysisBundle, rule_id: &str) -> Vec<Finding> {
     rule.evaluate(bundle, &RuleProfile::default())
 }
 
+/// Evaluates every rule through the *engine*, not through `rule.evaluate`.
+///
+/// The distinction is the whole point of the §71 tests below. `run` above calls
+/// a rule directly and therefore skips `RuleEngine::evaluate`, which is where the
+/// rationale is attached — so a test written with `run` could not detect a
+/// rationale that never reached a finding.
+fn evaluate(bundle: &AnalysisBundle) -> Vec<Finding> {
+    RuleEngine::new(builtin_rules())
+        .evaluate(bundle, &RuleProfile::default())
+        .expect("rule evaluation is infallible")
+}
+
 fn clean_bytes() -> Vec<u8> {
     build_mp4(&TrackSpec::video_25fps(320, 240, 60))
 }
@@ -123,6 +135,83 @@ fn every_rule_explains_what_it_checks_and_why_it_matters() {
             rule.why_it_matters().trim().len() > 20,
             "{} gives no meaningful rationale",
             rule.id()
+        );
+    }
+}
+
+/// Every finding the engine produces must arrive carrying its rule's rationale.
+///
+/// The test above only proves each rule *has* the text. That was true for every
+/// rule while nothing ever read it: `what_it_checks` and `why_it_matters` were
+/// called from this file and nowhere else in the codebase, so spec §71 was
+/// satisfied at the trait level and at no other. A rule that explains itself into
+/// a void is the same defect this project has shipped twice — once for
+/// `measure_audio`, once for `av_sync::analyse` — and once more for the whole
+/// comparison engine.
+///
+/// This closes it at the boundary that matters: the point where a rule's prose
+/// becomes part of a finding a reviewer will read.
+#[test]
+fn every_finding_carries_its_rules_explanation() {
+    // A GOP change trips a known rule, so the engine has something to explain.
+    let bundle = bundle_with_container(build_mp4_stsd_gop_change());
+    let findings = evaluate(&bundle);
+    assert!(
+        !findings.is_empty(),
+        "the fixture must trip at least one rule"
+    );
+
+    for finding in &findings {
+        let rationale = finding
+            .rationale
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} carries no rationale at all", finding.rule_id));
+
+        assert!(
+            rationale.checks.trim().len() > 10,
+            "{} reached a finding with an empty 'what it checks'",
+            finding.rule_id
+        );
+        assert!(
+            rationale.why_it_matters.trim().len() > 20,
+            "{} reached a finding with an empty 'why it matters'",
+            finding.rule_id
+        );
+        assert!(
+            !rationale.does_not_establish.trim().is_empty(),
+            "{} reached a finding stating no limitations; a finding with no stated \
+             limits reads as more conclusive than one that states them",
+            finding.rule_id
+        );
+    }
+}
+
+/// The rationale on a finding must be its *own* rule's, not a neighbour's.
+#[test]
+fn a_findings_explanation_matches_the_rule_that_produced_it() {
+    let bundle = bundle_with_container(build_mp4_stsd_gop_change());
+    let findings = evaluate(&bundle);
+
+    // Each rule states distinct prose, so a finding carrying another rule's text
+    // is detectable by comparing against the rule set.
+    for finding in &findings {
+        let rule = builtin_rules()
+            .into_iter()
+            .find(|r| r.id() == finding.rule_id)
+            .unwrap_or_else(|| panic!("{} is not a registered rule", finding.rule_id));
+
+        let rationale = finding.rationale.as_ref().expect("rationale");
+        assert_eq!(
+            rationale.checks,
+            rule.what_it_checks(),
+            "{} carries another rule's explanation",
+            finding.rule_id
+        );
+        assert_eq!(
+            rationale.why_it_matters,
+            rule.why_it_matters(),
+            "{} carries another rule's explanation",
+            finding.rule_id
         );
     }
 }
@@ -835,7 +924,8 @@ fn bundle_with_packet_damage(bytes: &[u8]) -> AnalysisBundle {
     if let Some(inspection) = &bundle.container {
         let samples =
             tpt_app_media_forensics_container::read_samples(bytes.to_vec()).expect("reads samples");
-        bundle.packet_damage = tpt_app_media_forensics_container::scan_packets(&samples, inspection);
+        bundle.packet_damage =
+            tpt_app_media_forensics_container::scan_packets(&samples, inspection);
     }
     bundle
 }
@@ -846,7 +936,11 @@ fn a_clean_file_reports_no_packet_damage() {
     // `CONTAINER.UNREADABLE_PACKET` fire on every asset in a case.
     let bytes = clean_bytes();
     let bundle = bundle_with_packet_damage(&bytes);
-    assert!(bundle.packet_damage.is_empty(), "{:?}", bundle.packet_damage);
+    assert!(
+        bundle.packet_damage.is_empty(),
+        "{:?}",
+        bundle.packet_damage
+    );
     assert!(run(&bundle, "CONTAINER.UNREADABLE_PACKET").is_empty());
 }
 
@@ -1021,7 +1115,9 @@ fn a_lost_reference_says_how_many_frames_it_cost() {
     assert_eq!(findings.len(), 1, "{findings:?}");
     let measurements = &findings[0].observation.measurements;
     assert!(
-        measurements.iter().any(|m| m.contains('7') && m.contains("skipped")),
+        measurements
+            .iter()
+            .any(|m| m.contains('7') && m.contains("skipped")),
         "the finding must say how many frames the damage cost: {measurements:?}"
     );
 }

@@ -353,6 +353,35 @@ pub struct StoredAsset {
     pub blake3: Option<String>,
 }
 
+/// The stored spelling of how a timeline position was arrived at.
+///
+/// A stable tag rather than `{:?}`: the database is a record that outlives the
+/// Rust enum, and a debug rendering would change with the type's name. These
+/// columns exist for querying; `payload` is the authority, so a tag that ever
+/// fell behind would not corrupt the record.
+fn placement_tag(placement: tpt_app_media_forensics_model::timeline::Placement) -> &'static str {
+    use tpt_app_media_forensics_model::timeline::Placement;
+    match placement {
+        Placement::Measured => "measured",
+        Placement::Inferred => "inferred",
+        // An entry with no position is *unplaced*, which is not the same as
+        // placed at zero. Recording it as `measured` at time 0 would fabricate
+        // the one position the engine never established.
+        Placement::Unplaced => "unplaced",
+    }
+}
+
+/// The stored spelling of which stage produced a timeline entry.
+fn source_tag(source: tpt_app_media_forensics_model::timeline::TimelineSource) -> &'static str {
+    use tpt_app_media_forensics_model::timeline::TimelineSource;
+    match source {
+        TimelineSource::StructuralDamage => "structural_damage",
+        TimelineSource::Timestamp => "timestamp",
+        TimelineSource::Finding => "finding",
+        TimelineSource::PacketDamage => "packet_damage",
+        TimelineSource::DecodeDamage => "decode_damage",
+    }
+}
 impl Store {
     /// Inserts or replaces a case.
     ///
@@ -511,6 +540,48 @@ pub struct StoredAnalysis {
     pub started_at: i64,
 }
 
+/// How much of a case's timeline is a record of what the runs observed.
+///
+/// Schema v4 began retaining the timeline with the run. A case whose analyses
+/// predate it opens cleanly and shows an empty strip, and the empty strip is
+/// true — nothing was retained — but it reads as "this run found nothing", which
+/// is the more dangerous of the two claims in a forensic tool. This type exists so
+/// the screen can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineRetention {
+    /// The case holds no analysis at all.
+    ///
+    /// Distinct from `Complete` with an empty strip: nothing was examined, which
+    /// is not the same as examining something and observing nothing.
+    NoRuns,
+    /// Every recorded run retained its timeline, so the strip is a complete
+    /// record of what those runs observed.
+    Complete,
+    /// At least one run predates timeline retention and recorded no strip.
+    ///
+    /// The strip still shows what the *later* runs found. What it cannot show is
+    /// anything about the earlier ones, and an analyst must be told so rather than
+    /// shown a partial strip that looks whole.
+    Partial {
+        /// Runs that retained no timeline.
+        unrecorded_runs: usize,
+        /// Runs recorded in the case.
+        total_runs: usize,
+    },
+}
+
+impl TimelineRetention {
+    /// Whether the strip accounts for every run in the case.
+    ///
+    /// `Partial` is not complete even though the strip draws: the markers are the
+    /// later runs', and their absence from the earlier runs is a gap in the record
+    /// rather than an absence of observations.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
 impl Store {
     /// Records an analysis run.
     ///
@@ -520,8 +591,8 @@ impl Store {
         self.connection.execute(
             "INSERT INTO analyses (id, case_id, asset_id, cache_key, software_version, \
          analysis_version, status, finding_count, rule_count, profile, \
-         profile_fingerprint, rule_set_fingerprint, started_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'COMPLETE', ?7, ?8, ?9, ?10, ?11, ?12)",
+         profile_fingerprint, rule_set_fingerprint, started_at, writer_schema_version) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'COMPLETE', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 analysis.id,
                 analysis.case_id,
@@ -535,9 +606,54 @@ impl Store {
                 analysis.profile_fingerprint,
                 analysis.rule_set_fingerprint,
                 analysis.started_at,
+                schema::SCHEMA_VERSION,
             ],
         )?;
         Ok(())
+    }
+
+    /// How much of a case's timeline can be read as a record of what was found.
+    ///
+    /// Three outcomes, and the difference between the last two is the whole
+    /// point:
+    ///
+    /// * `Complete` — every recorded run was written by a build that persisted
+    ///   the timeline, so an empty strip means the run observed nothing.
+    /// * `Partial { unrecorded_runs }` — at least one run predates timeline
+    ///   retention. Its strip was never written, and no conclusion about that
+    ///   run can be drawn from this case.
+    /// * `NoRuns` — the case has no analysis at all, which is not the same as a
+    ///   run that found nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `rusqlite` error if the query fails.
+    pub fn timeline_retention_in_case(
+        &self,
+        case_id: &str,
+    ) -> rusqlite::Result<TimelineRetention> {
+        // The count is over `analyses`, not `timeline_entries`: a run that
+        // recorded an empty strip and a run that recorded nothing at all are
+        // indistinguishable from the entries alone, and treating them as equal
+        // is the conflation this type exists to prevent.
+        let (runs, unrecorded): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(writer_schema_version IS NULL), 0) FROM analyses \
+             WHERE case_id = ?1",
+            [case_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let runs = usize::try_from(runs).unwrap_or(usize::MAX);
+        let unrecorded = usize::try_from(unrecorded).unwrap_or(usize::MAX);
+        Ok(match (runs, unrecorded) {
+            (0, _) => TimelineRetention::NoRuns,
+            (_, 0) => TimelineRetention::Complete,
+            (_, n) => TimelineRetention::Partial {
+                unrecorded_runs: n,
+                total_runs: runs,
+            },
+        })
     }
 
     /// Records every rule that ran, so a case shows what was considered even when
@@ -562,6 +678,94 @@ impl Store {
     /// typed columns, so `report` re-renders the engine's output exactly rather
     /// than a reconstruction from lossy columns. Append-only: an existing finding
     /// is never updated (spec §66).
+    /// Records the timeline an analysis produced (spec §31).
+    ///
+    /// The engine merges structural damage, timestamp anomalies and positioned
+    /// findings into one ordered strip and returns it in `AnalysisOutcome`.
+    /// Without this call the strip is built, handed back, and dropped — which is
+    /// what left the video, audio, scene and error layers permanently empty for
+    /// every case reopened after its run.
+    ///
+    /// `position` is the index within the timeline and is what preserves the
+    /// engine's ordering. The stored order is the run's order, so re-reading it
+    /// reproduces the strip exactly; it is not re-sorted on the way out, because
+    /// re-deriving an order at read time is how two renderings of one run come
+    /// to disagree.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `rusqlite` error if the insert fails. Serialisation failure is
+    /// reported rather than swallowed: an entry that could not be written is a
+    /// run whose record is incomplete, and a silently dropped observation is
+    /// exactly the failure this whole table exists to prevent.
+    pub fn insert_timeline(
+        &self,
+        analysis_id: &str,
+        asset_id: &str,
+        timeline: &tpt_app_media_forensics_model::Timeline,
+    ) -> rusqlite::Result<()> {
+        for (position, entry) in timeline.entries.iter().enumerate() {
+            let payload = serde_json::to_string(entry)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let micros = entry.time.map_or(0, MediaTime::as_micros);
+            self.connection.execute(
+                "INSERT INTO timeline_entries (analysis_id, asset_id, position, time_micros, \
+                 placement, source, reference, summary, payload) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    analysis_id,
+                    asset_id,
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                    micros,
+                    placement_tag(entry.placement),
+                    source_tag(entry.source),
+                    entry.reference,
+                    entry.summary,
+                    payload,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every timeline entry recorded for a case, in the order the runs produced.
+    ///
+    /// Entries are read back from `payload`, which is the authority: the typed
+    /// columns exist for querying, not for reconstructing. An entry whose payload
+    /// cannot be parsed is skipped rather than fatal, so one unreadable row does
+    /// not make an entire case unopenable.
+    ///
+    /// Ordering is `(position, id)` per analysis, analyses by start time, so a
+    /// case opened twice draws the same strip both times (spec §77).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `rusqlite` error if the query fails.
+    pub fn timeline_in_case(
+        &self,
+        case_id: &str,
+    ) -> rusqlite::Result<Vec<tpt_app_media_forensics_model::TimelineEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT te.payload FROM timeline_entries te \
+             JOIN analyses a ON a.id = te.analysis_id \
+             WHERE a.case_id = ?1 \
+             ORDER BY a.started_at, te.analysis_id, te.position, te.id",
+        )?;
+        let rows = statement.query_map([case_id], |row| row.get::<_, String>(0))?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let payload = row?;
+            if let Ok(entry) = serde_json::from_str(&payload) {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Writes one finding and its review disposition.
+    ///
+    /// The finding is appended, never updated: a review records a disposition
+    /// beside the observation rather than changing it (spec §66).
     pub fn insert_finding(
         &self,
         analysis_id: &str,
@@ -809,6 +1013,82 @@ impl Store {
             // read: one corrupt row must not make a case unreportable.
             if let Ok(finding) = serde_json::from_str(&payload) {
                 out.push(finding);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Records a retained artefact and returns its identifier (spec §32-§33).
+    ///
+    /// The complete evidence record is stored as canonical JSON in `payload`
+    /// alongside the typed columns, for the same reason findings are: a report
+    /// rebuilt from the database must state exactly what was verified, not a
+    /// reconstruction from the lossy columns. `sha256` and `blake3` are stored
+    /// separately because `search` matches against them, and a search that had to
+    /// deserialise every row to find a hash would not be a search.
+    ///
+    /// Append-only like findings: re-writing an artefact's row would silently
+    /// rewrite the record of what was examined.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database rejects the write.
+    pub fn insert_evidence(
+        &self,
+        analysis_id: &str,
+        evidence: &tpt_app_media_forensics_model::Evidence,
+    ) -> rusqlite::Result<()> {
+        let payload = serde_json::to_string(evidence)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        self.connection.execute(
+            "INSERT INTO evidence (id, analysis_id, asset_id, kind, provenance, \
+             relative_path, caption, size_bytes, sha256, blake3, verified, created_at, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                evidence.id.to_string(),
+                analysis_id,
+                evidence.asset_id.to_string(),
+                evidence.kind.tag(),
+                evidence.provenance.tag(),
+                evidence.relative_path,
+                evidence.caption,
+                i64::try_from(evidence.integrity.size_bytes).unwrap_or(i64::MAX),
+                evidence.integrity.hashes.sha256(),
+                evidence.integrity.hashes.blake3(),
+                i64::from(evidence.integrity.verified),
+                0_i64,
+                payload,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Reads every evidence artefact recorded against a case.
+    ///
+    /// Ordered by `id` so a rebuilt report lists the same artefacts in the same
+    /// order on every run; evidence has no severity to sort by, and an unstable
+    /// order would make two reports of one case differ for no stated reason.
+    ///
+    /// A payload that will not parse is skipped rather than failing the read, for
+    /// the same reason `findings_in_case` does.
+    pub fn evidence_in_case(
+        &self,
+        case_id: &str,
+    ) -> rusqlite::Result<Vec<tpt_app_media_forensics_model::Evidence>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT e.payload FROM evidence e \
+             JOIN analyses a ON a.id = e.analysis_id \
+             WHERE a.case_id = ?1 \
+             ORDER BY e.id",
+        )?;
+
+        let rows = stmt.query_map([case_id], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(evidence) = serde_json::from_str(&row?) {
+                out.push(evidence);
             }
         }
         Ok(out)

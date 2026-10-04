@@ -262,7 +262,11 @@ mod tests {
         let report = analyse(&frames);
 
         assert_eq!(report.comparisons_skipped, 1);
-        assert_eq!(report.differences.len(), 1, "only the adjacent pair compares");
+        assert_eq!(
+            report.differences.len(),
+            1,
+            "only the adjacent pair compares"
+        );
         assert_eq!(report.differences[0].index, 10);
         assert!((report.differences[0].mean_absolute - 255.0).abs() < 1e-9);
     }

@@ -64,6 +64,29 @@ pub enum CoreError {
     #[error("the analysis was cancelled")]
     Cancelled,
 
+    /// A background analysis worker ended without producing a result.
+    ///
+    /// Distinct from every other variant because nothing was wrong with the media
+    /// or the case: the thread died, which is a defect in this program rather than
+    /// an observation about the file. It is reported rather than propagated because
+    /// a panic unwinding out of a worker thread would otherwise be silent — the
+    /// joiner would see an `Err` with no explanation — and because "malformed
+    /// media must never crash the application" (spec §75, §96) has to hold for a
+    /// decoder panic on hostile input just as much as for a parse error.
+    ///
+    /// `retryable` is true for a panic and false for a worker the operating system
+    /// refused to start: the first may recur on a different file, the second will
+    /// recur on this machine until something else is closed.
+    #[error("the background analysis worker for {path} {reason}")]
+    WorkerFailed {
+        /// The path being analysed.
+        path: String,
+        /// What happened, in a form a reader can act on.
+        reason: String,
+        /// Whether re-running this analysis could plausibly succeed.
+        retryable: bool,
+    },
+
     /// A case directory is missing expected structure.
     #[error("case directory is not initialised: {0}")]
     CaseDirectoryNotInitialised(PathBuf),

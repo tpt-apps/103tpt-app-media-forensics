@@ -89,6 +89,22 @@ pub fn to_html(report: &Report) -> String {
                 }
                 out.push_str("</ul>\n");
             }
+            // Spec §71: what the rule checks, why it matters, what was observed, and what
+            // the observation does not establish. The three prose blocks travel with
+            // the finding rather than being looked up from the rule at render time,
+            // so they survive into the JSON and the PDF a reviewer reads later.
+            if let Some(rationale) = &finding.rationale {
+                out.push_str("<dl class=\"rationale\">\n");
+                out.push_str(&format!(
+                    "<dt>What this checks</dt><dd>{}</dd>\n",
+                    escape_html(&rationale.checks)
+                ));
+                out.push_str(&format!(
+                    "<dt>Why it matters</dt><dd>{}</dd>\n",
+                    escape_html(&rationale.why_it_matters)
+                ));
+                out.push_str("</dl>\n");
+            }
             if let (Some(start), Some(end)) = (finding.timeline_start, finding.timeline_end) {
                 out.push_str(&format!(
                     "<p class=\"time\">{} - {}</p>\n",
@@ -96,10 +112,21 @@ pub fn to_html(report: &Report) -> String {
                     end.to_timecode()
                 ));
             }
-            out.push_str(
-                "<p class=\"limits\">This observation does not establish intent, \
-                 authorship, or authenticity.</p>\n</article>\n",
-            );
+            // The rule's own caveat where it states one, the report-wide
+            // disclaimer otherwise. A finding with no stated limits reads as more
+            // conclusive than one that states them, so this is never omitted — but
+            // boilerplate is labelled as boilerplate rather than presented as if
+            // the rule author had written it about this specific observation.
+            let limitation = match &finding.rationale {
+                Some(rationale) if rationale.has_specific_limit() => {
+                    rationale.does_not_establish.clone()
+                }
+                _ => tpt_app_media_forensics_model::RuleRationale::DEFAULT_LIMITATION.to_owned(),
+            };
+            out.push_str(&format!(
+                "<p class=\"limits\">{}</p>\n</article>\n",
+                escape_html(&limitation)
+            ));
         }
     }
     out.push_str("</section>\n");

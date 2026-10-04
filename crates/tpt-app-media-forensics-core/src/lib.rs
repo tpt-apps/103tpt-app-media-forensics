@@ -39,6 +39,8 @@ pub use cache::{AnalysisCache, CacheEntry};
 pub mod batch;
 pub mod pipeline;
 pub mod progress;
+pub mod worker;
 
 pub use pipeline::{measure_audio, AnalysisEngine, AnalysisOutcome, AudioMeasurements};
 pub use progress::{Cancellation, Progress, ProgressTracker, Stage};
+pub use worker::AnalysisJob;

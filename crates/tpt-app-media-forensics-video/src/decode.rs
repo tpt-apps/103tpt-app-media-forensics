@@ -38,6 +38,10 @@ use tpt_kinetix_core::pixel_format::PixelFormat;
 use tpt_kinetix_core::timestamp::Timestamp;
 use tpt_kinetix_vp9::Vp9Decoder;
 
+use tpt_app_media_forensics_model::MediaTime;
+
+use crate::frame::{FrameError, FrameImage};
+
 /// Bounds on how much work a decode session will do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeLimits {
@@ -240,7 +244,11 @@ impl DecodeDamage {
                 reason,
             } => format!(
                 "packet {packet} ({}) was rejected by the decoder: {reason}",
-                if *is_key_frame { "keyframe" } else { "predicted" }
+                if *is_key_frame {
+                    "keyframe"
+                } else {
+                    "predicted"
+                }
             ),
             Self::LostReference {
                 from_packet,
@@ -385,6 +393,78 @@ impl DecodedFrame {
     pub fn luma_at(&self, x: usize, y: usize) -> Option<u8> {
         let w = self.width as usize;
         (x < w && y < self.height as usize).then(|| self.luma[y * w + x])
+    }
+
+    /// Converts the frame to a greyscale image for extraction as evidence (§32).
+    ///
+    /// # Greyscale, and deliberately not colour
+    ///
+    /// A `DecodedFrame` keeps only the luma plane — chroma is what `scene` and
+    /// `near_duplicate` do not need, and keeping it for every frame in a bounded
+    /// window would multiply the memory that bound exists to avoid. There is
+    /// therefore no chroma here to convert.
+    ///
+    /// Two ways to produce colour were rejected, and both would have been lies:
+    /// assuming neutral chroma (which renders a saturated frame as grey and hides
+    /// exactly the colour shift a reviewer may be looking for) and re-decoding
+    /// through the full YUV path (which would make evidence extraction cost a
+    /// second decode of the whole window). The artefact says what it is, and the
+    /// caption states it, so a reviewer comparing it against a reference decode
+    /// knows why the colours differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::EmptyFrame`] for a zero-sized frame, and
+    /// [`FrameError::PlaneSizeMismatch`] when the luma plane is shorter than the
+    /// declared dimensions — a truncated or hostile frame. Refused rather than
+    /// padded, because padding would produce a plausible image with invented
+    /// pixels along one edge.
+    ///
+    /// # Panics
+    ///
+    /// Never.
+    pub fn to_greyscale(&self, time: MediaTime) -> Result<FrameImage, FrameError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(FrameError::EmptyFrame);
+        }
+        let pixels = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .ok_or(FrameError::EmptyFrame)?;
+
+        if self.luma.len() < pixels {
+            return Err(FrameError::PlaneSizeMismatch {
+                width: self.width,
+                height: self.height,
+                actual: self.luma.len(),
+            });
+        }
+
+        // R = G = B = Y, with no matrix applied. Applying BT.601 to a neutral
+        // chroma would apply the matrix's offset and rescale the output, yielding a
+        // different image from the one the analysers actually measured — and an
+        // evidence frame that disagrees with the finding it supports is worse than
+        // none.
+        let rgb = self
+            .luma
+            .iter()
+            .take(pixels)
+            .flat_map(|&y| [y, y, y])
+            .collect();
+
+        Ok(FrameImage {
+            rgb,
+            width: self.width,
+            height: self.height,
+            time,
+            // The packet index, matching what `extract` records and what the
+            // pixel rules report, so a finding and its evidence frame agree on
+            // which frame it means.
+            frame_index: u32::try_from(self.index).unwrap_or(u32::MAX),
+            // No matrix was applied, so none is claimed. The string says
+            // which planes were missing rather than just "none", because a greyscale
+            // frame and a frame that was already RGB need different explanations.
+            colour_matrix: "none (luma only; chroma not retained)",
+        })
     }
 }
 
@@ -645,7 +725,14 @@ impl DecodeSession {
             });
         }
 
-        Self::reconcile(&mut run, packets.len());
+        // Only reconcile when the stream was walked to the end. If a limit stopped the
+        // run, the packets after that point were never examined rather than
+        // dropped, and calling them lost would be a false finding — on top of
+        // inflating the count the report prints. `stopped` already states the
+        // real reason the tail is missing.
+        if run.stopped.is_none() {
+            Self::reconcile(&mut run, packets.len());
+        }
         run
     }
 
@@ -731,13 +818,7 @@ impl DecodeSession {
     ///
     /// Split out so the body of [`Self::decode_resilient`] reads as the
     /// resynchronisation policy rather than as buffer management.
-    fn retain(
-        &mut self,
-        index: usize,
-        is_key_frame: bool,
-        frame: VideoFrame,
-        run: &mut DecodeRun,
-    ) {
+    fn retain(&mut self, index: usize, is_key_frame: bool, frame: VideoFrame, run: &mut DecodeRun) {
         let Some(reduced) = reduce(index, is_key_frame, frame) else {
             run.damage.push(DecodeDamage::UnusableFrame {
                 packet: index,
@@ -1012,7 +1093,10 @@ mod tests {
             gop.len(),
             "a clean stream decodes fully"
         );
-        assert!(clean.is_clean(), "a clean stream reports nothing: {clean:?}");
+        assert!(
+            clean.is_clean(),
+            "a clean stream reports nothing: {clean:?}"
+        );
 
         let victim = gop
             .iter()
@@ -1052,10 +1136,7 @@ mod tests {
         // the decoder silently drops is diagnosable twice — once by the keyframe
         // rule, once by the index gap — and has to collapse to one defect.
         let gop = encode_av1_gop(9);
-        let victim = gop
-            .iter()
-            .position(|(_, key)| *key)
-            .expect("a keyframe");
+        let victim = gop.iter().position(|(_, key)| *key).expect("a keyframe");
         let mut broken = gop.clone();
         for byte in broken[victim].0.iter_mut().skip(3) {
             *byte ^= 0xFF;
@@ -1064,11 +1145,7 @@ mod tests {
         let mut session = DecodeSession::open("av01", DecodeLimits::default()).expect("decoder");
         let run = session.decode_resilient(&broken);
 
-        let reports = run
-            .damage
-            .iter()
-            .filter(|d| d.packet() == victim)
-            .count();
+        let reports = run.damage.iter().filter(|d| d.packet() == victim).count();
         assert_eq!(
             reports, 1,
             "one lost packet is one defect: {:?}",
@@ -1090,11 +1167,39 @@ mod tests {
     }
 
     #[test]
+    fn a_run_stopped_by_a_limit_does_not_claim_the_unread_tail_was_lost() {
+        // The tail of a bounded run was never examined, not dropped. Calling it a
+        // decode failure would be a false finding *and* would inflate the very count
+        // spec §30 asks the report to print.
+        let mut session = DecodeSession::open(
+            "av01",
+            DecodeLimits {
+                max_frames: 0,
+                max_frames_in_memory: 8,
+            },
+        )
+        .expect("av01 is decodable");
+
+        let packets: Vec<(Vec<u8>, bool)> = (0..20).map(|_| (vec![0u8; 16], true)).collect();
+        let run = session.decode_resilient(&packets);
+
+        assert!(matches!(
+            run.stopped,
+            Some(DecodeError::LimitReached { .. })
+        ));
+        assert!(
+            run.damage.is_empty(),
+            "no packet was examined, so none was lost: {:?}",
+            run.damage
+        );
+    }
+
+    #[test]
     fn a_clean_stream_produces_no_damage_and_no_stop() {
         // The common path must report nothing at all, or every report carries a
         // corruption section that means nothing.
-        let mut session = DecodeSession::open("av01", DecodeLimits::default())
-            .expect("av01 is decodable");
+        let mut session =
+            DecodeSession::open("av01", DecodeLimits::default()).expect("av01 is decodable");
         let run = session.decode_resilient(&[]);
 
         assert!(run.is_clean(), "{run:?}");
@@ -1106,11 +1211,9 @@ mod tests {
     fn garbage_packets_are_recorded_rather_than_returned_as_errors() {
         // Bytes that are not AV1 at all. The point is that the caller gets a
         // *report*, not an `Err`: one corrupt file must not end an examination.
-        let mut session = DecodeSession::open("av01", DecodeLimits::default())
-            .expect("av01 is decodable");
-        let packets: Vec<(Vec<u8>, bool)> = (0..3)
-            .map(|_| (vec![0xABu8; 64], true))
-            .collect();
+        let mut session =
+            DecodeSession::open("av01", DecodeLimits::default()).expect("av01 is decodable");
+        let packets: Vec<(Vec<u8>, bool)> = (0..3).map(|_| (vec![0xABu8; 64], true)).collect();
 
         let run = session.decode_resilient(&packets);
         assert!(
@@ -1154,8 +1257,7 @@ mod tests {
                 reason: "x".to_owned(),
             },
         ];
-        let tags: std::collections::BTreeSet<_> =
-            variants.iter().map(DecodeDamage::tag).collect();
+        let tags: std::collections::BTreeSet<_> = variants.iter().map(DecodeDamage::tag).collect();
         assert_eq!(tags.len(), 3, "each variant needs its own tag");
         for damage in &variants {
             assert!(!damage.describe().is_empty());
@@ -1177,10 +1279,13 @@ mod tests {
     fn the_frame_limit_stops_the_run_but_keeps_what_was_recovered() {
         // A bounded run must say it was bounded. Returning the frames with no
         // indication the stream continued would read as a complete analysis.
-        let mut session = DecodeSession::open("av01", DecodeLimits {
-            max_frames: 0,
-            max_frames_in_memory: 8,
-        })
+        let mut session = DecodeSession::open(
+            "av01",
+            DecodeLimits {
+                max_frames: 0,
+                max_frames_in_memory: 8,
+            },
+        )
         .expect("av01 is decodable");
 
         let run = session.decode_resilient(&[(vec![0u8; 8], true)]);
@@ -1191,7 +1296,7 @@ mod tests {
         assert!(!run.is_clean());
     }
 
-#[test]
+    #[test]
     fn errors_describe_themselves() {
         // These strings reach the report, so they must name the condition.
         assert!(DecodeError::NotPixelExact {

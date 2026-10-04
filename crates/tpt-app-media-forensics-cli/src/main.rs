@@ -10,6 +10,8 @@
 //! * `acquire` — record an acquisition manifest for a file
 //! * `inspect` — print container and stream structure for a file
 //! * `analyze` — run the analysis engine over an asset
+//! * `compare` — compare two files across every measured axis
+//! * `search`  — search a case's findings, assets, and evidence
 //! * `report`  — generate a report from stored results
 //! * `note`    — record an analyst note against a case, asset, or finding
 //! * `batch`   — analyse every media file in a directory
@@ -135,6 +137,61 @@ enum Command {
         subject: Option<String>,
     },
 
+    /// Compare two media files across every measured axis (spec §38–40).
+    ///
+    /// Both files are analysed directly. No case directory is involved: a
+    /// comparison is a read-only question about two files, and writing an
+    /// analysis record for each would put evidence in the case that nobody
+    /// examined.
+    Compare {
+        /// The first file. Opened read-only.
+        left: std::path::PathBuf,
+        /// The second file. Opened read-only.
+        right: std::path::PathBuf,
+    },
+
+    /// Search a case's findings, assets, and evidence (spec §41).
+    Search {
+        /// Case directory produced by `acquire` or `analyze`.
+        #[arg(long)]
+        case_dir: std::path::PathBuf,
+
+        /// Text to look for. Omitted lists everything in scope.
+        term: Option<String>,
+
+        /// Which records to search.
+        #[arg(long, value_enum, default_value = "all")]
+        scope: SearchScopeArg,
+
+        /// Only findings at this severity or above.
+        #[arg(long, value_enum)]
+        min_severity: Option<SeverityArg>,
+
+        /// Maximum rows to return.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// Report whether a case's findings permit delivery (spec §68).
+    ///
+    /// Reads the case rather than re-analysing it: the verdict is a statement
+    /// about findings that were already measured, and re-running the engine to
+    /// reach the same numbers would risk reporting a verdict against a different
+    /// run than the one the findings came from.
+    Validate {
+        /// Case directory produced by `analyze`.
+        #[arg(long)]
+        case_dir: std::path::PathBuf,
+
+        /// Also write the verdict into the case's report bundle.
+        ///
+        /// Off by default: a verdict is a claim about delivery, and silently
+        /// adding one to an existing report bundle would change a record the
+        /// analyst has not asked to change.
+        #[arg(long)]
+        write: bool,
+    },
+
     /// Analyse every media file found beneath a directory.
     Batch {
         /// Directory to scan recursively.
@@ -143,6 +200,56 @@ enum Command {
         #[arg(long)]
         case_dir: std::path::PathBuf,
     },
+}
+
+/// Which records `search` looks at, as a command-line value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SearchScopeArg {
+    /// Findings only.
+    Findings,
+    /// Assets only.
+    Assets,
+    /// Evidence only.
+    Evidence,
+    /// Everything.
+    All,
+}
+
+impl From<SearchScopeArg> for tpt_app_media_forensics_core::store::SearchScope {
+    fn from(value: SearchScopeArg) -> Self {
+        use tpt_app_media_forensics_core::store::SearchScope;
+        match value {
+            SearchScopeArg::Findings => SearchScope::Findings,
+            SearchScopeArg::Assets => SearchScope::Assets,
+            SearchScopeArg::Evidence => SearchScope::Evidence,
+            SearchScopeArg::All => SearchScope::All,
+        }
+    }
+}
+
+/// A severity floor for `search`, as a command-line value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SeverityArg {
+    /// Findings at Critical or above.
+    Critical,
+    /// Findings at Significant or above.
+    Significant,
+    /// Findings at Warning or above.
+    Warning,
+    /// Every finding.
+    Info,
+}
+
+impl From<SeverityArg> for tpt_app_media_forensics_model::Severity {
+    fn from(value: SeverityArg) -> Self {
+        use tpt_app_media_forensics_model::Severity;
+        match value {
+            SeverityArg::Critical => Severity::Critical,
+            SeverityArg::Significant => Severity::Significant,
+            SeverityArg::Warning => Severity::Warning,
+            SeverityArg::Info => Severity::Info,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -242,6 +349,29 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             directory,
             case_dir,
         } => run_batch(directory, case_dir, cli.json),
+
+        Command::Compare { left, right } => compare(left, right, cli.json),
+
+        Command::Validate { case_dir, write } => validate_delivery(case_dir, *write, cli.json),
+
+        Command::Search {
+            case_dir,
+            term,
+            scope,
+            min_severity,
+            limit,
+            // Copied out of the `&self.cli` match binding. `search_case` takes values
+            // rather than references because it hands them straight to `SearchQuery`,
+            // which is built rather than borrowed — a reference here would have to
+            // outlive the query for no gain.
+        } => search_case(
+            case_dir,
+            term.as_deref(),
+            *scope,
+            *min_severity,
+            *limit,
+            cli.json,
+        ),
     }
 }
 
@@ -970,17 +1100,57 @@ fn notes_for(
 
 /// Analyses a media file and writes the result into a case (spec §97).
 ///
-/// Runs the same engine the desktop app uses, so a finding means the same
-/// thing however it was reached (spec §51). The source is opened read-only.
+/// Runs the same engine the desktop app uses, so a finding means the same thing
+/// however it was reached (spec §51). The source is opened read-only.
+///
+/// The analysis runs on a background worker (spec §55) and reports each stage to
+/// stderr as it completes, because a QC pass over a feature-length master takes
+/// long enough that a silent terminal looks like a hung process. It goes to
+/// stderr rather than stdout so that `--json` output stays machine-readable and
+/// pipeable: a progress line interleaved with the result document would corrupt
+/// both for anything parsing the output.
+///
+/// The result is identical whatever progress is printed — progress is a report
+/// about the run, never a measurement of the media.
 fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> anyhow::Result<()> {
-    use tpt_app_media_forensics_core::{AnalysisEngine, CaseDirectory};
+    use std::sync::{Arc, Mutex};
+
+    use tpt_app_media_forensics_core::{AnalysisEngine, AnalysisJob, CaseDirectory, Progress};
     use tpt_app_media_forensics_report::{write_bundle, AssetSummary, Methodology, Report};
 
     let directory = CaseDirectory::open(case_dir)
         .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
 
-    let engine = AnalysisEngine::new();
-    let outcome = engine.analyse(path, &directory)?;
+    let engine = Arc::new(AnalysisEngine::new());
+
+    // The last line printed, so a stage that reports twice does not print twice.
+    let seen = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&seen);
+    let progress = tpt_app_media_forensics_core::ProgressTracker::reporting(move |event| {
+        let line = match event {
+            Progress::Started { stage, .. } => format!("{} ...", stage.tag()),
+            Progress::Finished { stage } => format!("{} done", stage.tag()),
+            Progress::BranchFinished {
+                completed, total, ..
+            } => format!("concurrent analysis: {completed} of {total} independent stages done"),
+        };
+
+        let mut seen = sink.lock().expect("progress lock");
+        if *seen == line {
+            return;
+        }
+        *seen = line.clone();
+        drop(seen);
+        eprintln!("  {line}");
+    });
+
+    let job = AnalysisJob::spawn(
+        Arc::clone(&engine),
+        path.to_path_buf(),
+        directory.clone(),
+        progress,
+    )?;
+    let outcome = job.join()?;
 
     let profile = &outcome.profile;
     let fingerprint = engine.analysis_fingerprint(&outcome.cache_key);
@@ -1016,7 +1186,11 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
             stream_count: outcome.asset.acquisition.size_bytes as usize,
         }],
         findings: outcome.findings.clone(),
-        evidence: Vec::new(),
+        // The artefacts this run wrote into the case, each verified by re-reading
+        // it from disk after writing. Previously hardcoded empty, so the report's
+        // evidence table rendered no rows and `referenced_evidence` could only ever
+        // return nothing.
+        evidence: outcome.evidence.clone(),
         limitations: outcome.limitations.clone(),
         // Notes already on the case travel into the bundle. Reading them back means
         // re-running `analyse` on a case an analyst has already annotated produces a
@@ -1039,6 +1213,11 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
             "analysis_fingerprint": fingerprint,
             "finding_count": outcome.findings.len(),
             "findings": outcome.findings,
+            // The artefacts this run wrote, so a machine consumer can locate them
+            // without re-reading the case. Previously absent from the JSON entirely,
+            // which meant evidence was written and then invisible to any script.
+            "evidence_count": outcome.evidence.len(),
+            "evidence": outcome.evidence,
             "timeline": outcome.timeline,
             "encoder_indicators": outcome.fingerprint,
             "limitations": outcome.limitations,
@@ -1070,6 +1249,20 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
                 finding.severity.tag(),
                 finding.rule_id,
                 finding.observation.summary
+            );
+        }
+        // Evidence is stated even when there is none. An analyst who sees no line
+        // here cannot tell "no frames were decoded" from "nothing was written",
+        // and those are very different conclusions about the strength of the
+        // examination — so the count is always printed and the artefacts listed
+        // when they exist.
+        println!("Evidence      {}", outcome.evidence.len());
+        for artefact in &outcome.evidence {
+            println!(
+                "  {}  {}  {} bytes",
+                artefact.kind.tag(),
+                artefact.relative_path,
+                artefact.integrity.size_bytes
             );
         }
         // The placement qualifier travels with each timecode, so an inferred
@@ -1111,6 +1304,426 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
     Ok(())
 }
 
+/// Compares two media files across every measured axis (spec §38–40).
+///
+/// Analyses both files directly rather than reading a case, because a comparison
+/// is a question *about* two files rather than a finding *about* an asset: it
+/// creates no case, writes no analysis record, and touches nothing. Both sources
+/// are opened read-only.
+///
+/// # What the output does and does not claim
+///
+/// The result reports differences and, separately, axes it could not compare.
+/// Those are kept apart because "we could not read it" and "it matches" are
+/// different claims, and a comparison that collapsed them would tell a reviewer
+/// two files are equivalent when in fact nothing was measured.
+///
+/// There is deliberately no overall verdict and no similarity score. A transcode
+/// to a lower bitrate and a re-mux with reordered atoms produce byte-different
+/// files, but only the first changed anything a reviewer would care about; a
+/// single number would discard exactly the information the command exists to
+/// surface.
+fn compare(left: &std::path::Path, right: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::AnalysisEngine;
+    use tpt_app_media_forensics_rules::comparison::compare as compare_inputs;
+
+    let engine = AnalysisEngine::new();
+    let left_bundle = engine.observe_stages(left).0;
+    let right_bundle = engine.observe_stages(right).0;
+
+    let left_name = display_name(left);
+    let right_name = display_name(right);
+    let left_input = comparison_input(&left_bundle, &left_name);
+    let right_input = comparison_input(&right_bundle, &right_name);
+    let result = compare_inputs(&left_input, &right_input);
+
+    emit(json, &result, &render_comparison(&result));
+    Ok(())
+}
+
+/// The file's name, so a report identifies two files by more than a full path.
+fn display_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Builds the comparison input for one analysed asset.
+///
+/// Every field is `Option` and stays `None` when the stage that would have
+/// measured it did not run. Passing a zero for an unmeasured axis would make
+/// "not measured" indistinguishable from "measured as zero", which is the same
+/// conflation the comparison types exist to prevent.
+fn comparison_input<'a>(
+    bundle: &'a tpt_app_media_forensics_rules::AnalysisBundle,
+    name: &'a str,
+) -> tpt_app_media_forensics_rules::comparison::ComparisonInput<'a> {
+    use tpt_app_media_forensics_rules::comparison::ComparisonInput;
+
+    ComparisonInput {
+        name,
+        streams: bundle.container.as_ref().map(|c| c.streams.as_slice()),
+        metadata: bundle.metadata.as_ref(),
+        scene: bundle.scene.as_ref(),
+        silence: Some(bundle.silence.as_slice()),
+        loudness: bundle.loudness.as_ref(),
+    }
+}
+
+/// One-line rendering of a per-property comparison.
+///
+/// The three that matter are kept visibly distinct: a difference, a property only
+/// one side has, and a property neither side could measure.
+fn describe_difference(
+    difference: &tpt_app_media_forensics_model::comparison::Difference,
+) -> String {
+    use tpt_app_media_forensics_model::comparison::Difference;
+    match difference {
+        Difference::Equal => "same on both sides".to_owned(),
+        Difference::Different { left, right } => format!("{left} vs {right}"),
+        Difference::OnlyLeft { value } => format!("only on the left: {value}"),
+        Difference::OnlyRight { value } => format!("only on the right: {value}"),
+        Difference::NotComparable { reason } => format!("not compared: {reason}"),
+    }
+}
+
+/// One-line rendering of a tolerance-based comparison.
+fn describe_within_tolerance(
+    result: &tpt_app_media_forensics_rules::comparison::WithinTolerance,
+) -> String {
+    use tpt_app_media_forensics_rules::comparison::WithinTolerance;
+    match result {
+        WithinTolerance::Agree { lower, upper, .. } => {
+            format!("{lower:.1} to {upper:.1} LU, within tolerance")
+        }
+        WithinTolerance::Diverge { left, right, .. } => {
+            format!("{left:.1} LU vs {right:.1} LU, outside tolerance")
+        }
+        WithinTolerance::Unmeasured { .. } => "not measured on at least one side".to_owned(),
+    }
+}
+
+/// Renders a comparison as text.
+///
+/// Grouped by axis and ordered by [`ComparisonAxis::ALL`], so two runs of the
+/// same comparison read in the same order — a report whose ordering varies is
+/// hard to diff and easy to misread.
+///
+/// Per-property results are labelled `same`, `DIFFERS`, or `NOT COMPARED` rather
+/// than only the interesting ones being printed. A reader shown only the
+/// differences would conclude the files match on everything else, which is the
+/// one inference this command must not invite.
+fn render_comparison(result: &tpt_app_media_forensics_rules::comparison::Comparison) -> String {
+    use tpt_app_media_forensics_model::comparison::{ComparisonAxis, ComparisonSide};
+
+    let mut out = String::new();
+    out.push_str(&format!("Left        {}\n", result.left_name));
+    out.push_str(&format!("Right       {}\n", result.right_name));
+
+    // Three outcomes, not two. "Equivalent" is deliberately strict — it is false
+    // whenever any axis went uncomparable even if nothing differs — so printing a
+    // bare "no" would leave a reader unable to tell a real disagreement from an
+    // axis this build never measured. Those are different sentences.
+    let differences = result.measured_differences();
+    out.push_str(&format!(
+        "Result      {}\n",
+        match (differences.is_empty(), result.is_equivalent()) {
+            (false, _) => format!("{} measured difference(s) — see below", differences.len()),
+            (true, true) => "equivalent on every axis measured".to_owned(),
+            (true, false) => {
+                "no measured differences, but not every axis could be compared".to_owned()
+            }
+        }
+    ));
+    out.push_str(&format!(
+        "Tolerances  loudness {:.2} LU, scene changes {:.1}\n",
+        result.tolerances.loudness_lu, result.tolerances.scene_changes
+    ));
+
+    for axis in ComparisonAxis::ALL {
+        let mut lines: Vec<String> = Vec::new();
+
+        for stream in &result.streams.streams {
+            for field in stream.fields.iter().filter(|f| f.axis == *axis) {
+                let label = if field.difference.is_different() {
+                    "DIFFERS"
+                } else if field.difference.is_not_comparable() {
+                    "NOT COMPARED"
+                } else {
+                    "same"
+                };
+                lines.push(format!(
+                    "  {label:<13} {} — {}",
+                    field.field,
+                    describe_difference(&field.difference)
+                ));
+            }
+        }
+
+        // Whole-file axes live outside the per-stream list, so they are rendered
+        // from their own summaries. Without this an axis measured only once —
+        // silence, with no video stream to attach it to — would never appear.
+        match axis {
+            ComparisonAxis::SceneStructure => lines.push(format!(
+                "  {:<13} {}",
+                "scene changes",
+                describe_difference(&result.scene.changes)
+            )),
+            ComparisonAxis::Silence => {
+                lines.push(format!(
+                    "  {:<13} {}",
+                    "silent regions",
+                    describe_difference(&result.silence.region_counts)
+                ));
+                lines.push(format!(
+                    "  {:<13} {}",
+                    "silent frames",
+                    describe_within_tolerance(&result.silence.totals)
+                ));
+            }
+            ComparisonAxis::Loudness => lines.push(format!(
+                "  {:<13} {}",
+                "integrated loudness",
+                describe_within_tolerance(&result.loudness)
+            )),
+            _ => {}
+        }
+
+        if lines.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("{}\n", axis.tag()));
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    if !result.unmatched().is_empty() {
+        out.push_str("Unmatched streams\n");
+        for stream in result.unmatched() {
+            let side = match stream.side {
+                ComparisonSide::Left => "left ",
+                ComparisonSide::Right => "right",
+            };
+            out.push_str(&format!(
+                "  {side} stream {} ({}): no counterpart\n",
+                stream.index, stream.codec
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !result.metadata.is_empty() {
+        out.push_str("Metadata\n");
+        for entry in &result.metadata {
+            let track = match entry.track_index {
+                Some(index) => format!(" (track {index})"),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "  {}{track}: {}\n",
+                entry.key,
+                describe_difference(&entry.difference)
+            ));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Searches a case's findings, assets, and evidence (spec §41).
+///
+/// The point of this command is that the engine has been writing findings to the
+/// database and, before it, nothing read them back out. An examiner who wanted
+/// one finding out of five thousand had no way to name it.
+///
+/// # Truncation is never implied by a short list
+///
+/// `--limit` bounds how many rows are returned, and the count of everything that
+/// matched is reported alongside it. Showing 200 of 5,000 rows and printing a
+/// bare "200 results" would be a false statement about the case — and worse, one
+/// a reviewer could not detect from the output alone.
+///
+/// # A severity floor constrains findings only
+///
+/// `--min-severity` filters findings. Assets and evidence carry no severity, so
+/// the floor does not hide them; dropping them would mean searching a case for
+/// its assets at WARNING and being told there were none.
+fn search_case(
+    case_dir: &std::path::Path,
+    term: Option<&str>,
+    scope: SearchScopeArg,
+    min_severity: Option<SeverityArg>,
+    limit: Option<usize>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::store::search::search as run_search;
+    use tpt_app_media_forensics_core::store::{SearchQuery, SeverityFilter, Store};
+
+    let directory = CaseDirectory::open(case_dir)
+        .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
+    let store = Store::open(directory.root())?;
+    let case_id = store.only_case_id()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds no case, so there is nothing to search",
+            case_dir.display()
+        )
+    })?;
+
+    let mut query = match term {
+        Some(text) => SearchQuery::text(text),
+        None => SearchQuery::all(),
+    };
+    query.scope = Some(scope.into());
+    query.severity = min_severity.map(|s| SeverityFilter::AtLeast(s.into()));
+    query.limit = limit;
+
+    let result = run_search(store.connection(), &case_id, &query)
+        .map_err(|e| anyhow::anyhow!("search failed for {}: {e}", case_dir.display()))?;
+
+    emit(
+        json,
+        &SearchJson::new(&query, &result),
+        &render_search(&query, &result),
+    );
+    Ok(())
+}
+
+/// The search result in a shape that serialises usefully.
+///
+/// A thin wrapper rather than a `#[derive(Serialize)]` on `SearchResult` so the
+/// JSON gains a name for what was searched *for*, not only what it found — a
+/// document listing 200 rows is ambiguous without it.
+#[derive(serde::Serialize)]
+struct SearchJson {
+    term: String,
+    scope: &'static str,
+    matched: usize,
+    total: usize,
+    truncated: bool,
+    hits: Vec<SearchHitJson>,
+}
+
+/// One row, in the shape the CLI prints.
+#[derive(serde::Serialize)]
+struct SearchHitJson {
+    scope: &'static str,
+    severity: Option<&'static str>,
+    label: String,
+    id: String,
+}
+
+impl SearchJson {
+    /// Builds the JSON view of a search.
+    ///
+    /// Takes the query as well as the result so `term` and `scope` describe what
+    /// was actually asked for. Taken from the result alone they would have to be
+    /// invented, and a document that names the wrong search is worse than one that
+    /// omits the name.
+    fn new(
+        query: &tpt_app_media_forensics_core::store::SearchQuery,
+        result: &tpt_app_media_forensics_core::store::search::SearchResult,
+    ) -> Self {
+        Self {
+            term: query.trimmed().to_owned(),
+            scope: scope_tag(query.effective_scope()),
+            matched: result.hits.len(),
+            total: result.total,
+            truncated: result.truncated,
+            hits: result
+                .hits
+                .iter()
+                .map(|hit| SearchHitJson {
+                    scope: scope_tag(hit.scope),
+                    severity: hit.severity.map(|s| s.tag()),
+                    label: hit.label.clone(),
+                    id: hit.id.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A stable lowercase tag for a search scope.
+fn scope_tag(scope: tpt_app_media_forensics_core::store::SearchScope) -> &'static str {
+    use tpt_app_media_forensics_core::store::SearchScope;
+    match scope {
+        SearchScope::Findings => "finding",
+        SearchScope::Assets => "asset",
+        SearchScope::Evidence => "evidence",
+        SearchScope::All => "all",
+    }
+}
+
+/// Renders search results as text.
+///
+/// The count line always states both the rows returned *and* the total that
+/// matched. A truncated page says so in words rather than leaving a short list to
+/// imply there was nothing more — the difference between "200 findings" and
+/// "200 of 5,000 findings" is the difference between a report and a fabrication.
+fn render_search(
+    query: &tpt_app_media_forensics_core::store::SearchQuery,
+    result: &tpt_app_media_forensics_core::store::SearchResult,
+) -> String {
+    let mut out = String::new();
+
+    // Echo what was searched for, not only what was found, so a saved output can
+    // be read months later without reference to the command that produced it.
+    let term = query.trimmed();
+    if term.is_empty() {
+        out.push_str("Term        (none — every record in scope)\n");
+    } else {
+        out.push_str(&format!("Term        {term}\n"));
+    }
+    out.push_str(&format!(
+        "Scope       {}\n",
+        scope_tag(query.effective_scope())
+    ));
+
+    if result.truncated {
+        out.push_str(&format!(
+            "Results     {} of {} matches (truncated by --limit)\n",
+            result.hits.len(),
+            result.total
+        ));
+    } else {
+        out.push_str(&format!("Results     {} match(es)\n", result.total));
+    }
+
+    if result.is_empty() {
+        // Distinguishes "nothing matched" from "nothing was looked at", which a
+        // whitespace-only term or a wrong scope could otherwise blur.
+        out.push_str("\nNo matching records.\n");
+        return out;
+    }
+
+    out.push('\n');
+    for hit in &result.hits {
+        let severity = hit
+            .severity
+            .map(|s| format!("[{}] ", s.tag()))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  {:<9} {severity}{}\n",
+            scope_tag(hit.scope),
+            hit.label
+        ));
+        out.push_str(&format!("            {}\n", hit.id));
+    }
+
+    if result.truncated {
+        out.push_str(&format!(
+            "\n{} more match(es) exist; raise --limit to see them.\n",
+            result.total - result.hits.len()
+        ));
+    }
+
+    out
+}
+
 /// Reads the case name from its manifest, falling back to the directory name.
 fn directory_manifest_name(directory: &CaseDirectory) -> String {
     directory
@@ -1123,6 +1736,111 @@ fn directory_manifest_name(directory: &CaseDirectory) -> String {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "case".to_owned())
         })
+}
+
+/// Reports whether a case's findings permit delivery (spec §68).
+///
+/// The verdict is derived from the findings' severities through
+/// `ValidationResult::from_findings`, which is the single place that decides what
+/// blocks a delivery. Nothing here restates that rule: a second copy in the
+/// command layer would be free to disagree with the one the report renders.
+///
+/// Reads the stored findings rather than re-analysing, for the same reason
+/// `generate_report` does — a verdict computed from a fresh run would be a
+/// statement about that run, not about the findings in the case.
+fn validate_delivery(case_dir: &std::path::Path, write: bool, json: bool) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::pipeline::load_report;
+    use tpt_app_media_forensics_report::{write_bundle, ValidationResult};
+
+    let directory = CaseDirectory::open(case_dir)
+        .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
+    let loaded = load_report(&directory)?;
+    let report = &loaded.report;
+
+    let verdict = ValidationResult::from_findings(&report.findings);
+
+    // The blocking findings, named rather than counted. "FAIL" on its own tells an
+    // analyst nothing about what to fix; the rule id and summary are what they act
+    // on, and a verdict that does not carry them is not actionable.
+    let blocking: Vec<&tpt_app_media_forensics_model::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.severity.fails_validation())
+        .collect();
+    let warnings: Vec<&tpt_app_media_forensics_model::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == tpt_app_media_forensics_model::Severity::Warning)
+        .collect();
+
+    if write {
+        // Rewritten from the loaded report with the verdict attached, so the bundle
+        // on disk and the report rendered from the database agree. Written to a
+        // sibling directory rather than over the caller's, because an existing
+        // bundle is a record of a previous render.
+        let bundle_dir = directory.root().join("reports").join("validated");
+        let mut validated = loaded.report.clone();
+        validated.validation = Some(verdict);
+        let manifest = write_bundle(&validated, &bundle_dir)?;
+        println!("Bundle        {}", bundle_dir.display());
+        for entry in &manifest.files {
+            println!("  {}  sha256 {}", entry.name, entry.sha256);
+        }
+    }
+
+    let payload = serde_json::json!({
+        "case_dir": case_dir.display().to_string(),
+        "result": verdict.label(),
+        "blocking": blocking.iter().map(|f| serde_json::json!({
+            "rule_id": f.rule_id,
+            "severity": f.severity.tag(),
+            "summary": f.observation.summary,
+        })).collect::<Vec<_>>(),
+        "warnings": warnings.iter().map(|f| serde_json::json!({
+            "rule_id": f.rule_id,
+            "summary": f.observation.summary,
+        })).collect::<Vec<_>>(),
+        "written_to_case": write,
+    });
+
+    let mut text = String::new();
+    text.push_str(&format!("Result        {}\n", verdict.label()));
+    text.push_str(&format!("Findings      {}\n", report.findings.len()));
+    if !blocking.is_empty() {
+        text.push_str("Blocking\n");
+        for finding in &blocking {
+            text.push_str(&format!(
+                "  [{}] {}  {}\n",
+                finding.severity.tag(),
+                finding.rule_id,
+                finding.observation.summary
+            ));
+        }
+    }
+    if !warnings.is_empty() {
+        text.push_str("Warnings\n");
+        for finding in &warnings {
+            text.push_str(&format!(
+                "  [{}] {}  {}\n",
+                finding.severity.tag(),
+                finding.rule_id,
+                finding.observation.summary
+            ));
+        }
+    }
+    if blocking.is_empty() && warnings.is_empty() {
+        text.push_str("No finding at WARNING or above.\n");
+    }
+
+    emit(json, &payload, &text);
+
+    // A non-zero exit on FAIL so `validate` composes in a pipeline. A delivery
+    // gate that always exits 0 is not a gate.
+    if verdict == ValidationResult::Fail {
+        std::process::exit(2);
+    }
+
+    Ok(())
 }
 
 /// Renders a report from a previously analysed case.

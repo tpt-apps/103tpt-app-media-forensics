@@ -5,7 +5,7 @@
 //! than in isolation.
 
 use tpt_app_media_forensics_core::case_dir::CaseDirectory;
-use tpt_app_media_forensics_core::store::{Store, StoredAnalysis, StoredAsset};
+use tpt_app_media_forensics_core::store::{Store, StoredAnalysis, StoredAsset, TimelineRetention};
 use tpt_app_media_forensics_model::{
     AssetId, Case, Confidence, Finding, FindingId, FindingStatus, Observation, Severity,
 };
@@ -234,11 +234,13 @@ fn finding(status: FindingStatus) -> Finding {
             summary: "observed something".to_owned(),
             measurements: vec!["1.0".to_owned()],
         },
+        rationale: None,
         asset_id: asset_id(),
         stream_id: None,
         timeline_start: None,
         timeline_end: None,
         evidence: Vec::new(),
+        frame_index: None,
         status,
         review_note: (status != FindingStatus::New).then(|| "reviewer note".to_owned()),
     }
@@ -630,6 +632,118 @@ fn there_is_no_only_case_id_when_a_database_holds_several() {
 fn an_empty_database_has_no_only_case_id() {
     let store = Store::open_in_memory().expect("opens");
     assert!(store.only_case_id().expect("reads").is_none());
+}
+
+#[test]
+fn a_current_run_reports_a_complete_timeline() {
+    // The baseline the other two are measured against: a run written by this
+    // build stored its strip, so an empty one would mean it found nothing.
+    let store = seeded_store();
+    assert_eq!(
+        store.timeline_retention_in_case("case-1").expect("reads"),
+        TimelineRetention::Complete,
+    );
+}
+
+#[test]
+fn a_case_with_no_analysis_is_not_reported_as_a_complete_empty_timeline() {
+    // Nothing was examined, which is not the same as examining something and
+    // observing nothing. Reporting `Complete` here would put the two on the same
+    // footing, which is the conflation the type exists to prevent.
+    let store = Store::open_in_memory().expect("opens");
+    store.upsert_case("case-1", "Case", None).expect("case");
+    store
+        .insert_asset(&asset("a1", "aa"))
+        .expect("asset");
+
+    assert_eq!(
+        store.timeline_retention_in_case("case-1").expect("reads"),
+        TimelineRetention::NoRuns,
+    );
+}
+
+#[test]
+fn a_case_written_before_timeline_retention_is_reported_as_partial() {
+    // The question this answers: does the case predating schema v4 know that it
+    // did?
+    //
+    // Built by hand rather than by a flag, because the failure mode being guarded
+    // against is precisely that a case migrated to the current schema looks
+    // identical to one created at it. The only honest source for this fact is
+    // what the writing build recorded, so the test writes an analysis the way a
+    // pre-v4 build did: with no `writer_schema_version` at all.
+    let store = Store::open_in_memory().expect("opens");
+    store.upsert_case("case-1", "Case", None).expect("case");
+    store
+        .insert_asset(&StoredAsset {
+            id: asset_id().to_string(),
+            case_id: "case-1".to_owned(),
+            name: "a1.mp4".to_owned(),
+            source_path: "C:\\evidence\\a1.mp4".to_owned(),
+            size_bytes: 4096,
+            sha256: Some("aa".to_owned()),
+            blake3: None,
+        })
+        .expect("asset");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO analyses (id, case_id, asset_id, cache_key, software_version, \
+             analysis_version, status, finding_count, rule_count, started_at) \
+             VALUES ('legacy', 'case-1', ?1, 'k', '0.1.0', 1, 'COMPLETE', 0, 0, 1)",
+            [asset_id().to_string()],
+        )
+        .expect("an analysis row as a pre-v4 build wrote it");
+
+    assert_eq!(
+        store.timeline_retention_in_case("case-1").expect("reads"),
+        TimelineRetention::Partial {
+            unrecorded_runs: 1,
+            total_runs: 1,
+        },
+    );
+}
+
+#[test]
+fn a_mixed_case_counts_only_the_runs_that_predate_retention() {
+    // The common shape once the feature has shipped: an old case re-analysed
+    // under a current build. The strip holds the new run's entries, and the
+    // screen still has to say the old run contributed nothing.
+    let store = seeded_store();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO analyses (id, case_id, asset_id, cache_key, software_version, \
+             analysis_version, status, finding_count, rule_count, started_at) \
+             VALUES ('legacy', 'case-1', ?1, 'k2', '0.1.0', 1, 'COMPLETE', 0, 0, 2)",
+            [asset_id().to_string()],
+        )
+        .expect("a legacy row beside a current one");
+
+    assert_eq!(
+        store.timeline_retention_in_case("case-1").expect("reads"),
+        TimelineRetention::Partial {
+            unrecorded_runs: 1,
+            total_runs: 2,
+        },
+    );
+}
+
+#[test]
+fn an_analysis_records_the_schema_version_that_wrote_it() {
+    // Without this, every future case reads as `NoRuns`/`Partial` forever and the
+    // notice stops meaning anything.
+    let store = seeded_store();
+    let version: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT writer_schema_version FROM analyses WHERE id = 'an1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reads");
+
+    assert_eq!(version, Some(tpt_app_media_forensics_core::store::schema::SCHEMA_VERSION));
 }
 
 #[test]

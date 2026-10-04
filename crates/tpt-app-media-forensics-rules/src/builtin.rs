@@ -73,11 +73,21 @@ pub fn finding_with(
             summary,
             measurements,
         },
+        // Stamped by `RuleEngine::evaluate`, which holds the rule and can read its
+        // rationale. `None` here only means "not yet stamped", which is why the
+        // field is an `Option` rather than a default-filled value: an empty
+        // rationale would render as a finding that had no explanation, instead of
+        // one the engine has not attached yet.
+        rationale: None,
         asset_id: bundle.asset_id,
         stream_id: None,
         timeline_start: at,
         timeline_end: at,
         evidence: Vec::new(),
+        // Set by the pixel rules that measure a specific decoded frame. `None`
+        // here means "no frame behind this finding", which is the answer for every
+        // container, timing, and audio finding.
+        frame_index: None,
         status: Default::default(),
         review_note: None,
     }

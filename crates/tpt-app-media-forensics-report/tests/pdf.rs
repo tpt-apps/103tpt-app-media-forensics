@@ -41,11 +41,13 @@ fn finding(index: u8) -> Finding {
             summary: format!("Observation number {index} was recorded."),
             measurements: vec!["gop length: 50 -> 15".to_owned()],
         },
+        rationale: None,
         asset_id: asset(),
         stream_id: None,
         timeline_start: None,
         timeline_end: None,
         evidence: Vec::new(),
+        frame_index: None,
         status: FindingStatus::default(),
         review_note: None,
     }

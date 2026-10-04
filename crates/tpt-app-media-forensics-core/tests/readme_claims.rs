@@ -50,10 +50,16 @@ fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
 // `ColourInfo` and the audio crate had no spectral code at all, so the README
 // naming them would have been a false claim. `audio/src/spectral.rs` now
 // provides them, and the claim is checked against that source below.
-const NOT_IMPLEMENTED: [(&str, &str); 2] = [
-    ("reference master", "no comparison engine exists"),
-    ("comparison", "no comparison engine exists"),
-];
+/// The comparison entries moved to `CLAIMED_EXIST`. The CLI now has a `compare`
+/// subcommand that drives the engine, so a README claim about comparing two
+/// files is checked against that code rather than denied here.
+///
+/// They were listed here because the comparison engine existed but nothing
+/// reached it: `-model/src/comparison.rs` and `-rules/src/comparison.rs` were
+/// written, documented, and unit-tested across two commits, and no caller
+/// outside their own tests ever invoked them. The engine was healthy and its
+/// caller missing — the same defect `tests/stage_guard.rs` was written for.
+const NOT_IMPLEMENTED: [(&str, &str); 0] = [];
 
 /// Builds the claim table, embedding each file's source at compile time.
 ///
@@ -77,7 +83,7 @@ macro_rules! claimed_exist {
 /// This is the check that would have caught the stale claims found by hand:
 /// colour/HDR (no reader populates `ColourInfo`), spectral (no FFT in the audio
 /// crate), and progress/cancellation (no such code in `-core`).
-const CLAIMED_EXIST: [(&str, &str, &str); 21] = claimed_exist![
+const CLAIMED_EXIST: [(&str, &str, &str); 26] = claimed_exist![
     (
         "container inspection",
         "../../tpt-app-media-forensics-container/src/mp4.rs",
@@ -108,14 +114,17 @@ const CLAIMED_EXIST: [(&str, &str, &str); 21] = claimed_exist![
         "../../tpt-app-media-forensics-audio/src/measurement.rs",
         "HannWindowFft"
     ),
-    // Claimed as "decoded frames written as real PNGs". `to_png` is the part that
-    // must exist: without it the bytes on disk are an in-house format no reviewer
-    // can open.
-    (
-        "decoded frames written as real",
-        "../../tpt-app-media-forensics-video/src/frame.rs",
-        "pub fn to_png"
-    ),
+    // NOT "decoded frames written as real PNGs". That claim used to be checked by
+    // looking for `pub fn to_png` in `frame.rs` — which passed for as long as the
+    // function existed, while nothing on earth called it and every report carried
+    // an empty evidence table. The string existed; the capability did not.
+    //
+    // A guard that greps a source file proves an implementation exists, never
+    // that anything reaches it. `tests/evidence.rs` is now the guard for this
+    // claim: it analyses a real AV1 fixture end to end and asserts the PNGs are
+    // written, verified, persisted, and cited. A grep cannot be repaired into
+    // that; only deleting the claim or wiring the code can, which is the correct
+    // set of options.
     (
         "gop",
         "../../tpt-app-media-forensics-video/src/gop.rs",
@@ -196,6 +205,56 @@ const CLAIMED_EXIST: [(&str, &str, &str); 21] = claimed_exist![
         "pdf",
         "../../tpt-app-media-forensics-report/src/pdf.rs",
         "pub fn to_pdf"
+    ),
+    // Claimed as "background worker" in the README. `AnalysisJob` is the thing
+    // that moves an analysis off the caller's thread; before it existed the only
+    // way to keep a UI responsive was for the caller to do the threading itself,
+    // which is a claim the README could not have made honestly.
+    ("background worker", "../src/worker.rs", "pub fn spawn"),
+    // Claimed as "run in parallel". `run_branches` is the dispatch; the
+    // `std::thread::scope` marker is the part that makes it concurrency rather
+    // than a loop, so it is what the check looks for.
+    (
+        "run in parallel",
+        "../src/pipeline.rs",
+        "std::thread::scope"
+    ),
+    // Claimed as "sized to the usable CPU count". `available_parallelism` is the
+    // whole claim: a fixed thread count would oversubscribe a container that
+    // cannot use the cores it reports.
+    (
+        "sized to the usable cpu count",
+        "../src/pipeline.rs",
+        "available_parallelism"
+    ),
+    // Claimed as "why that condition matters" in the README. Checked against the
+    // *stamping site*, not the trait: `what_it_checks` and `why_it_matters` were
+    // declared on every rule and read by nothing but their own test, so a check
+    // on `-rules/src/engine.rs` proving the methods exist would have passed while
+    // spec §71 was unmet.
+    (
+        "why that condition",
+        "../../tpt-app-media-forensics-rules/src/engine.rs",
+        "finding.rationale = Some(rationale.clone())"
+    ),
+    // Claimed as "search" in the README's CLI section. Checked against the
+    // *caller*, for the same reason as `compare`: `SearchQuery` was implemented
+    // and unit-tested while nothing outside its own tests invoked it, so the
+    // engine alone proves nothing about the capability being reachable.
+    (
+        "search",
+        "../../tpt-app-media-forensics-cli/src/main.rs",
+        "run_search(store.connection(), &case_id, &query)"
+    ),
+    // Claimed as "File-to-file comparison" in the README. Checked against the
+    // *caller*, not the engine: the engine was committed, documented, and
+    // unit-tested before anything invoked it, so a check on
+    // `-rules/src/comparison.rs` would have passed throughout. The CLI is the
+    // thing that makes the claim true.
+    (
+        "file-to-file comparison",
+        "../../tpt-app-media-forensics-cli/src/main.rs",
+        "compare_inputs(&left_input, &right_input)"
     ),
 ];
 

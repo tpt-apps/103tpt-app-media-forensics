@@ -44,7 +44,7 @@ pub use comparison::{
     FieldComparison, StreamComparison, StreamComparisonResult, UnmatchedStream,
 };
 pub use evidence::{Evidence, EvidenceIntegrity, EvidenceKind, Provenance};
-pub use finding::{Confidence, Finding, FindingStatus, Observation, Severity};
+pub use finding::{Confidence, Finding, FindingStatus, Observation, RuleRationale, Severity};
 pub use id::{
     AnalysisId, AssetId, CaseId, EntityId, EntityKind, EvidenceId, FindingId, ReportId, StreamId,
 };

@@ -41,13 +41,262 @@ fn help_lists_every_documented_subcommand() {
 
     assert!(ok);
     for command in [
-        "hash", "acquire", "inspect", "analyze", "report", "note", "batch",
+        "hash", "acquire", "inspect", "analyze", "report", "note", "batch", "compare", "search",
+        "validate",
     ] {
         assert!(
             stdout.contains(command),
             "`{command}` is missing from the help output"
         );
     }
+}
+
+#[test]
+fn compare_reports_a_real_difference_between_two_mp4_files() {
+    // The comparison engine's reason for existing (spec §38-40). Driven through
+    // the real binary because the point is not only that `compare` works but that
+    // a caller reaches it: two commits shipped it, unit-tested it, and nothing
+    // outside those tests ever invoked it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let left = dir.path().join("left.mp4");
+    let right = dir.path().join("right.mp4");
+    std::fs::write(&left, build_mp4(&TrackSpec::video_25fps(1920, 1080, 50))).expect("writes left");
+    std::fs::write(&right, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes right");
+
+    let output = cli()
+        .args([
+            "compare",
+            left.to_str().expect("utf-8 path"),
+            right.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "compare failed: {stderr}");
+    assert!(
+        stdout.contains("1920x1080") || stdout.contains("1280x720"),
+        "the resolution difference must be surfaced: {stdout}"
+    );
+    assert!(
+        stdout.contains("DIFFERS"),
+        "a difference must be marked as such, not merely implied: {stdout}"
+    );
+}
+
+#[test]
+fn compare_reports_a_file_as_identical_to_itself() {
+    // Without this, a comparison that reported everything as different would
+    // still pass the test above. Two runs of one file are the control.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("sample.mp4");
+    let bytes = build_mp4(&TrackSpec::video_25fps(1280, 720, 50));
+    std::fs::write(&file, bytes).expect("writes fixture");
+
+    let output = cli()
+        .args([
+            "compare",
+            file.to_str().expect("utf-8 path"),
+            file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "compare failed: {stderr}");
+    assert!(
+        !stdout.contains("DIFFERS"),
+        "a file must not differ from itself: {stdout}"
+    );
+    assert!(
+        stdout.contains("no measured differences"),
+        "a self-comparison must report no differences: {stdout}"
+    );
+    // And it must *not* claim equivalence. This file is H.264 with no audio, so
+    // several axes were never measured, and `is_equivalent` is deliberately false
+    // whenever anything went uncomparable — "they match on everything we looked
+    // at" is a weaker claim than "they match". Asserting it here is what stops a
+    // future change from quietly relaxing that.
+    assert!(
+        stdout.contains("not every axis could be compared"),
+        "an uncomparable axis must not be reported as agreement: {stdout}"
+    );
+}
+
+#[test]
+fn compare_emits_machine_readable_json() {
+    // `compare --json` has to be one parseable document, like every other
+    // machine-readable path in this CLI.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let left = dir.path().join("left.mp4");
+    let right = dir.path().join("right.mp4");
+    std::fs::write(&left, build_mp4(&TrackSpec::video_25fps(640, 480, 30))).expect("writes left");
+    std::fs::write(&right, build_mp4(&TrackSpec::video_25fps(320, 240, 30))).expect("writes right");
+
+    let output = cli()
+        .args([
+            "compare",
+            left.to_str().expect("utf-8 path"),
+            right.to_str().expect("utf-8 path"),
+            "--json",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "compare failed: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+
+    // The tolerances travel with the result so a reader can judge each claim
+    // rather than take it on trust.
+    assert!(
+        value.get("tolerances").is_some(),
+        "the tolerances must be reported alongside: {stdout}"
+    );
+    assert!(
+        value.get("streams").is_some(),
+        "the stream half must be present: {stdout}"
+    );
+}
+
+#[test]
+fn search_reads_back_the_findings_the_engine_wrote() {
+    // The point of the command: the engine writes findings to the database, and
+    // before it nothing read them back. `analysed_case` uses a fixture with a
+    // known GOP change, so the search has something specific to find.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let output = cli()
+        .args([
+            "search",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "GOP",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "search failed: {stderr}");
+    assert!(
+        stdout.contains("GOP"),
+        "the finding the engine recorded must be findable: {stdout}"
+    );
+    assert!(
+        stdout.contains("finding"),
+        "hits must be labelled with the kind of record they are: {stdout}"
+    );
+}
+
+#[test]
+fn search_reports_how_many_matched_rather_than_only_how_many_are_shown() {
+    // The property the search module exists to protect. `--limit 1` on a case
+    // holding several findings must say the page is truncated and name the real
+    // total, because "1 result" would read as "there was only one".
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let output = cli()
+        .args([
+            "search",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "search failed: {stderr}");
+    assert!(
+        stdout.contains("of ") && stdout.contains("matches"),
+        "a truncated page must name the total it truncated from: {stdout}"
+    );
+    assert!(
+        stdout.contains("truncated"),
+        "truncation must be stated, never left to be inferred from a short list: {stdout}"
+    );
+}
+
+#[test]
+fn a_search_that_matches_nothing_says_so_rather_than_looking_empty() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let output = cli()
+        .args([
+            "search",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "no-such-text-98765",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "search failed: {stderr}");
+    assert!(
+        stdout.contains("No matching records"),
+        "an empty result must say so explicitly: {stdout}"
+    );
+    assert!(
+        stdout.contains("0 match"),
+        "the count must be zero, not absent: {stdout}"
+    );
+}
+
+#[test]
+fn search_emits_machine_readable_json_naming_the_query() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let output = cli()
+        .args([
+            "search",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "GOP",
+            "--json",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "search failed: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+
+    // The query is echoed, not just the results: a saved document listing rows is
+    // ambiguous without knowing what was asked for.
+    assert_eq!(value["term"], "GOP", "{stdout}");
+    assert!(
+        value.get("total").is_some(),
+        "the total must be reported so truncation is detectable: {stdout}"
+    );
+    assert!(
+        value.get("truncated").is_some(),
+        "`truncated` must be an explicit field, never implied: {stdout}"
+    );
+}
+
+#[test]
+fn help_lists_every_documented_subcommand_including_compare() {
+    let output = cli().arg("--help").output().expect("runs CLI");
+    let (ok, stdout, _) = split(output);
+
+    assert!(ok);
+    assert!(
+        stdout.contains("compare"),
+        "`compare` is missing from the help output"
+    );
+    assert!(
+        stdout.contains("search"),
+        "`search` is missing from the help output"
+    );
 }
 
 #[test]
@@ -215,6 +464,71 @@ fn analyze_rejects_a_directory_that_is_not_a_case() {
     assert!(
         stderr.contains("not an initialised case"),
         "the error must explain why: {stderr}"
+    );
+}
+
+#[test]
+fn analyze_reports_stage_progress_without_polluting_stdout() {
+    // Spec §55 asks for background workers and progress reporting, and a QC pass
+    // over a long master is slow enough that a silent terminal reads as a hung
+    // process. The progress therefore goes to stderr...
+    //
+    // ...and specifically *not* to stdout, because `analyze --json` is meant to be
+    // piped. A progress line interleaved with the result document would corrupt
+    // the output for every consumer that parses it, which is the opposite of what
+    // machine-readable output is for.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("sample.mp4");
+    std::fs::write(&file, build_mp4(&TrackSpec::video_25fps(320, 240, 30)))
+        .expect("writes fixture");
+
+    let acquired = cli()
+        .args([
+            "acquire",
+            file.to_str().expect("utf-8 path"),
+            "--name",
+            "Progress",
+            "--parent",
+            dir.path().to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("acquires a case");
+    assert!(
+        acquired.status.success(),
+        "acquire failed: {}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+    let case = dir.path().join("case.tptcase");
+
+    let output = cli()
+        .args([
+            "analyze",
+            file.to_str().expect("utf-8 path"),
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "--json",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "analyze failed: {stderr}");
+    assert!(
+        stderr.contains("acquisition"),
+        "the run must report the stages it went through: {stderr}"
+    );
+    assert!(
+        stderr.contains("concurrent analysis"),
+        "the independent stages must report themselves: {stderr}"
+    );
+    assert!(
+        !stdout.contains("acquisition"),
+        "progress must not reach stdout; `--json` output has to stay parseable: {stdout}"
+    );
+    // And the JSON is still a single parseable document.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_ok(),
+        "stdout must remain valid JSON: {stdout}"
     );
 }
 
@@ -1106,5 +1420,164 @@ fn notes_survive_into_a_generated_report() {
     assert!(
         html.contains("Client says this is the wrong master."),
         "the note must reach the report"
+    );
+}
+
+#[test]
+fn validate_reports_a_verdict_derived_from_the_findings() {
+    // Before this command, `ValidationResult::from_findings` and
+    // `Severity::fails_validation` were both implemented, documented, and unit
+    // tested, and nothing on earth called either. Every report carried
+    // `validation: null` and the HTML header's PASS/FAIL block could never render.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let output = cli()
+        .args(["validate", "--case-dir", case.to_str().expect("utf-8 path")])
+        .output()
+        .expect("runs CLI");
+    let (_, stdout, stderr) = split(output);
+
+    assert!(
+        ["PASS", "PASS WITH WARNINGS", "FAIL"]
+            .iter()
+            .any(|label| stdout.contains(label)),
+        "validate must state one of the three spec §68 verdicts: {stdout}\n{stderr}"
+    );
+    // The verdict must be accompanied by the findings that drove it. A bare
+    // "FAIL" is not actionable and, more importantly, cannot be checked against
+    // the case by anyone reading the output.
+    assert!(
+        stdout.contains("Findings"),
+        "the verdict must state how many findings it considered: {stdout}"
+    );
+}
+
+#[test]
+fn validate_exits_non_zero_when_the_verdict_is_fail() {
+    // A delivery gate that always exits 0 is not a gate. The exit code is the
+    // part a CI pipeline actually consumes.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let output = cli()
+        .args(["validate", "--case-dir", case.to_str().expect("utf-8 path")])
+        .output()
+        .expect("runs CLI");
+    let code = output.status.code();
+    let (_, stdout, _) = split(output);
+
+    let expected = if stdout.contains("FAIL") && !stdout.contains("PASS WITH WARNINGS") {
+        // FAIL
+        2
+    } else {
+        0
+    };
+    assert_eq!(
+        code,
+        Some(expected),
+        "exit code must match the verdict.\nstdout:\n{stdout}\nexpected {expected}"
+    );
+}
+
+#[test]
+fn validate_emits_machine_readable_json_naming_the_blocking_findings() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let output = cli()
+        .args([
+            "--json",
+            "validate",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (_, stdout, stderr) = split(output);
+
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}"));
+    assert!(
+        value["result"].is_string(),
+        "the verdict must be present in the JSON: {stdout}"
+    );
+    assert!(
+        value["blocking"].is_array(),
+        "the blocking findings must be listed so a caller can act on them: {stdout}\n{stderr}"
+    );
+    assert!(
+        value["warnings"].is_array(),
+        "warnings must be distinguishable from blocking findings: {stdout}"
+    );
+}
+
+#[test]
+fn validate_writes_a_bundle_only_when_asked() {
+    // Off by default. A verdict is a claim about delivery, and silently adding one
+    // to a report bundle would change a record the analyst did not ask to change.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+
+    let without = cli()
+        .args(["validate", "--case-dir", case.to_str().expect("utf-8 path")])
+        .output()
+        .expect("runs CLI");
+    let (_, _, _) = split(without);
+    assert!(
+        !case.join("reports").join("validated").exists(),
+        "validate wrote a bundle without being asked"
+    );
+
+    let with = cli()
+        .args([
+            "validate",
+            "--case-dir",
+            case.to_str().expect("utf-8 path"),
+            "--write",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (_, stdout, stderr) = split(with);
+
+    let bundle = case.join("reports").join("validated");
+    assert!(
+        bundle.exists(),
+        "--write did not produce a bundle: {stdout}\n{stderr}"
+    );
+    // The written bundle must actually carry the verdict, or `--write` would be
+    // a flag that produces a file indistinguishable from the one it replaced.
+    let rendered = bundle.join("report.html");
+    if rendered.exists() {
+        let html = std::fs::read_to_string(&rendered).unwrap_or_default();
+        assert!(
+            ["PASS", "PASS WITH WARNINGS", "FAIL"]
+                .iter()
+                .any(|label| html.contains(label)),
+            "the written report must render the verdict: {html}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_a_directory_that_is_not_a_case() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let not_a_case = dir.path().join("plain");
+    std::fs::create_dir_all(&not_a_case).expect("creates dir");
+
+    let output = cli()
+        .args([
+            "validate",
+            "--case-dir",
+            not_a_case.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "validate accepted a directory that is not a case");
+    assert!(
+        stderr.contains("not an initialised case"),
+        "the error must say what is wrong: {stderr}"
     );
 }

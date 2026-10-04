@@ -64,8 +64,59 @@ means:
 - constant-memory statistics where possible (running sums, histogram bins)
 
 Work runs on background workers with progress reporting and cancellation
-(spec §56). Progress is reported per-asset and per-stage so the UI can show
-meaningful state for a 40 GB file.
+(spec §55–56).
+
+`AnalysisEngine::analyse` is synchronous and blocks. Moving a run off the
+calling thread is a separate, explicit step: `AnalysisJob::spawn` runs the same
+analysis on its own thread and returns a handle with `cancel()`, `is_finished()`,
+and `join()`. The engine never spawns anything a caller did not ask for, and no
+async runtime is involved.
+
+```rust
+let job = AnalysisJob::spawn(engine, path, case_dir, ProgressTracker::none())?;
+let token = job.cancellation();   // hand this to a cancel button
+// ... keep the UI responsive ...
+let outcome = job.join()?;
+```
+
+Progress is reported per-stage so the UI can show meaningful state for a 40 GB
+file. There is no ETA: an estimate on a feature-length master would be wrong by
+minutes and would read as a commitment the engine cannot make.
+
+## Parallelism
+
+The four analysers that follow container inspection are independent and run
+concurrently (spec §56):
+
+```text
+container inspection
+   ├─ sample index + bitrate
+   ├─ audio decode and measurement
+   ├─ Tier-2 pixel analysis
+   └─ metadata extraction
+```
+
+They read the same inputs and write disjoint bundle fields. On a file with both
+tracks the audio decode and the Tier-2 decode each run for minutes, so
+overlapping them roughly halves the wall-clock of an examination.
+
+**Parallelism is invisible in the output.** Each branch returns its own
+measurements and its own limitations, and the branches are merged back into
+stage order regardless of the order they finished in. Two runs of the same file
+therefore produce identical findings, identical limitations in identical order,
+and an identical progress stream — whether the work ran on one thread or four.
+A report that varied with thread scheduling would not be reproducible evidence.
+
+`WorkerBudget` sizes the fan-out from the process's usable CPU count and clamps
+it to the work available, so cores are not oversubscribed. `WorkerBudget::serial()`
+gives the identical result on one thread, for a caller whose binding constraint
+is peak memory rather than time: two branches hold decoded media at once where
+the sequential path held one, though each is still capped by its own decode
+limits.
+
+Batch mode over a directory stays sequential. The analyses would share one SQLite
+file, and interleaving two writers' database work would make the outcome
+timing-dependent.
 
 ## Caching
 

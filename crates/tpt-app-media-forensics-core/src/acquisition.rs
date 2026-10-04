@@ -270,7 +270,57 @@ mod tests {
             first.hashes, second.hashes,
             "acquisition must be reproducible (spec §77)"
         );
-        assert_eq!(first, second);
+        assert_eq!(
+            first.size_bytes, second.size_bytes,
+            "the byte count is derived from the read and must agree"
+        );
+        assert_eq!(
+            first.timestamps.modified_unix_secs, second.timestamps.modified_unix_secs,
+            "nothing was written to the source, so its modification time is stable"
+        );
+        assert_eq!(
+            first.timestamps.created_unix_secs, second.timestamps.created_unix_secs,
+            "nothing was written to the source, so its creation time is stable"
+        );
+        assert_eq!(
+            first.filesystem, second.filesystem,
+            "the filesystem context describes the source, not the run"
+        );
+    }
+
+    #[test]
+    fn the_access_time_is_the_one_field_acquisition_can_change_by_existing() {
+        // The counterpart to the determinism claim above, and the reason the test
+        // does not compare whole records.
+        //
+        // `acquire` opens the file, and opening it is what updates the access
+        // time on any filesystem that records one. The value is stored in whole
+        // seconds, so two acquisitions either side of a second boundary disagree
+        // even though nothing about the file did.
+        //
+        // That makes the access time an observation *about the act of looking*,
+        // not a property of the evidence, so it is outside the determinism claim.
+        // The claim still covers everything the engine derived about the file,
+        // and this test says so out loud rather than leaving it as a carve-out
+        // somebody would later "tidy up".
+        let (_dir, path) = write_temp("a.bin", b"identical content");
+        let record = acquire(&path).expect("acquires");
+
+        // Whatever the filesystem decided, the record is what is stored: the
+        // engine reports the value it read and never substitutes one.
+        let observed = record.timestamps.accessed_unix_secs;
+        let again = acquire(&path).expect("acquires");
+        let second = again.timestamps.accessed_unix_secs;
+
+        assert!(
+            second == observed || second.is_none(),
+            "a second acquisition must not invent an access time \
+             (first: {observed:?}, second: {second:?})"
+        );
+        assert!(
+            record.hashes == again.hashes,
+            "however the access time moved, the digests must not"
+        );
     }
 
     #[test]

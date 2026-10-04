@@ -414,7 +414,10 @@ fn av1_webm(dir: &std::path::Path) -> Vec<u8> {
 /// built to notice.
 fn decode_failure_webm() -> Vec<u8> {
     let payloads = av1_payloads();
-    assert!(payloads.len() > 2, "the encoder must produce a stream to damage");
+    assert!(
+        payloads.len() > 2,
+        "the encoder must produce a stream to damage"
+    );
 
     let mut blocks: Vec<(u16, bool, Vec<u8>)> = payloads
         .iter()

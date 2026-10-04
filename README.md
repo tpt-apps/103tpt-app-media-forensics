@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   765 passing
+tests   844 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -81,11 +81,27 @@ one that names the gap:
   pass; derived artefacts stored with hashes and provenance, including decoded
   frames written as real PNGs so a reviewer can open them with their own tools
 - **Rule-driven findings** — severity, confidence, timeline placement, and an
-  explanation of what was observed and what it does not establish
+  explanation of what was observed, what the rule checks, why that condition
+  matters, and what the observation does not establish
 - **Reports** — PDF, HTML, JSON, CSV, all reproducible
 - **Progress and cancellation** — stage-by-stage progress with an honest
   cancellation token; a cancelled run writes nothing rather than leaving a
   partial record that looks complete
+- **Large files and concurrency** — files stream through fixed-size buffers
+  rather than being loaded whole; the independent analysers (sample index, audio,
+  Tier-2, metadata) run in parallel sized to the usable CPU count; and an analysis
+  can be handed to a background worker with a cancel token, so a UI stays
+  responsive. Parallelism is invisible in the output: two runs produce identical
+  findings, identical limitations in identical order, and an identical progress
+  stream, on one core or sixteen
+- **File-to-file comparison** — `compare` puts two files side by side across
+  container, stream layout, codec, video and audio format, colour, timing,
+  metadata, scene structure, silence, and loudness. Streams are paired by kind
+  rather than by index, so a file that dropped its first audio track reports one
+  unmatched stream instead of three changed ones. Axes that could not be measured
+  are reported as uncomparable rather than as agreement, and there is no
+  similarity score — a re-mux and a re-encode both change bytes, but only one
+  changes anything a reviewer would care about
 
 ### Planned, not built
 
@@ -95,7 +111,7 @@ reappears in the list above.
 
 | Capability | Spec | State |
 |---|---|---|
-| Comparing two or more assets against a reference master | §38–40 | not started |
+| Comparison against a designated *reference master* recorded in the case | §67 | not started; `compare` takes two arbitrary files and holds no notion of a stored reference |
 | Colour for Matroska / WebM | §45 | not started; the Matroska reader exposes no picture geometry, so there is no video format to attach colour to |
 | A corrupt-media corpus held on disk | §76 | directories are empty; every damaged file today is built in code by a fixture |
 
@@ -133,7 +149,8 @@ crates/
   ...-metadata/     metadata extraction and consistency
   ...-evidence/     evidence storage
   ...-rules/        rule engine and rule set
-  ...-core/         orchestration, caching, progress, cancellation
+  ...-core/         orchestration, caching, progress, cancellation,
+                   background workers, parallelism
   ...-report/       PDF / HTML / JSON / CSV
   ...-cli/          command line
   ...-tauri/        desktop shell (separate workspace)
@@ -152,8 +169,42 @@ The desktop shell is a separate workspace because it pulls in the webview
 toolchain:
 
 ```bash
-cd crates/tpt-app-media-forensics-tauri && cargo check
+cd crates/tpt-app-media-forensics-tauri
+cargo build          # produces the executable
+cargo test           # 193 tests: 163 unit, 6 analysis, 9 decode, 15 corrupt-media
+cargo clippy --all-targets
+node ui/check.mjs    # parses; commands, ids, imports; renders and clicks every screen
 ```
+
+`cargo build` runs the frontend check itself, so the two are not separate
+rituals. It is fatal when `node` is on the PATH and a warning when it is not:
+the no-bundler frontend means a developer without Node must still be able to
+build the desktop app, but nobody with Node should be able to ship JavaScript
+that does not parse.
+
+That check is not sufficient on its own: a stub DOM is not a browser, and a
+blank window and a working one look identical from outside. To see what the
+real webview loaded, point `TPT_STARTUP_LOG` at a file and start the app:
+
+```sh
+TPT_STARTUP_LOG=./startup.log cargo run
+```
+
+The frontend appends `ready screens=12 bridge=yes` once every screen has
+rendered, and `main.rs` probes the page on load to report what it found. A
+missing line means the page did not get that far — which is a failure no static
+check would have reported.
+
+Its frontend is plain ES modules with **no bundler**, so the desktop build needs
+a Rust toolchain and nothing else — no Node, no `pnpm`, no `npm install`. That is
+deliberate: a JavaScript toolchain in the build path of a forensic tool is a
+second supply chain whose lockfile would need the same pinned-revision
+discipline as the Cargo one.
+
+The application grants itself the minimum capabilities it needs: the core
+defaults and the folder-picker dialog. Every path enters through a dialog rather
+than typed text, and it has no general filesystem or shell permission because it
+writes only inside a case directory.
 
 ## CLI
 
@@ -161,9 +212,17 @@ cd crates/tpt-app-media-forensics-tauri && cargo check
 tpt-media-forensics inspect  <file>
 tpt-media-forensics hash     <file>
 tpt-media-forensics analyze  <file> --case-dir <case>
+tpt-media-forensics compare  <file-a> <file-b>
+tpt-media-forensics search   --case-dir <case> <term>
+tpt-media-forensics validate --case-dir <case>
 tpt-media-forensics report   --case-dir <case> --out report.pdf
 tpt-media-forensics batch    <directory> --case-dir <case>
 ```
+
+`validate` returns `PASS`, `PASS WITH WARNINGS`, or `FAIL` from the findings
+already recorded in the case, and exits `2` on `FAIL` so it can gate a
+pipeline. It answers "do the findings permit delivery" — it does not check the
+file against a delivery specification, which is not implemented.
 
 The CLI and the desktop app drive the same engine, so results are identical
 whichever you use. No command requires a network connection.

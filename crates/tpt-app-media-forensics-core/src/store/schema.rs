@@ -22,10 +22,87 @@
 //! what the file says.
 
 /// Current schema version. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Migrations, applied in order. Index + 1 is the version it produces.
-const MIGRATIONS: &[&str] = &[BASE_SCHEMA, FINDING_PAYLOADS];
+const MIGRATIONS: &[&str] = &[
+    BASE_SCHEMA,
+    FINDING_PAYLOADS,
+    EVIDENCE_PAYLOADS,
+    TIMELINE_ENTRIES,
+    ANALYSIS_WRITER_VERSION,
+];
+
+/// Records which schema version wrote each analysis row.
+///
+/// # Why a column rather than a date comparison
+///
+/// A case created before `timeline_entries` exists opens cleanly and reports
+/// nothing about the gap: after migration its `user_version` is the current one,
+/// so "this case predates timeline retention" and "this run found nothing" are
+/// indistinguishable from inside the store. Comparing a run's date against the
+/// release date of schema v4 would guess, and a guess here produces the more
+/// dangerous of the two answers — an empty strip that reads as an absence of
+/// findings.
+///
+/// So the fact is recorded at write time, by the only party that knows it.
+/// A row written by a build that predates this column is left `NULL`, which
+/// means exactly "this build did not record what it knew" — the same reading a
+/// missing `findings.payload` already carries (spec §65).
+///
+/// Deliberately no `DEFAULT`. A default would stamp every existing row with a
+/// version it was not written by, which is the guess this column exists to
+/// avoid.
+const ANALYSIS_WRITER_VERSION: &str = r#"
+ALTER TABLE analyses ADD COLUMN writer_schema_version INTEGER;
+"#;
+
+/// Records where each analysis placed its observations (spec §31).
+///
+/// The timeline was the one thing an analysis produced and then dropped: the
+/// engine built it, merged structural damage, timestamp anomalies and positioned
+/// findings into a single ordered list, and returned it in `AnalysisOutcome` —
+/// and nothing wrote it anywhere. A case reopened later could only rebuild the
+/// strip from findings, which is why the video, audio, scene and error layers
+/// were permanently empty.
+///
+/// Append-only, like findings and evidence: the strip describes what the run
+/// observed, and a later run records its own rather than editing this one.
+///
+/// `payload` holds the entry's canonical JSON and is the authority. The typed
+/// columns exist so a case can be queried by position or by source without
+/// parsing anything — the same split `findings` uses, and for the same reason:
+/// the stored value is the evidence, and rebuilding it from columns would state
+/// something the engine did not observe.
+const TIMELINE_ENTRIES: &str = r#"
+CREATE TABLE timeline_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    asset_id    TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    time_micros INTEGER,
+    placement   TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    reference   TEXT NOT NULL,
+    summary     TEXT NOT NULL,
+    payload     TEXT NOT NULL
+);
+CREATE INDEX idx_timeline_entries_analysis ON timeline_entries (analysis_id, position);
+CREATE INDEX idx_timeline_entries_asset ON timeline_entries (asset_id, time_micros);
+"#;
+
+/// Adds a `payload` column to `evidence`.
+///
+/// The same reasoning as `FINDING_PAYLOADS`, for the same reason: an `Evidence`
+/// carries hashes, a provenance label, and a verification flag that no typed
+/// column set can reconstruct without loss, and a report that rebuilt those from
+/// lossy columns would state something the engine never verified.
+///
+/// Nullable, like `findings.payload`, so a database created before this migration
+/// keeps working: rows written by an older build read back as absent rather than
+/// failing, and `evidence_in_case` skips them.
+const EVIDENCE_PAYLOADS: &str = r#"
+ALTER TABLE evidence ADD COLUMN payload TEXT;"#;
 
 /// Adds a `payload` column to `findings` and `relative_dir` to `reports`.
 ///

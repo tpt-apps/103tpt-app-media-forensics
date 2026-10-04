@@ -4,6 +4,202 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### Three open questions, answered
+- **`startup_log` ships in release builds — but it can no longer forge a log entry.**
+  The reason it exists is a *release* build opening a blank window: that is the one
+  nobody is watching and the one where there is no other evidence, so compiling it
+  out of release would remove the diagnostic from precisely the build that needs
+  it. The real hazard was different from the one recorded. It is a write primitive
+  reachable from the webview, and the webview renders strings taken from the file
+  under examination — asset names, container brands, codec strings, atom values,
+  all attacker-chosen by definition. Nothing routed case data into it and nothing
+  enforced that; the frontend has no build step, so the next edit is free to.
+  Every control character is now flattened and the line is bounded, so one IPC
+  call is one line: a crafted name containing a newline can no longer write an
+  entry the application never composed into the one file a build script treats as
+  ground truth. Six tests, each verified to fail when the flattening is removed
+- **Timestamps are not part of the determinism claim.** `acquisition_is_deterministic`
+  asserted whole-record equality and was flaky because `acquire` *opens the file*,
+  which is what updates the access time on any filesystem recording one — and the
+  value is whole seconds, so two acquisitions either side of a second boundary
+  disagree although nothing about the file did. That makes the access time an
+  observation *about the act of looking*, not a property of the evidence. The claim
+  is now stated over what the engine derived: digests, size, modification and
+  creation times, filesystem context. A companion test pins the carve-out so a
+  later "tidy-up" cannot quietly reinstate it. 25 consecutive runs, all green
+- **A case predating timeline retention now says so.** The schema could not answer
+  this: after migration a legacy case's `user_version` is current, so "this case
+  predates timeline retention" and "this run found nothing" were indistinguishable
+  inside the store. Comparing a run's date against v4's release date would guess,
+  and the guess produces the more dangerous of the two answers — an empty strip
+  reading as an absence of findings. Schema v5 adds `analyses.writer_schema_version`,
+  written by the only party that knows the fact and left `NULL` on rows a pre-v5
+  build wrote, the same reading a missing `findings.payload` already carries.
+  `TimelineRetention` is `Complete` / `Partial { unrecorded_runs, total_runs }` /
+  `NoRuns`, and the wording is produced in the view model where a test can reach it
+  — an empty strip and an unrecorded one draw identically, so a sentence assembled
+  in a renderer is a sentence no Rust test can assert
+
+#### The analysis built a timeline and then threw it away
+- **The engine merged structural damage, timestamp anomalies and positioned
+  findings into one ordered strip, returned it in `AnalysisOutcome`, and nothing
+  wrote it anywhere.** The `timeline` command then passed
+  `Timeline::new(Vec::new(), None)` — a literal empty list — so every case drew
+  four structurally empty layers. The command's own comment said the ERRORS row
+  was empty on reopen; it was empty always
+- **This read as "nothing was found" rather than "was not retained."** In a
+  forensic tool that is the more dangerous of the two, because an empty layer
+  reads as evidence of absence
+- The strip is now persisted in a `timeline_entries` table (schema v3 → v4) with
+  the run that produced it: append-only like findings and evidence, canonical
+  JSON in `payload` as the authority, typed columns for querying
+- **Unplaced entries stay unplaced.** `Placement::Unplaced` is stored as its own
+  value rather than as time zero — writing a byte-offset defect at `0` would
+  fabricate the one position the engine never established (spec §31)
+- **The tests found two real bugs on their first run**, both of which would have
+  shipped as a query that errors on every open: `analyses` carries `started_at`,
+  not `created_at`, so the ordering column did not exist; and the foreign key on
+  `analysis_id` correctly refused a timeline row belonging to a run the database
+  had never heard of
+- The round-trip test reads back through a **fresh** `Store` and compares against
+  the engine's own entries, because a write the writer can see but the next
+  process cannot is not a record
+
+#### Every static check passed while three screens threw on first click
+#### The application crashed on startup, and every check was green
+- **Pressing "Compare" was not the only thing broken. The window never opened at
+  all.** `close-case` was read by `app.js` and never declared in `index.html`, so
+  `document.getElementById("close-case")` was `null` and the first
+  `.addEventListener` on it threw. The process started, the window appeared, and
+  the page showed nothing
+- **The frontend check had been looking at five elements and reported all five
+  present.** Its id pattern was `\w+`, which stops at a hyphen, so `close-case`
+  and `open-case` were invisible to it. A check that cannot see the thing it is
+  checking reports the same green either way
+- **The bare `@tauri-apps/*` imports could not have resolved either.**
+  `frontendDist` serves a directory of static files, so there is no import map
+  and no bundler: `import { invoke } from "@tauri-apps/api/core"` throws before
+  any of this application runs. `ui/bridge.js` now reads `window.__TAURI__`
+  behind `withGlobalTauri`, and the check fails on any bare specifier
+- **Only running the real webview found any of this.** So the application can now
+  report what loaded: `TPT_STARTUP_LOG` points at a file, `startup_log` appends to
+  it, and `main.rs` probes the page on load through the internals bridge. A blank
+  window and a working one look identical from outside; this makes them differ
+- `ui/bootstrap.js` runs before the module graph, imports nothing, and turns a
+  startup failure into a readable message rather than an empty window. The probe
+  caught the crash because of it
+- **Untrusted metadata was interpolated raw into `innerHTML`.** Asset names,
+  container brands, codec strings and atom values all arrive from the file under
+  examination — chosen *because* it is hostile. Markup is now built with an `html`
+  tagged template that escapes by construction, and the check fails on any
+  untagged interpolation, including the continuation segments of a multi-line
+  assignment that the first version of that check could not see
+- **Finished the interaction gaps**: assets are selectable, a timeline click seeks
+  to the nearest frame, the viewer has real nearest-neighbour zoom and an A/B
+  pixel-difference report. Zoom repaints the decoded frame rather than decoding it
+  again, and the frame canvas no longer leaves a quarter of every frame
+  transparent from stepping a four-byte stride over a three-byte buffer
+- The remaining honest gap: **the timeline strip is still findings-only.** `timeline`
+  builds `Timeline::new(Vec::new(), None)`, so the video, audio, scene and error
+  layers are structurally empty — the command says so in a comment, but the
+  screen draws four empty tracks that read as "nothing was found" rather than
+  "not retained". Filling them means persisting the engine's timeline into the
+  case, which is a schema change to the core crate rather than a shell fix. It is
+  recorded in `todo.md` rather than faked with placeholder rows
+- **Batch intake is wired up, to the engine's own `core::batch::run`.** It is a
+  panel on the Case screen rather than a thirteenth nav entry, because spec §79
+  fixes the screen list at twelve. It runs on its own thread and is polled, so a
+  folder of masters does not freeze the window, and `UNREADABLE`/`SKIPPED` stay
+  distinct from `FAIL` — an unexamined file is not a verdict on the media
+
+#### Every static check passed while three screens threw on first click
+#### Every static check passed while three screens threw on first click
+- **The screen layer was never executed.** `ui/check.mjs` parsed the JavaScript
+  and matched command names, and all of it was green — while pressing "Compare"
+  with an empty field, and pressing "Generate report bundle", both threw a
+  `ReferenceError`. Neither renderer declared the helpers argument `renderScreen`
+  passes, so `helpers.banner`, `helpers.el` and `guarded` were free identifiers
+  that only resolved the moment an analyst pressed a button
+- **`renderViewer` had the same defect**, and nothing had ever clicked a frame row
+- **`guarded` conflated two different answers.** It returns `null` for a failed
+  call *and* for a command that legitimately answered `null` — and two commands
+  do. `close_case` returns unit, so `if (!closed) return;` discarded every
+  success and the close button did nothing at all; `poll_analysis` answers `null`
+  for "still running", so a failing poll read as progress and the loop retried
+  every 750ms for as long as the window stayed open. `attempt` now returns
+  `{ ok, value }` and those two call sites use it
+- **The check now renders every screen against a stub DOM and presses every
+  button.** That found all three. Verified by reintroducing each: the
+  `ReferenceError`s come back, named
+- **Two failures in the new check were its own, and worth recording.** It passed
+  the Rust variant name (`Reports`) where `renderScreen` receives the serde key
+  (`REPORTS`), so every screen rendered its "no renderer yet" placeholder and the
+  test passed while testing nothing. And the first fixtures were hand-written
+  from the Rust structs and wrong immediately — `dashboard` returns `counts` and
+  `analysis_status`, not `by_severity`. View models are now a permissive
+  stand-in, so the check tests wiring rather than a fixture that needs editing
+  every time a struct gains a field
+
+#### The analysis command panicked on its first run
+- **Pressing "Analyse" would have crashed the application.** `next_run_id()`
+  incremented the counter and returned it; `register_job()` then incremented it
+  again and returned *that*. The id stamped on every progress event was one
+  number and the id the run was registered under was the next one, so
+  `debug_assert_eq!` fired — and in a development build that is a panic, not a
+  warning
+- **It survived because my own test helper skipped the step that reaches it.**
+  `run_to_completion` called `register_job` directly and never called
+  `next_run_id`, so it exercised a path no real caller uses. Five integration
+#### The frontend did not parse, and 188 Rust tests could not see it
+- **A `return` sat outside any function in `screens.js`.** The module failed to
+  evaluate before any screen rendered, so the application would have opened to a
+  blank window. It survived four builds and 188 passing tests
+- **Nothing could have caught it.** The frontend has no build step by design, so
+  `tauri_build` embeds `ui/` as static assets and never parses the JavaScript.
+  The Rust tests never load the frontend. `cargo build` produced a working 23 MB
+  executable containing a file that does not parse — the failure was only
+  reachable by launching the application and looking at it
+- **The cause was my own text editing.** An earlier pass removed a duplicated
+  `bytes()` helper with a line-range script that cut two lines too many, and I did
+  not parse the file afterwards. Four subsequent builds reported success because
+  none of them read it
+- **`ui/check.mjs` now exists**, and `build.rs` runs it. It parses every module
+  through the same ES-module loader the browser uses, and cross-checks every
+  `invoke("...")` in the frontend against the `#[tauri::command]` functions in
+  `commands.rs`. Both checks were verified by deliberately breaking the frontend:
+  a syntax error and an unknown command name each fail the build
+- **The gate is fatal when Node is present, and a warning when it is not.** The
+  no-bundler frontend is a deliberate property, so a developer without Node must
+  still be able to build the desktop app. What is not permitted is running the
+  build with Node installed and the check failing
+- This is the same lesson the project has already learned three times — code that
+  compiles, is documented, and has tests, but was never wired to a caller. Here
+  the unwired surface was not a command but a whole file
+
+#### The pixel viewer works, and I had reported it as impossible
+- Completing the viewer meant deciding *when* to decode, not *whether* the public
+  engine API allowed it. Re-reading the container and video crates showed
+  `decode_frame`, the AV1 decoder, and the frame-timestamp accessors were all
+  already public — the earlier claim that pixel viewing needed an engine redesign
+  was wrong, and it was wrong because I had not looked
+- **Frames are decoded per click rather than cached.** A 4K frame is ~24 MB as
+  RGB; a few hundred of them is a multi-gigabyte cache in a tool that is
+  supposed to open quickly and hold one case
+- **A greyscale decode is labelled as one.** AV1 decodes luma-only when there is
+  no chroma plane, so neutral Cb/Cr is *arithmetic*, not measurement. Presenting
+  128/128 as an observed chroma value would be a fabricated reading in a panel
+  that looks like an instrument
+- The pixel inspector and histogram are live, and the nine frame-decode tests
+  cover corrupt streams, stepping past the end, and two different frames actually
+  differing
+  tests passed, all of them bypassing the two-step sequence the command performs
+- **The `debug_assert` was correct and useless.** It documented the invariant
+  precisely and could not observe it, because nothing tested the path it guards
+- `register_job` now takes the reserved id and never advances the counter. The
+  test helper mirrors `analyse` exactly, and a new test asserts that consecutive
+  runs get distinct, consecutive ids rather than merely different ones
+- **Verified by reintroducing the bug:** five tests fail with `left: 1, right: 0`
+  — the double allocation, named exactly
 #### The decoder does not tell you when it drops a frame
 - Completing §30 meant writing decode-failure detection, and the first version of
   it counted `Err` from the decoder. Testing against real AV1 showed that **the

@@ -73,7 +73,7 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [ ] Implement frame extraction as evidence
 - [ ] Implement analysis cache keyed on asset hash + analysis version +
       profile hash + rule-set hash (§54)
-- [ ] Implement large-file/streaming analysis with bounded memory,
+- [x] Implement large-file/streaming analysis with bounded memory,
       background workers, cancellation, progress reporting (§55–56)
 - [x] Implement file-to-file comparison engine (duration, streams, codec,
       colour, audio, metadata, timestamps, scene structure) (§38–40)
@@ -98,17 +98,53 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [ ] Implement CLI (`inspect`, `hash`, `analyze`, `report`, batch) sharing
       the core engine with the GUI (§51)
 - [ ] Implement batch analysis engine + directory batch mode (§48–49)
-- [ ] Build Tauri desktop app shell wrapping the same core engine (§78)
-- [ ] Implement core UI screens: Case, Assets, Overview, Streams, Timeline,
+- [x] Build Tauri desktop app shell wrapping the same core engine (§78)
+      Tauri 2.11, no-bundler frontend (plain ES modules; the build is
+      Rust-only). Kept out of the workspace because it pulls in the webview
+      toolchain. `src/view/` holds the screens as ordinary structs so
+      `cargo test` here exercises the whole UI layer without a window.
+- [x] Implement core UI screens: Case, Assets, Overview, Streams, Timeline,
       Video, Audio, Metadata, Findings, Comparisons, Evidence, Reports (§79)
-- [ ] Implement dashboard (asset/finding/severity counts, status) (§80)
-- [ ] Implement timeline UI as central navigation (video/audio/scene/error/
+      All twelve have a renderer and a model. **Overview and Streams are
+      plumbed** through `commands::inspect_asset`, and the analysis path is
+      complete: `analyse` spawns a job, emits progress events, `poll_analysis`
+      collects the result and `cancel_analysis` stops it.
+      All twelve are plumbed, and the viewer displays pixels: `decode_frame`
+      decodes one frame on demand through `DecodeSession::decode_prefix`, and
+      `tests/frame_decode.rs` verifies the whole path on genuinely encoded AV1 in
+      a real WebM container. Decoding is per click rather than retained - a 4K
+      master would exhaust memory before the analyst reached the end.
+- [x] Implement dashboard (asset/finding/severity counts, status) (§80)
+      Counts by severity plus `REVIEW REQUIRED` / `CLEAR` / `INCOMPLETE`. No
+      authenticity score — spec §80 forbids one, and a single figure would
+      have to discard every `Confidence` and every rule's stated limitation to
+      exist. `INCOMPLETE` covers running, failed *and* cancelled: a run that
+      died halfway has not cleared itself.
+- [x] Implement timeline UI as central navigation (video/audio/scene/error/
       finding layers, click-to-jump) (§42, §81)
-- [ ] Implement media viewer: frame stepping, PTS/DTS display, zoom, pixel
+      Five layers; click resolves to a screen, time, frame, stream, finding and
+      evidence. An unplaced observation is listed, never drawn, and clicking it
+      goes nowhere with an explanation — spec §31 forbids inventing a
+      timecode for it. Empty rows are omitted rather than drawn blank.
+- [x] Implement media viewer: frame stepping, PTS/DTS display, zoom, pixel
       inspector, histogram, waveform, A/B compare (§43–44)
-- [ ] Implement side-by-side comparison view (§82)
-- [ ] Implement batch results dashboard (§83)
-- [ ] Verify: malformed/corrupt media cannot crash the app
+      Stepping saturates rather than wrapping. PTS and DTS are separate, and an
+      absent DTS is `None` rather than zero. The pixel inspector names its
+      matrix (spec §44) and says when a greyscale frame's chroma figures are
+      128 by construction.
+- [x] Implement side-by-side comparison view (§82)
+      Built on `-model::comparison`. `NotComparable` is carried to the screen
+      and never styled as agreement; a comparison showing "no differences" also
+      prints how many properties were uncomparable.
+- [x] Implement batch results dashboard (§83)
+      PASS / WARN / FAIL derived from the engine's own
+      `ValidationResult::from_findings`, so the GUI and `validate` cannot
+      disagree. A file that could not be read is `UNREADABLE` and blocks
+      delivery.
+- [x] Verify: malformed/corrupt media cannot crash the app
+      13 tests over 11 hostile fixtures plus malformed decoded frames. Found and
+      fixed three real overflow bugs where `checked_mul` guarded the pixel count
+      and the `* 3` for bytes-per-pixel was unchecked.
 - [ ] Verify: analysis is reproducible from recorded profile + software
       version (analysis fingerprint, §63)
 - [ ] Complete a full real-world professional workflow end-to-end (§96)

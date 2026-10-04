@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TPT Media Forensics</title>
+<!--
+  No bundler.
+
+  The frontend is plain ES modules with no build step, so `cargo build` and
+  `cargo tauri build` need nothing but a Rust toolchain. That is deliberate:
+  spec \u00a776 requires reproducible output, and a Node/pnpm toolchain in the
+  build path is a second supply chain whose lockfile has to be pinned as
+  carefully as the Cargo one. It is also why this crate is excluded from the
+  workspace build.
+-->
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="titlebar">
+    <h1>TPT Media Forensics</h1>
+    <div class="case-bar">
+      <button id="open-case" type="button">Open case\u2026</button>
+      <span id="case-name" class="case-name">No case open</span>
+      <!--
+        `close-case` was read by app.js but never declared here, and nothing
+        caught it. The frontend check's id pattern was `\w+`, which does not match
+        the hyphen in a hyphenated id, so this element was invisible to it. The
+        application died at startup on
+        `Cannot read properties of null (reading 'addEventListener')` - found by
+        running the real webview, not by any static check. See ui/bootstrap.js.
+      -->
+      <button id="close-case" type="button" disabled>Close case</button>
+      <input id="search" type="search" placeholder="Search the case\u2026" autocomplete="off" />
+    </div>
+  </header>
+
+  <div id="toolbar" class="toolbar"></div>
+
+  <div class="shell">
+    <nav id="nav" class="nav" aria-label="Screens"></nav>
+    <main id="screen" class="screen">
+      <p class="placeholder">
+        Open a case directory to begin. Nothing is analysed until you ask for it.
+      </p>
+    </main>
+  </div>
+
+  <div id="banner" class="banner" hidden role="status"></div>
+
+  <!--
+    Loaded first, and deliberately not a module: a classic script with no
+    imports is the only thing guaranteed to run even when the module graph
+    below is broken. It turns "the window opened blank" into a readable
+    message. See ui/bootstrap.js.
+  -->
+  <script src="bootstrap.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use tpt_app_media_forensics_model::{AssetId, Finding, FindingId};
+use tpt_app_media_forensics_model::{AssetId, Finding, FindingId, RuleRationale};
 
 use crate::profile::RuleProfile;
 
@@ -262,6 +262,22 @@ pub trait ForensicRule: Send + Sync {
     /// Why the condition matters.
     fn why_it_matters(&self) -> &'static str;
 
+    /// What a finding from this rule does *not* establish.
+    ///
+    /// Spec §71 asks every finding to state its own limitations, and a rule author
+    /// is the only party who knows which apply. `VIDEO.GOP_LENGTH_CHANGE` can say
+    /// precisely that a re-encode changes GOP length; a generic "this does not
+    /// prove manipulation" would be true of every rule and so tells a reviewer
+    /// nothing about this one.
+    ///
+    /// Defaults to [`RuleRationale::DEFAULT_LIMITATION`] rather than to nothing,
+    /// because a missing caveat reads as *no* caveat — an absence a reader
+    /// resolves in the finding's favour. Override it wherever the rule can say
+    /// something a reviewer would act on differently.
+    fn does_not_establish(&self) -> &'static str {
+        RuleRationale::DEFAULT_LIMITATION
+    }
+
     /// The analysis this rule reads, without which it cannot produce a finding.
     ///
     /// Mandatory, with no default. A rule that declares nothing it reads is
@@ -324,11 +340,23 @@ impl RuleEngine {
         bundle: &AnalysisBundle,
         profile: &RuleProfile,
     ) -> Result<Vec<Finding>, RuleError> {
-        let mut findings: Vec<Finding> = self
-            .rules
-            .iter()
-            .flat_map(|rule| rule.evaluate(bundle, profile))
-            .collect();
+        let mut findings: Vec<Finding> = Vec::new();
+        for rule in &self.rules {
+            // Spec §71: every finding carries what its rule checks and why that
+            // matters. Stamped here, while the rule is in hand, rather than looked
+            // up at render time — a report is read away from this binary, and an
+            // explanation that only existed inside the engine could not travel
+            // with the finding.
+            let rationale = RuleRationale {
+                checks: rule.what_it_checks().to_owned(),
+                why_it_matters: rule.why_it_matters().to_owned(),
+                does_not_establish: rule.does_not_establish().to_owned(),
+            };
+            for mut finding in rule.evaluate(bundle, profile) {
+                finding.rationale = Some(rationale.clone());
+                findings.push(finding);
+            }
+        }
 
         findings.sort_by(|a, b| {
             // Most severe first (Severity orders Critical as greatest), then

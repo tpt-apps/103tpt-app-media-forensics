@@ -1,0 +1,415 @@
+/*
+  TPT Media Forensics \u2014 application styles.
+
+  A dark, low-chroma palette on purpose. Every colour here that carries meaning
+  is a severity colour, and a saturated background competes with them for the
+  eye. The point of the interface is that the *finding* is the brightest thing
+  on screen.
+
+  Severity colours are chosen to stay distinguishable for the most common form
+  of colour vision deficiency: red/green is the pair that fails, so Critical is
+  a red-orange and Warning is a yellow rather than a green, and every severity
+  also carries a text label. Colour is never the only channel.
+*/
+
+:root {
+  --bg: #12161c;
+  --bg-raised: #181d25;
+  --bg-inset: #0e1216;
+  --line: #262d38;
+  --text: #d8dee9;
+  --text-dim: #8a94a6;
+
+  --critical: #ff6b5a;
+  --significant: #ffa24d;
+  --warning: #e8c547;
+  --info: #6aa9ff;
+  --accent: #5aaaff;
+  --ok: #57c98a;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-raised);
+}
+
+.titlebar h1 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin: 0;
+  color: var(--text-dim);
+}
+
+.case-bar { display: flex; align-items: center; gap: 12px; flex: 1; }
+
+.case-name { color: var(--text); font-weight: 600; }
+
+input[type="search"] {
+  margin-left: auto;
+  width: 260px;
+  padding: 5px 9px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+button {
+  padding: 5px 11px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: default; }
+
+.shell { display: flex; flex: 1; min-height: 0; }
+
+.nav {
+  width: 168px;
+  border-right: 1px solid var(--line);
+  padding: 8px 0;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.nav button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  padding: 7px 16px;
+}
+.nav button[aria-current="true"] {
+  border-left-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-raised);
+}
+.nav button:disabled { color: var(--text-dim); }
+
+.screen { flex: 1; overflow: auto; padding: 20px 24px; min-width: 0; }
+.placeholder { color: var(--text-dim); }
+
+h2 {
+  margin: 0 0 16px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+h3 {
+  margin: 24px 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* ---------------------------------------------------------------- dashboard */
+
+.counters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.counter {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+
+.counter .value { font-size: 24px; font-weight: 600; line-height: 1.1; }
+.counter .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.verdict {
+  display: flex;
+  gap: 28px;
+  align-items: baseline;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-raised);
+}
+.verdict .k { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.verdict .v { font-weight: 600; }
+
+/* ------------------------------------------------------------------- tables */
+
+table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--text-dim); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: var(--bg-raised); }
+code, .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+
+/* --------------------------------------------------------------- severity */
+
+.sev { font-weight: 600; letter-spacing: 0.03em; }
+.sev-CRITICAL { color: var(--critical); }
+.sev-SIGNIFICANT { color: var(--significant); }
+.sev-WARNING { color: var(--warning); }
+.sev-INFO { color: var(--info); }
+
+.status-PASS { color: var(--ok); font-weight: 600; }
+.status-WARN { color: var(--warning); font-weight: 600; }
+.status-FAIL { color: var(--critical); font-weight: 600; }
+.status-UNREADABLE, .status-SKIPPED { color: var(--significant); font-weight: 600; }
+
+.dim { color: var(--text-dim); }
+
+/* ----------------------------------------------------------------- timeline */
+
+.timeline { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.tl-row { display: flex; align-items: center; border-bottom: 1px solid var(--line); }
+.tl-row:last-child { border-bottom: 0; }
+.tl-label {
+  width: 130px;
+  flex-shrink: 0;
+  padding: 8px 10px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  background: var(--bg-inset);
+}
+.tl-track { position: relative; height: 34px; flex: 1; cursor: crosshair; }
+.tl-mark { position: absolute; top: 8px; width: 2px; height: 18px; border-radius: 1px; }
+.tl-mark.inferred { opacity: 0.55; border-left: 1px dashed currentColor; border-radius: 0; width: 0; }
+
+.tl-unplaced {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--text-dim);
+}
+.tl-unplaced ul { margin: 6px 0 0; padding-left: 18px; }
+.tl-unplaced li { margin: 2px 0; }
+
+/* ------------------------------------------------------------------ banner */
+
+.banner {
+  padding: 9px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-raised);
+  font-size: 12px;
+}
+.banner.error { color: var(--critical); border-top-color: var(--critical); }
+.banner.notice { color: var(--accent); }
+
+/* ----------------------------------------------------------------- panels */
+
+.panel {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+
+.kv { display: grid; grid-template-columns: 190px 1fr; gap: 4px 14px; }
+.kv dt { color: var(--text-dim); }
+.kv dd { margin: 0; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+
+.limits { margin: 0; padding-left: 18px; color: var(--text-dim); }
+.limits li { margin: 3px 0; }
+
+/* ------------------------------------------------------------------ toolbar */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.toolbar:empty { display: none; }
+
+/* The bar's fill is the engine's own fraction, not a frontend animation. It is
+   never smoothed: an eased bar implies a prediction the engine has not made
+   (spec \u00a756). */
+.progress {
+  position: relative;
+  flex: 1;
+  max-width: 420px;
+  height: 16px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  /* No transition: a smoothed bar would imply an estimate the engine refuses to
+     make, and would keep moving after the run that was driving it had stopped. */
+}
+
+.progress-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+  font-size: 11px;
+  color: var(--text);
+  pointer-events: none;
+}
+
+.run-summary { color: var(--text-dim); font-size: 12px; }
+
+/* ------------------------------------------------------------- comparison */
+
+/* Path inputs for the comparison form. Free text rather than two more dialogs:
+   a comparison is usually between a file already in the case and one on a
+   share, and the path is shown beside the result either way. */
+.path {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 6px 9px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.panel .k {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.panel .v { font-weight: 600; margin-bottom: 6px; }
+
+/* ---------------------------------------------------------------- waveform */
+
+/* Full width of the panel, fixed height. The canvas is drawn at a fixed
+   internal resolution and scaled by the browser, so the envelope stays sharp on
+   a high-DPI display without a re-render on every window resize. */
+.waveform {
+  display: block;
+  width: 100%;
+  height: 160px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-inset);
+}
+
+/* ------------------------------------------------------------------ viewer */
+
+.viewer {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+/* `image-rendering: pixelated` matters: at 4x the browser would otherwise
+   smoothly interpolate, and a reviewer would read the interpolation as detail
+   in the frame rather than as an artefact of the display. */
+.frame-canvas {
+  display: block;
+  margin: 12px 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #000;
+  image-rendering: pixelated;
+  max-width: 100%;
+  cursor: crosshair;
+}
+
+.histogram {
+  display: block;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-inset);
+  max-width: 100%;
+}
+
+.inspector { margin-top: 14px; }
+.inspector .mono { line-height: 1.7; }
+
+.readout .k { min-width: 60px; }
+/* A startup failure, reported by ui/bootstrap.js in place of a blank window. */
+pre.fatal {
+  margin: 2rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid #b3261e;
+  border-radius: 6px;
+  background: rgba(179, 38, 30, 0.08);
+  color: inherit;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* A row that can be selected - an asset, or the frame a seek landed on. */
+table.selectable tbody tr { cursor: pointer; }
+table.selectable tbody tr:hover { background: rgba(232, 197, 71, 0.08); }
+table.selectable tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+table.selectable tbody tr.selected { background: rgba(232, 197, 71, 0.16); }
+table tbody tr.selected { background: rgba(232, 197, 71, 0.16); }
+
+/* Zoom and A/B pinning, above the decoded frame. */
+.viewer-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+.viewer-controls button {
+  padding: 0.15rem 0.55rem;
+  font-size: 0.8rem;
+}
+.viewer-controls button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* The decoded frame itself: exact pixels, never resampled by the compositor. */
+canvas.frame-canvas {
+  image-rendering: pixelated;
+  max-width: 100%;
+  height: auto;
+}

@@ -109,18 +109,18 @@ impl ValidationResult {
     /// Derives the result from the findings' severities (spec §68).
     ///
     /// `Critical` and `Significant` fail delivery; `Warning` and `Info` do not.
+    ///
+    /// Delegates to [`Severity::fails_validation`] rather than repeating the
+    /// severity list. A second copy of "what blocks a delivery" would be free to
+    /// drift from the first, and it would drift silently: this function is what
+    /// actually produces verdicts, so a change to the predicate that missed it
+    /// would leave the answer unchanged while the rule it names looked changed.
     #[must_use]
     pub fn from_findings(findings: &[Finding]) -> Self {
-        let has_blocking = findings.iter().any(|f| {
-            matches!(
-                f.severity,
-                tpt_app_media_forensics_model::Severity::Critical
-                    | tpt_app_media_forensics_model::Severity::Significant
-            )
-        });
-        let has_warnings = findings
-            .iter()
-            .any(|f| f.severity == tpt_app_media_forensics_model::Severity::Warning);
+        use tpt_app_media_forensics_model::Severity;
+
+        let has_blocking = findings.iter().any(|f| f.severity.fails_validation());
+        let has_warnings = findings.iter().any(|f| f.severity == Severity::Warning);
 
         match (has_blocking, has_warnings) {
             (true, _) => Self::Fail,

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the main window. Deliberately minimal: this application performs all of its work through its own Rust commands, so it needs no general filesystem, shell, or HTTP permission. The only plugin granted is the dialog picker, which exists so a case directory is chosen from disk rather than typed (spec §11).",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save", "dialog:allow-message", "dialog:allow-confirm"]
+}

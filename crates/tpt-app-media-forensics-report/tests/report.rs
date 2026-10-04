@@ -24,11 +24,19 @@ fn finding(rule: &str, severity: Severity, summary: &str) -> Finding {
             summary: summary.to_owned(),
             measurements: vec!["observed: 50 -> 15 frames (measured from stts)".to_owned()],
         },
+        rationale: Some(tpt_app_media_forensics_model::RuleRationale {
+            checks: "Whether frame timing changes beyond the profile tolerance.".to_owned(),
+            why_it_matters: "A cadence conversion or re-encode can change it harmlessly."
+                .to_owned(),
+            does_not_establish: tpt_app_media_forensics_model::RuleRationale::DEFAULT_LIMITATION
+                .to_owned(),
+        }),
         asset_id: asset,
         stream_id: None,
         timeline_start: Some(MediaTime::from_millis(2_000)),
         timeline_end: None,
         evidence: Vec::new(),
+        frame_index: None,
         status: Default::default(),
         review_note: None,
     }
@@ -116,6 +124,51 @@ fn the_html_report_carries_the_disclaimer_and_methodology() {
     ] {
         assert!(html.contains(field), "methodology is missing {field}");
     }
+}
+
+#[test]
+fn every_finding_renders_its_explanation_in_html() {
+    // Spec §71 asks that every finding explain itself: what the rule checks, why
+    // it matters, what was observed, and what the observation does not establish.
+    // Three of those four were already rendered; the first two existed only as
+    // trait methods that nothing outside their own tests ever called, so a report
+    // reached a reviewer with the observation and no explanation of it.
+    //
+    // Asserted against the rendered document rather than the struct because the
+    // struct passing proves nothing about what a reviewer is shown.
+    let html = to_html(&report());
+
+    assert!(
+        html.contains("What this checks"),
+        "the report must say what each rule checks: {html}"
+    );
+    assert!(
+        html.contains("Why it matters"),
+        "the report must say why each condition matters: {html}"
+    );
+    assert!(
+        html.contains("frame timing changes beyond the profile tolerance"),
+        "the rule's own prose must appear verbatim, not a paraphrase: {html}"
+    );
+}
+
+#[test]
+fn a_finding_with_no_rationale_still_carries_a_limitation() {
+    // A finding assembled by a caller rather than raised by a rule has no
+    // rationale to show. It must still state its limits rather than render as an
+    // unexplained assertion — the disclaimer is the floor, not the ceiling.
+    let mut report = report();
+    for finding in &mut report.findings {
+        finding.rationale = None;
+    }
+
+    let html = to_html(&report);
+    assert!(html.contains("does not establish intent"));
+    // And it does not claim an explanation it does not have.
+    assert!(
+        !html.contains("What this checks"),
+        "a finding with no rationale must not render an empty explanation: {html}"
+    );
 }
 
 #[test]

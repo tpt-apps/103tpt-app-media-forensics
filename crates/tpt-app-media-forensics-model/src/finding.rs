@@ -143,6 +143,53 @@ impl FindingStatus {
         }
     }
 }
+/// What was observed, and why anyone should care (spec §71).
+///
+/// Present on the finding rather than looked up from the rule at render time,
+/// because a report is read away from the binary that produced it. Spec §71
+/// requires every finding to carry its own explanation, and an explanation that
+/// only exists inside the running engine cannot appear in the PDF a reviewer
+/// receives six months later.
+///
+/// The two strings are copied from [`ForensicRule::what_it_checks`] and
+/// [`ForensicRule::why_it_matters`] when the finding is raised, so they cannot
+/// drift from the rule that produced them.
+///
+/// [`ForensicRule::what_it_checks`]: tpt_app_media_forensics_rules::ForensicRule::what_it_checks
+/// [`ForensicRule::why_it_matters`]: tpt_app_media_forensics_rules::ForensicRule::why_it_matters
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuleRationale {
+    /// What the rule checks.
+    pub checks: String,
+    /// Why that condition matters.
+    pub why_it_matters: String,
+    /// What this particular observation does *not* establish.
+    ///
+    /// Rule-specific where a rule can say something useful, falling back to the
+    /// report-wide disclaimer. Present because a finding with no stated limits
+    /// reads as more conclusive than one that states them — and a rule author is
+    /// the only party who knows which limits apply.
+    pub does_not_establish: String,
+}
+
+impl RuleRationale {
+    /// The fallback wording, used when a rule states nothing more specific.
+    ///
+    /// Matches the disclaimer the report already carries, so a finding with no
+    /// rule-specific caveat is limited no more loosely than one that has one.
+    pub const DEFAULT_LIMITATION: &'static str =
+        "This observation does not establish intent, authorship, or authenticity.";
+
+    /// Whether the rule supplied its own limitation wording.
+    ///
+    /// A render can then say "the rule adds" only when there is something added,
+    /// rather than presenting boilerplate as if it were specific.
+    #[must_use]
+    pub fn has_specific_limit(&self) -> bool {
+        !self.does_not_establish.is_empty() && self.does_not_establish != Self::DEFAULT_LIMITATION
+    }
+}
+
 /// A single rule observation (spec §34).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
@@ -156,6 +203,13 @@ pub struct Finding {
     pub confidence: Confidence,
     /// What was observed.
     pub observation: Observation,
+    /// What the rule checks, why it matters, and what this does not establish
+    /// (spec §71).
+    ///
+    /// `None` only for a finding constructed by hand rather than raised by a
+    /// rule — a test fixture, or a caller assembling a record. Every finding the
+    /// engine produces carries its rationale.
+    pub rationale: Option<RuleRationale>,
     /// The asset this finding belongs to.
     pub asset_id: AssetId,
     /// The stream this finding belongs to, when stream-scoped.
@@ -166,6 +220,15 @@ pub struct Finding {
     pub timeline_end: Option<MediaTime>,
     /// Evidence artefacts supporting this finding.
     pub evidence: Vec<EvidenceId>,
+    /// The decoded frame this finding was measured on, as an index into the
+    /// Tier-2 frame list.
+    ///
+    /// Set by the pixel rules only. It exists so the evidence extractor can attach
+    /// the frame a finding actually came from, rather than the nearest frame by
+    /// time — which for a scene change is very often the wrong one. `None` for a
+    /// finding with no decoded frame behind it, which is the honest answer for
+    /// every container, timing, and audio finding.
+    pub frame_index: Option<usize>,
     /// Reviewer disposition (spec §66).
     pub status: FindingStatus,
     /// Reviewer note, kept separate from the observation.
@@ -215,11 +278,13 @@ mod tests {
                 summary: "Frame timing changes beyond tolerance".to_owned(),
                 measurements: vec!["29.97 fps -> 30.00 fps".to_owned()],
             },
+            rationale: None,
             asset_id: AssetId::new_derived(&["asset"]),
             stream_id: Some(StreamId::new_derived(&["asset", "0"])),
             timeline_start: Some(MediaTime::from_millis(2_243_120)),
             timeline_end: None,
             evidence: vec![EvidenceId::new_derived(&["frame", "1002"])],
+            frame_index: Some(1002),
             status: FindingStatus::New,
             review_note: None,
         }

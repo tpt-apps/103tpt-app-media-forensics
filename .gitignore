@@ -6,6 +6,12 @@
 /src-tauri/target/
 /dist/
 
+# Tauri-generated capability schemas. `tauri-build` regenerates these from
+# `capabilities/*.json` on every build, and they are derived from the plugin
+# set rather than authored, so committing them would mean a stale copy could
+# disagree with the permissions the build actually grants.
+/crates/tpt-app-media-forensics-tauri/gen/schemas/
+
 # Node (Tauri frontend tooling)
 node_modules/
 .pnpm-store/

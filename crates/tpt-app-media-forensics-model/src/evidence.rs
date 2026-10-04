@@ -60,7 +60,11 @@ impl EvidenceKind {
 ///
 /// Recorded so a reviewer can judge whether an artefact is a direct capture or
 /// a transformation. A re-encoded frame is weaker evidence than a direct dump.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Copy` because the label is stored in the database, the artefact, and the
+/// report without ever being modified after construction; cloning it to satisfy
+/// the borrow checker would imply it could change, which it cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provenance {
     /// Copied byte-for-byte from the source.
     DirectCopy,
