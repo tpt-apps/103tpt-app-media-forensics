@@ -1270,6 +1270,48 @@ pub fn build_mp4_with_overlapping_presentation_times(frames: u32) -> Vec<u8> {
     )])
 }
 
+/// Builds a Matroska document whose block timecodes go backwards.
+///
+/// The only route to [`tpt_app_media_forensics_timing::pts_dts::Anomaly::NonMonotonicDts`],
+/// and it has to be Matroska because ISO-BMFF cannot express it at all: `stts`
+/// builds decode times from *unsigned* deltas, so decode time in an MP4 is
+/// strictly increasing by construction. Composition offsets can move
+/// *presentation* time backwards — which is what `reordered.mp4` does — but they
+/// are applied after decode time is fixed, so they can never disturb it.
+///
+/// Matroska is the opposite. A `SimpleBlock` carries a block-relative timecode
+/// that is signed and interpreted against its cluster's timestamp, and this
+/// builder emits blocks in decreasing order, so the reader recovers the sequence
+/// in file order and the times move backwards.
+///
+/// That is a real defect rather than an exotic one: blocks must appear in
+/// timestamp order within a cluster, and a file that violates it is the signature
+/// of concatenated or partially-remuxed material.
+#[must_use]
+pub fn build_webm_with_backwards_timestamps(
+    codec_id: &str,
+    track_type: u8,
+    blocks: usize,
+) -> Vec<u8> {
+    // Strictly decreasing, by more than the 33 ms a 30 fps track would use. The
+    // step is deliberately large so the anomaly cannot be confused with the
+    // jitter a real muxer emits between adjacent blocks.
+    let step = 100u16;
+    let entries: Vec<(u16, bool, Vec<u8>)> = (0..blocks)
+        .map(|index| {
+            let ts = (blocks as u16 - 1 - index as u16).saturating_mul(step);
+            let mut payload = vec![0u8; 32];
+            // Distinct payloads, so the file carries no duplicate-frame run that
+            // would fire `VIDEO.DUPLICATE_FRAME_RUN` for reasons unrelated to
+            // what this fixture is for.
+            payload[0] = index as u8;
+            payload[1] = (index as u8).wrapping_mul(7);
+            (ts, index % 4 == 0, payload)
+        })
+        .collect();
+    build_webm(codec_id, track_type, &entries)
+}
+
 /// Encodes an EBML variable-length size integer for `value`.
 ///
 /// The width is the narrowest that can hold `value`, chosen so that the leading

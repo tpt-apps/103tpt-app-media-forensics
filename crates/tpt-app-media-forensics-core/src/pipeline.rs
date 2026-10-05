@@ -36,7 +36,7 @@ use tpt_app_media_forensics_model::{
 use tpt_app_media_forensics_rules::{
     builtin_rules, engine::empty_bundle, engine::AnalysisBundle, RuleEngine, RuleProfile,
 };
-use tpt_app_media_forensics_timing::pts_dts::scan_presentation;
+use tpt_app_media_forensics_timing::pts_dts::{scan_decode, scan_presentation};
 use tpt_app_media_forensics_video::duplicate::find_repeated_runs;
 use tpt_app_media_forensics_video::gop;
 
@@ -652,10 +652,24 @@ impl AnalysisEngine {
             // `VIDEO.SINGLE_KEYFRAME` fired on an MP3 and GOP "structure" was
             // reported for a track that has no concept of one.
             if let Some(info) = inspection.first_video_frames() {
-                bundle.timestamps = vec![scan_presentation(
-                    &info.frame_times,
-                    self.profile.pts_tolerance,
-                )];
+                // Presentation order *and* decode order, in that order. Both are
+                // scanned because they fail for different reasons and a report
+                // that showed only one could not tell them apart: B-frame video is
+                // normal with presentation time out of decode order, whereas
+                // decode time going backwards is always a broken table or a file
+                // assembled from reordered parts.
+                //
+                // `scan_decode` was unwired until now, which made
+                // `Anomaly::NonMonotonicDts` unreachable from any file — the
+                // variant existed, was unit-tested, and nothing in the pipeline
+                // could produce it. The two reports are kept as separate entries
+                // rather than merged because each rule matches on one anomaly
+                // kind; a merged report would let a decode-time regression read as
+                // a presentation-order finding.
+                bundle.timestamps = vec![
+                    scan_presentation(&info.frame_times, self.profile.pts_tolerance),
+                    scan_decode(&info.decode_times),
+                ];
             }
         }
 

@@ -43,4 +43,7 @@ Thumbs.db
 *~
 *.orig
 *.rej
-
+# proptest regression seeds are local artefacts here: the only failure this file
+# ever recorded came from a deliberately weakened assertion, and checking one in
+# would imply a real defect had been found.
+*.proptest-regressions

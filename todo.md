@@ -1071,9 +1071,18 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       property body was caught, so the harness is not vacuous.
       The harness caught a bug in the test itself — a loop that never advanced
       `cursor` and so only ever checked offset 0.
-      **Still not started:** timestamps and frame ordering. Those need generators
-      for presentation/decode sequences, which is a different piece of work from
-      parsing bytes.
+      **Timestamps now have real properties** —
+      `-timing/tests/properties.rs`, 9 properties. The generators that entry said
+      were missing were the whole of the work: the scanners take an arbitrary
+      *sequence of numbers*, which is the cheapest property surface in the engine.
+      The load-bearing properties are completeness, not soundness — every backwards
+      step and every repeated instant must be reported and nothing else — since a
+      scanner that reports the first anomaly and then stops passes every example
+      test while missing the defect in the back half of a long file. Verified
+      non-vacuous by weakening the expectation and watching two fail. Full detail
+      in the completed entry below.
+
+      **Still not started:** frame ordering.
 - [ ] Fuzzing for container/codec/metadata/packet/timestamp parsers
 - [ ] Golden tests against known fixtures (metadata, structure, findings)
 - [~] Build corrupt-media test corpus (§76): synthetic generator in place;
@@ -1119,7 +1128,41 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       fixture could exist"** because the pipeline calls `scan_presentation` and
       never `scan_decode` — no file of any kind reaches it. That is an
       unwired *analysis*, not a corpus gap, and saying so is what distinguishes
-      the two.
+      the two. **Superseded — see the two entries below.**
+- [x] Wire `scan_decode` into the pipeline (§24)
+      The `UNREACHED_VARIANTS` entry above was correct about the wiring and wrong
+      about the conclusion. `pts_dts::scan_decode` was a real, documented,
+      unit-tested scanner the pipeline never called — so recording the variant as
+      "no fixture could exist" described the state of the *analysis* as a property
+      of the *format*, and would have left a correct function dead and a defect
+      class unreachable indefinitely.
+      The pipeline now scans both sequences, kept as separate entries in
+      `bundle.timestamps` because each rule matches on one anomaly kind: a merged
+      report would let a decode-time regression read as a presentation-order
+      finding. `NonMonotonicDts` is reached by `backwards-blocks.webm`, and
+      `UNREACHED_VARIANTS` is empty again — which is the point, since an entry
+      there had stopped being a record of anything.
+      `the_pipeline_scans_decode_and_presentation_time_separately` asserts both
+      directions — notably that `reordered.mp4` is *not* reported as a decode
+      regression, because B-frame video is normal — since a pipeline scanning the
+      same sequence twice would pass a positive-only test.
+- [x] Property tests for the timestamp scanners (§24, §76)
+      `-timing/tests/properties.rs`, 9 properties. Container parsing already had
+      6; timestamps are the only other stage whose input is an arbitrary
+      *sequence of numbers* rather than a file.
+      The load-bearing ones are **completeness**, not soundness: every backwards
+      step and every repeated instant must be reported, and nothing else. A scanner
+      that reported the first anomaly correctly and then stopped would pass every
+      example test in the crate while dropping the defect from the back half of a
+      long file. Verified non-vacuous by weakening the expectation and watching two
+      properties fail.
+      Also asserted: a regular track is clean; every reported anomaly is backed by
+      the input at the index named; negatives are reported exactly in both
+      directions (spec §24 treats them as legitimate before an edit list, so
+      grading them would be wrong); anomalies come back in sample order, because
+      the error timeline renders them in the order given; and appending a sample
+      can never hide an earlier regression, since the gap threshold is a *modal*
+      delta and therefore moves with the very sequence it is scanning.
 - [x] Determinism checks (stable rule ordering, no unseeded randomness) (§77)
       Checked at three levels: `results_are_ordered_deterministically` (rule
       output order), `hash_is_deterministic_across_invocations` and

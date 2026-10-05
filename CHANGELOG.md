@@ -56,6 +56,43 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### A correct scanner that nothing called, recorded as an impossible condition
+- **A gap list can hide a defect by classifying it as a limit.** The variant guard
+  added in the previous commit recorded `NonMonotonicDts` as "no fixture could
+  exist", because the pipeline called `pts_dts::scan_presentation` and never
+  `scan_decode`. The statement was true about the *wiring* and wrong about the
+  conclusion: `scan_decode` is a real, documented, unit-tested scanner that the
+  engine simply never called, so writing the variant off as unreachable would
+  have left a correct function dead and a whole defect class out of every report,
+  indefinitely
+- **The pipeline now scans decode order as well as presentation order**, as two
+  separate entries in `bundle.timestamps` rather than one merged report — each
+  rule matches on a single anomaly kind, and a merged report would let a
+  decode-time regression read as a presentation-order finding
+- **Both directions are asserted.** `the_pipeline_scans_decode_and_presentation_time_separately`
+  checks that `reordered.mp4` is *not* reported as a decode regression, because
+  B-frame video is normal and a decode anomaly there would be a false positive on
+  a healthy file. A positive-only test would have passed a pipeline that scanned
+  the same sequence twice
+- **`UNREACHED_VARIANTS` is empty again**, which is the point: an entry in that
+  list had stopped being a record of anything
+- **Nine property tests for the timestamp scanners**, the only engine stage whose
+  input is an arbitrary *sequence of numbers* rather than a file. The ones that
+  matter are completeness, not soundness — every backwards step and every repeated
+  instant must be reported, and nothing else — because a scanner that reports the
+  first anomaly correctly and then stops scanning passes every example test in the
+  crate while missing the defect in the back half of a long file. Confirmed
+  non-vacuous by weakening the expectation and watching two properties fail
+- **The modal-delta threshold got its own property.** The gap threshold is the
+  most common inter-sample spacing rather than an absolute one, which is correct —
+  a track that is mostly 40 ms with one 10-second gap should not have its expected
+  duration skewed by the gap — but it means the threshold moves with the sequence
+  being scanned. `extending_a_sequence_never_hides_an_earlier_regression` pins
+  that, because a threshold drifting far enough to stop reporting a real
+  discontinuity would be visible only on long files.
+
+914 tests, up from 904.
+
 #### A rule can be reachable, green, and still have a variant that never runs
 - **The corpus was audited by running it, not by reading the checklist.** The
   pending list in `todo.md` named seven outstanding fixtures. Measuring the

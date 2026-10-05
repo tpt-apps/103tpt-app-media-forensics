@@ -51,7 +51,8 @@ pub use fixture::{
     build_mp4_with_nonprintable_box_type, build_mp4_with_overlapping_presentation_times,
     build_mp4_with_reordered_frames, build_mp4_with_repeated_frames,
     build_mp4_with_wrong_declared_duration, build_mp4_without_moov, build_webm,
-    build_webm_with_empty_block, build_webm_without_duration, gop_change_keyframes, TrackSpec,
+    build_webm_with_backwards_timestamps, build_webm_with_empty_block, build_webm_without_duration,
+    gop_change_keyframes, TrackSpec,
 };
 pub use mkv::{
     inspect_bytes as inspect_matroska_bytes, inspect_file as inspect_matroska_file,

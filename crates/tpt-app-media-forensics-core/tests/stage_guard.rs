@@ -32,7 +32,8 @@ use tpt_app_media_forensics_container::{
     build_mp4_with_negative_presentation_times, build_mp4_with_nonprintable_box_type,
     build_mp4_with_overlapping_presentation_times, build_mp4_with_reordered_frames,
     build_mp4_with_repeated_frames, build_mp4_with_wrong_declared_duration, build_webm,
-    build_webm_with_empty_block, build_webm_without_duration, TrackSpec,
+    build_webm_with_backwards_timestamps, build_webm_with_empty_block, build_webm_without_duration,
+    TrackSpec,
 };
 use tpt_app_media_forensics_core::case_dir::CaseDirectory;
 use tpt_app_media_forensics_core::AnalysisEngine;
@@ -440,6 +441,18 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     put(
         "overlapping-pts.mp4",
         &build_mp4_with_overlapping_presentation_times(40),
+    );
+
+    // Block timecodes that go backwards: `Anomaly::NonMonotonicDts`.
+    //
+    // Matroska specifically, and only because ISO-BMFF cannot express it —
+    // `stts` builds decode times from *unsigned* deltas, so an MP4's decode
+    // order is strictly increasing by construction and no fixture can change
+    // that. A `SimpleBlock`'s relative timecode is signed, so a cluster whose
+    // blocks are written in decreasing order does produce the condition.
+    put(
+        "backwards-blocks.webm",
+        &build_webm_with_backwards_timestamps("V_VP9", 1, 8),
     );
 
     written
@@ -1134,28 +1147,28 @@ const ALL_VARIANTS: &[Variant] = &[
 
 /// Variants no fixture reaches, and why.
 ///
-/// **One entry, and it is "no fixture could exist".**
+/// **Currently empty**, and it held one entry rather than none.
 ///
-/// - `NonMonotonicDts` — the pipeline calls `pts_dts::scan_presentation` and never
-///   `scan_decode`, so no file of any kind reaches this variant. It is not a
-///   corpus gap and no builder would close it: `bundle.timestamps` is populated
-///   from presentation times alone, so a decode-time anomaly has no route into the
-///   bundle at all.
+/// - `NonMonotonicDts` was recorded here as "no fixture could exist", on the
+///   correct but incomplete grounds that the pipeline called
+///   `pts_dts::scan_presentation` and never `scan_decode`. That is a statement
+///   about the *wiring*, not about the format, and treating it as a dead end
+///   would have hidden a defect: `scan_decode` was a real, correct, unit-tested
+///   scanner that the pipeline simply never called, and `Anomaly::NonMonotonicDts`
+///   was consequently unreachable from any file in the world.
 ///
-///   Recorded rather than quietly dropped because the scanner is real, correct,
-///   and unit-tested against backwards decode times — a reader seeing this list
-///   should conclude the analysis is unwired, not that the condition is absent
-///   from the format. Whether to wire `scan_decode` is an engine decision about
-///   what a forensic report should claim, and the two sequences being the same for
-///   the common case is precisely why it was not done implicitly.
+///   The engine now calls both scanners, and the variant is reached by
+///   `backwards-blocks.webm`. It has to be a **Matroska** fixture: `stts` builds
+///   decode times from *unsigned* deltas, so an MP4's decode order is strictly
+///   increasing by construction and no ISO-BMFF fixture can change that, while a
+///   `SimpleBlock`'s signed relative timecode can move backwards.
 ///
-/// The other six were "no fixture yet", each fixed by a builder that now backs a
-/// named file in the corpus.
-const UNREACHED_VARIANTS: &[(&str, &str)] = &[(
-    "NonMonotonicDts",
-    "no fixture could exist: the pipeline calls scan_presentation and never scan_decode, \
-     so no decode-time anomaly reaches the bundle",
-)];
+/// An entry here should say which of two things it is — "no fixture yet" (write
+/// a builder) or "no fixture could exist" (the reader cannot express it). Only
+/// the second is a genuine limit of the engine; the first is ordinary work, and
+/// recording it as the second is how an unwired analysis came to look like an
+/// impossible condition.
+const UNREACHED_VARIANTS: &[(&str, &str)] = &[];
 
 #[test]
 fn every_damage_and_timing_variant_is_reached_by_some_fixture() {
@@ -1422,6 +1435,90 @@ fn a_reordered_file_is_out_of_order_only_in_presentation_time() {
     );
 }
 
+/// The pipeline must scan decode order as well as presentation order.
+///
+/// The test above proves the *reader* exposes two sequences. It cannot prove the
+/// pipeline looks at the second one, and that is the gap this closes:
+/// `pts_dts::scan_decode` was implemented, documented, and unit-tested against
+/// backwards decode times, and the pipeline never called it — so
+/// `Anomaly::NonMonotonicDts` was unreachable from any file and nothing failed.
+///
+/// Asserted against the bundle rather than a scanner, because a scanner test
+/// proves only that the function works. What had to be checked is that the
+/// *engine* runs it.
+///
+/// The negative half matters as much as the positive: `reordered.mp4` goes
+/// backwards in presentation time only, so a pipeline that scanned presentation
+/// times twice — or scanned decode times into the presentation report — would
+/// report a decode anomaly for perfectly normal B-frame video. Passing this test
+/// while doing that would mean the engine distinguishes the two sequences in name
+/// only.
+#[test]
+fn the_pipeline_scans_decode_and_presentation_time_separately() {
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    // One file with each kind of fault: presentation out of order, decode out of
+    // order.
+    let reordered = dir.path().join("reordered.mp4");
+    std::fs::write(&reordered, build_mp4_with_reordered_frames(40)).expect("writes fixture");
+    let backwards = dir.path().join("backwards-blocks.webm");
+    std::fs::write(
+        &backwards,
+        build_webm_with_backwards_timestamps("V_VP9", 1, 8),
+    )
+    .expect("writes fixture");
+
+    let engine = AnalysisEngine::new();
+
+    let kinds = |path: &std::path::Path| -> (bool, bool) {
+        let (bundle, _) = engine.observe_stages(path);
+        let reports = &bundle.timestamps;
+        let has = |wanted: fn(&tpt_app_media_forensics_timing::pts_dts::Anomaly) -> bool| {
+            reports.iter().flat_map(|r| r.anomalies.iter()).any(wanted)
+        };
+        (
+            has(|a| {
+                matches!(
+                    a,
+                    tpt_app_media_forensics_timing::pts_dts::Anomaly::NonMonotonicPts { .. }
+                )
+            }),
+            has(|a| {
+                matches!(
+                    a,
+                    tpt_app_media_forensics_timing::pts_dts::Anomaly::NonMonotonicDts { .. }
+                )
+            }),
+        )
+    };
+
+    let (pts, dts) = kinds(&reordered);
+    assert!(
+        pts,
+        "reordered.mp4 must be reported out of order in presentation time"
+    );
+    assert!(
+        !dts,
+        "reordered.mp4 is normal B-frame video: decode order is strictly increasing, \
+         so reporting a decode anomaly here would be a false positive on a healthy file"
+    );
+
+    let (pts, dts) = kinds(&backwards);
+    assert!(
+        dts,
+        "backwards-blocks.webm must be reported out of order in decode time"
+    );
+    // Matroska has no separate decode order, so the same defect necessarily
+    // appears in both sequences. Asserted so the test keeps passing for the right
+    // reason if that ever stops being true, rather than because the assertion was
+    // never written.
+    assert!(
+        pts,
+        "in Matroska the decode and presentation sequences are the same, so a backwards \
+         timecode must be visible in both"
+    );
+}
+
 #[test]
 fn each_audio_amplitude_fixture_triggers_only_its_own_rule() {
     // The corpus satisfies the coverage guard as a *set*: some file trips each
@@ -1639,6 +1736,20 @@ fn a_rule_fires_only_on_files_built_for_its_condition() {
         // engineered away.
         ("overlapping-pts.mp4", "TIMING.TIMESTAMP_GAP"),
         ("overlapping-pts.mp4", "VIDEO.FRAME_RATE_CHANGE"),
+        // The backwards timecodes themselves.
+        //
+        // `TIMING.NON_MONOTONIC_PTS` fires here too, and that is not incidental:
+        // Matroska has no separate decode order — `decode_times` and
+        // `frame_times` are the same sequence by construction — so timecodes that
+        // go backwards in decode order necessarily go backwards in presentation
+        // order as well. The two findings describe one defect seen twice, which
+        // is the honest record: the file has one broken ordering, not two.
+        ("backwards-blocks.webm", "TIMING.NON_MONOTONIC_PTS"),
+        // Also intended, for the same reason as `no-duration.webm` and
+        // `empty-block.webm` above: these are 32-byte stubs rather than real VP9,
+        // so the decoder genuinely rejects them and saying so is a true finding
+        // about the fixture.
+        ("backwards-blocks.webm", "VIDEO.DECODE_FAILURE"),
     ];
 
     for path in corpus(dir.path()) {

@@ -16,6 +16,13 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# The timestamp scanners are pure functions over a slice of times, which is the
+# cheapest possible property-test surface — but the properties worth asserting
+# are exactly the ones a handful of hand-written cases will never cover, because
+# they are statements about *all* sequences (spec §75-§77).
+proptest = { workspace = true }
+
 [lints.rust]
 missing_docs = "warn"
 

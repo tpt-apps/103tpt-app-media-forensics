@@ -1397,6 +1397,7 @@ dependencies = [
 name = "tpt-app-media-forensics-timing"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "serde",
  "thiserror",
  "tpt-app-media-forensics-model",
