@@ -1,0 +1,5 @@
+format isobmff
+declared_track_count 1
+declared_next_track_id 2
+stream 0 kind=video codec=avc1 packets=60 language=none
+  video coded=320x240 display=320x240 fps=25 sar=none rotation=none hdr=false

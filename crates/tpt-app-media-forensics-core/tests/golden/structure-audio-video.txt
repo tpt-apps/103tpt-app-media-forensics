@@ -1,0 +1,7 @@
+format isobmff
+declared_track_count 2
+declared_next_track_id 3
+stream 0 kind=video codec=avc1 packets=100 language=none
+  video coded=640x480 display=640x480 fps=25 sar=none rotation=none hdr=false
+stream 1 kind=audio codec=mp4a packets=2400 language=none
+  audio 48000 Hz, 16-bit, layout=Some(ChannelLayout { name: "2 channel(s)", channel_count: 2, channel_mask: None }) channels=2

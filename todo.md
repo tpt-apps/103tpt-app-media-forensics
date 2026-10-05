@@ -1175,7 +1175,44 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       the sample tables, where a file of pure noise is rejected by the first
       length check. Without it the harness would mostly be measuring the
       top-level check, and would probably never have reached the Matroska reader.
-- [ ] Golden tests against known fixtures (metadata, structure, findings)
+- [x] Golden tests against known fixtures (metadata, structure, findings) (§77)
+      `-core/tests/golden.rs`, 14 goldens in `tests/golden/`. The complementary
+      question to the fuzz harness: that one asserts nothing panics, which is
+      necessary and not sufficient — a reader can never crash and still quietly
+      misread a *valid* file, and that is exactly the shape of the VINT bug the
+      harness found (in release it did not crash at all; it misread every 8-byte
+      VINT).
+      Each field is rendered by an **explicit function**, not by `serde` or
+      `Debug`. `serde` would pin the struct layout, so adding a field would fail
+      every golden for a reason that is not a behaviour change — which trains a
+      reviewer to accept golden churn, the same way a gap list full of solved
+      problems trains a reader to stop reading it. A field not yet in a golden is
+      a decision not yet made, and is visible as an omission rather than hidden
+      in a blob.
+      Deliberately not pinned: filesystem timestamps, source paths, cache keys,
+      evidence locations. Those vary per machine and run, and a permanently red
+      golden eventually gets ignored.
+      **Two goldens are empty on purpose** — `findings-clean` and
+      `findings-sdr-colour`, both asserting a healthy file produces nothing.
+      `check` therefore tests whether the file *exists*, not whether it is
+      non-empty: treating an empty golden as missing would leave those two
+      permanently red, which is how a test gets ignored rather than fixed.
+      **Reviewing the generated goldens caught two defects in the harness itself,
+      which is the whole argument for reading them:**
+      - `structure-matroska` pinned "the MP4 reader rejects a WebM file" —
+        technically true, worth nothing. The renderer called `inspect_bytes`
+        unconditionally instead of dispatching on the detected format. It now
+        dispatches, and the golden says what it means: `format matroska`,
+        `codec=vp09`, `packets=6`.
+      - The empty-golden bug above, which would have been invisible while the
+        goldens were being generated.
+      Verified to detect drift: altering one resolution in a golden makes the
+      failure name line 5 and print expected beside actual, rather than dumping
+      four kilobytes of structure.
+      Regenerating is `UPDATE_GOLDENS=1 cargo test --test golden`, and the test
+      still runs and still asserts nothing in that mode — a regeneration can never
+      be mistaken for a pass. A changed golden is a claim somebody has to agree
+      with.
 - [~] Build corrupt-media test corpus (§76): synthetic generator in place;
       fixtures generated on demand. **Truncated is now built and analysed** —
       `stage_guard.rs` truncates a real MP4 to half length, which is what

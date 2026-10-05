@@ -56,6 +56,39 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### A golden that passes without testing anything is worse than no golden
+- **The fuzz harness asserts nothing panics. That is necessary and not sufficient.**
+  A reader can never crash and still quietly misread a *valid* file — and that is
+  exactly the shape of the VINT bug below, which in release did not crash at all but
+  read every 8-byte VINT wrongly. Golden tests ask the complementary question:
+  given a file we know is well-formed, does the engine report what we expect?
+- **14 goldens** over structure, metadata, and findings, each rendered by an
+  **explicit function** rather than by `serde` or `Debug`. `serde` would pin the
+  struct layout, so adding a field would fail every golden for a reason that is not
+  a behaviour change — which trains a reviewer to accept golden churn, the same way
+  a gap list full of solved problems trains a reader to stop reading it. A field not
+  yet in a golden is a decision not yet made, and stays visible as an omission
+  rather than hidden inside a blob
+- **Timestamps, paths, cache keys, and evidence locations are deliberately not
+  pinned.** They vary between machines and runs, and a permanently red golden
+  eventually gets ignored rather than fixed
+- **Reviewing the generated goldens caught two defects in the harness that the tests
+  passing had hidden.** `structure-matroska` was pinning "the MP4 reader rejects a
+  WebM file" — technically true, worth nothing, because the renderer called
+  `inspect_bytes` without dispatching on the detected format. It now dispatches, and
+  the golden says what it means: `format matroska`, `codec=vp09`, `packets=6`. And
+  two goldens are legitimately *empty* (a clean file producing no findings), which
+  `check` was treating as "missing" — it would have left those two tests permanently
+  red, which is how a test gets ignored rather than fixed. It now tests for existence
+- **Verified to detect drift**: altering one resolution makes the failure name the
+  line and print expected beside actual, rather than dumping four kilobytes of
+  structure at a reviewer who wants to know which field moved
+- **`UPDATE_GOLDENS=1` regenerates, and in that mode the test runs and asserts
+  nothing**, so a regeneration can never be mistaken for a pass. A changed golden is
+  a claim somebody has to agree with
+
+949 tests, up from 935.
+
 #### The first fuzz run found a crash, and in release it was worse than a panic
 - **`mkv.rs` computed `0xFFu8 >> len` for the EBML VINT value mask.** `len` can
   legitimately be 8 — the range check above it admits that — and shifting a `u8` by
