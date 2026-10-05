@@ -1007,7 +1007,7 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       given together). **Fixed along the way:** `CaseDirectory::create` never
       wrote a `cases` row — only `analyze` did — so an acquired-but-never-analysed
       case reported no case id and every read path treated it as empty. Not done:
-      the CSV renderers omit notes (they are per-finding tables).
+      **Done** — notes now reach `notes.csv`; see the completed entry below.
 - [x] Comparison against a defined reference/master asset (§67)
       `compare --reference <master> <delivery>`. The axes are unchanged from
       `compare` and deliberately so — "what changed since the master" is a
@@ -1084,7 +1084,7 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       An entry added back to that list should name which of the three it is.
       Conflating "no fixture yet" with "no fixture could exist" is how a rule stays
       unfireable while looking merely untested.
-- [~] Property tests for timestamps, frame ordering, container parsing
+- [x] Property tests for timestamps, frame ordering, container parsing
       **Container parsing now has real properties.**
       `-container/tests/properties.rs`: 6 properties, 512 cases each, on
       `next_box`, `parse_track_colour`, `parse_edit_lists`, and `scan_isobmff`.
@@ -1107,6 +1107,48 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       in the completed entry below.
 
       **Still not started:** frame ordering.
+- [x] Property tests for the frame-ordering analysers (§76)
+      `-video/tests/properties.rs`, 9 properties over `gop::analyse` and
+      `duplicate::find_repeated_runs` — the last two analysers whose *output shape*
+      carries the meaning. A GOP report is a **partition** of the track and a
+      repeated-run list is a claim about **maximality**; a report that
+      double-counted a frame or missed half a freeze would look entirely plausible.
+      The load-bearing one is `every_maximal_repeated_run_is_found_exactly_once`,
+      which checks completeness **and** soundness against an oracle written
+      independently of the implementation. Checking the detector against itself
+      would prove nothing, so the reference walks maximal runs directly and never
+      calls `find_repeated_runs`. Verified non-vacuous by breaking the oracle's
+      walk, which made it fail against the real implementation.
+      Also pinned: consecutive GOPs abut exactly (`previous.start_frame +
+      previous.length == current.start_frame`), so no frame is counted twice or
+      dropped; the GOPs cover the whole track from the first keyframe; a track
+      declaring **no** keyframes yields **no** GOPs — "no keyframes declared" and
+      "one GOP spanning the track" are different claims, and only the first is
+      true; reported runs never overlap and cannot cover more frames than the
+      track; and a run of one is never reported whatever `min_run` says, because a
+      single repeated frame is indistinguishable from ordinary encoder behaviour on
+      a static scene.
+      One test bug of my own is worth recording: the coverage property first
+      underflowed on a keyframe index beyond the end of the track. The engine
+      handles that with saturating arithmetic, but "the analyser coped" and "the
+      GOPs tile the track" are different properties, and asserting the second over
+      input where it does not hold asserts nothing. The keyframes are now filtered
+      to the track with the reason stated at the filter.
+- [x] Analyst notes reach the CSV renderers (§61, §65)
+      The gap `todo.md` had carried as a known limitation: notes reached HTML,
+      PDF and JSON, and none of the CSVs. A recipient working from the spreadsheet
+      rather than the document lost the analyst's own words entirely, with nothing
+      recording that they had been dropped.
+      They get their own `notes.csv` rather than a column on `findings.csv`,
+      because notes are not per-finding rows: a case-level note has no finding to
+      sit beside, and a note attached to the wrong finding is *worse* than a note
+      missing from a spreadsheet, because it reads as a considered judgement about
+      that finding. The body is emitted verbatim — trimming or joining an
+      analyst's prose would edit the only part of a report that is testimony
+      rather than measurement — and `a_note_body_survives_the_csv_round_trip_verbatim`
+      decodes the output back and compares byte-for-byte rather than merely
+      checking the text is present.
+      The bundle now writes `notes.csv` alongside the other five deliverables.
 - [ ] Fuzzing for container/codec/metadata/packet/timestamp parsers
 - [ ] Golden tests against known fixtures (metadata, structure, findings)
 - [~] Build corrupt-media test corpus (§76): synthetic generator in place;

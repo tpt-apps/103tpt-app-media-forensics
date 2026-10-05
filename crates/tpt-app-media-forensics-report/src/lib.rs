@@ -34,4 +34,6 @@ pub use model::{
     REPORT_SCHEMA_VERSION,
 };
 pub use pdf::to_pdf;
-pub use render::{asset_hashes_to_csv, escape_html, findings_to_csv, measurements_to_csv, to_json};
+pub use render::{
+    asset_hashes_to_csv, escape_html, findings_to_csv, measurements_to_csv, notes_to_csv, to_json,
+};

@@ -8,9 +8,9 @@ use tpt_app_media_forensics_model::{
     AssetId, Confidence, Finding, FindingId, MediaTime, Observation, Severity,
 };
 use tpt_app_media_forensics_report::{
-    asset_hashes_to_csv, escape_html, findings_to_csv, measurements_to_csv, standard_limitations,
-    to_html, to_json, to_pdf, write_bundle, AssetSummary, Methodology, Note, Report,
-    ValidationResult, DISCLAIMER,
+    asset_hashes_to_csv, escape_html, findings_to_csv, measurements_to_csv, notes_to_csv,
+    standard_limitations, to_html, to_json, to_pdf, write_bundle, AssetSummary, Methodology, Note,
+    Report, ValidationResult, DISCLAIMER,
 };
 
 fn finding(rule: &str, severity: Severity, summary: &str) -> Finding {
@@ -252,6 +252,78 @@ fn asset_hashes_csv_lists_every_asset() {
     assert!(csv.starts_with("name,source_path,sha256,blake3,size_bytes"));
     assert!(csv.contains("original.mp4"));
     assert!(csv.contains(&"c".repeat(64)));
+}
+
+#[test]
+fn notes_csv_carries_every_note_with_its_subject() {
+    // The gap this closes: notes reached HTML, PDF and JSON, and reached none of
+    // the CSVs. A recipient who worked from the spreadsheet rather than the
+    // document lost the analyst's own words entirely, with nothing recording that
+    // they had been dropped.
+    let mut r = report();
+    r.notes = vec![
+        tpt_app_media_forensics_report::Note::on("finding", "finding-1", "Checked by hand."),
+        tpt_app_media_forensics_report::Note::case("Whole case reviewed."),
+    ];
+
+    let csv = notes_to_csv(&r);
+    assert!(
+        csv.starts_with("subject_kind,subject_id,body"),
+        "the header must name the columns: {csv}"
+    );
+    assert!(
+        csv.contains("finding,finding-1,Checked by hand."),
+        "a finding-level note must keep both halves of its subject: {csv}"
+    );
+    assert!(
+        csv.contains("Whole case reviewed."),
+        "a case-level note must be emitted: {csv}"
+    );
+    // The case-level note has no subject, and must not be given a fabricated one.
+    let case_row = csv
+        .lines()
+        .find(|line| line.contains("Whole case reviewed."))
+        .expect("a case-level row");
+    assert!(
+        case_row.starts_with(','),
+        "a case-level note leaves the subject columns blank rather than inventing one: {case_row}"
+    );
+}
+
+#[test]
+fn a_note_body_survives_the_csv_round_trip_verbatim() {
+    // A note is the one part of a report that is testimony rather than
+    // measurement. Trimming it, joining its wrapped lines, or collapsing its
+    // whitespace would edit the analyst's words, and a report that quietly
+    // tidies up what someone wrote about a disputed file is not a faithful record
+    // of it.
+    let awkward = "First paragraph,\n  indented second.\n\nHe said \"check the master\".";
+    let mut r = report();
+    r.notes = vec![tpt_app_media_forensics_report::Note::case(awkward)];
+
+    let csv = notes_to_csv(&r);
+    // The body is the last column, so the record is everything after the header
+    // line. Splitting on *lines* here would be wrong: the body itself contains
+    // newlines, and they sit inside one quoted CSV record rather than ending it.
+    let record = csv
+        .split_once('\n')
+        .expect("a header line")
+        .1
+        .trim_end_matches('\n');
+    // Two blank subject columns — `subject_kind` and `subject_id` — and then the
+    // quoted body.
+    assert!(
+        record.starts_with(",,\""),
+        "the subject columns are blank and the body is quoted: {record}"
+    );
+
+    // And the escaped form decodes back to exactly what the analyst wrote.
+    let inner = record.trim_start_matches(',').trim_matches('"');
+    let decoded = inner.replace("\"\"", "\"");
+    assert_eq!(
+        decoded, awkward,
+        "the body must round-trip byte-for-byte, not merely survive"
+    );
 }
 
 #[test]

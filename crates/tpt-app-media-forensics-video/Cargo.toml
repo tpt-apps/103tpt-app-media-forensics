@@ -34,6 +34,11 @@ tpt-kinetix-av1 = { workspace = true }
 # Used only by the fixture builder in `-container`, which needs to declare a
 # real `V_AV1` track.
 tpt-app-media-forensics-container = { workspace = true }
+# The GOP and duplicate-run analysers are pure functions over sequences of frame
+# indices, digests, and times. Properties stated about *all* such sequences -- do
+# the GOPs partition the track, is every maximal repeated run found -- are what a
+# handful of hand-written cases cannot establish (spec §75-§77).
+proptest = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

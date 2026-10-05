@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use crate::error::ReportError;
 use crate::html::to_html;
 use crate::model::Report;
-use crate::render::{asset_hashes_to_csv, findings_to_csv, measurements_to_csv, to_json};
+use crate::render::{
+    asset_hashes_to_csv, findings_to_csv, measurements_to_csv, notes_to_csv, to_json,
+};
 
 /// One file written into the bundle.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -60,6 +62,7 @@ pub fn write_bundle(report: &Report, directory: &Path) -> Result<BundleManifest,
         ("findings.csv", findings_to_csv(report).into_bytes()),
         ("measurements.csv", measurements_to_csv(report).into_bytes()),
         ("asset-hashes.csv", asset_hashes_to_csv(report).into_bytes()),
+        ("notes.csv", notes_to_csv(report).into_bytes()),
     ];
 
     let mut files = Vec::with_capacity(outputs.len() + 1);

@@ -135,6 +135,46 @@ pub fn asset_hashes_to_csv(report: &Report) -> String {
     out
 }
 
+/// Renders analyst notes as CSV (spec §65, §61).
+///
+/// Notes get their own file rather than a column on `findings.csv`, and the
+/// reason is that they are not per-finding rows. A case-level note applies to the
+/// whole examination and has no finding to sit beside; a finding-level note has a
+/// *subject id* that is not always a finding id. Forcing them into the findings
+/// table would mean inventing a row for a note that belongs to nothing in it, or
+/// attaching a note to the wrong finding — and a note attached to the wrong
+/// finding is worse than a note missing from a spreadsheet, because it reads as a
+/// considered judgement about that finding.
+///
+/// The subject is rendered as the kind and id the store recorded, left blank when
+/// the note is case-level. Blank is not "unknown": the column pair is unambiguous,
+/// and an empty id with a kind of `finding` is not a state the store produces.
+///
+/// The body is verbatim. A note is the analyst's own words and reformatting them —
+/// trimming, joining wrapped lines, collapsing whitespace — would edit the only
+/// part of a report that is a human's testimony rather than a measurement. RFC
+/// 4180 quoting is applied so a multi-paragraph note survives a round trip.
+pub fn notes_to_csv(report: &Report) -> String {
+    let mut out = String::from("subject_kind,subject_id,body\n");
+
+    for note in &report.notes {
+        let fields = [
+            note.subject_kind.clone().unwrap_or_default(),
+            note.subject_id.clone().unwrap_or_default(),
+            note.body.clone(),
+        ];
+        out.push_str(
+            &fields
+                .iter()
+                .map(|f| csv_field(f))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
+    }
+    out
+}
+
 /// Quotes a CSV field when it contains a delimiter, quote, or newline.
 fn csv_field(value: &str) -> String {
     let needs_quotes = value.contains([',', '"', '\n', '\r']);

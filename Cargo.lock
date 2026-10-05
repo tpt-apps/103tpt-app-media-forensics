@@ -1409,6 +1409,7 @@ name = "tpt-app-media-forensics-video"
 version = "0.1.0"
 dependencies = [
  "png",
+ "proptest",
  "serde",
  "thiserror",
  "tpt-app-media-forensics-container",

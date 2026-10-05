@@ -56,6 +56,50 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### A report can be faithful and still lose the analyst's words
+- **Notes reached HTML, PDF and JSON — and none of the CSVs.** `todo.md` had
+  carried this as a known limitation: "the CSV renderers omit notes (they are
+  per-finding tables)". The parenthetical was the bug. Notes are *not* per-finding
+  rows, so putting them in `findings.csv` would mean either inventing a row for a
+  case-level note that belongs to nothing in that table, or attaching a note to
+  the wrong finding — and a note attached to the wrong finding is worse than a
+  note missing from a spreadsheet, because it reads as a considered judgement
+  about that finding
+- **`notes.csv` is a sixth deliverable in the bundle**, with `subject_kind`,
+  `subject_id` and `body`. A case-level note leaves the subject columns blank
+  rather than being given a fabricated one
+- **The body is verbatim.** A note is the one part of a report that is testimony
+  rather than measurement, so trimming it or joining its wrapped lines would edit
+  the analyst's words. `a_note_body_survives_the_csv_round_trip_verbatim` decodes
+  the rendered row back and compares byte-for-byte rather than checking the text
+  is present — which is what caught my own test asserting against a physical *line*
+  when the record legitimately spans several
+- **Nine property tests for the frame-ordering analysers**, closing the last gap in
+  Testing & Quality. `gop::analyse` and `duplicate::find_repeated_runs` are the two
+  analysers whose *output shape* carries the meaning: a GOP report is a
+  **partition** of the track, a repeated-run list is a claim about **maximality**,
+  and either could be wrong in a way that still looks entirely plausible
+- **The duplicate detector is checked against an oracle written independently of
+  it.** Completeness and soundness in one property; the reference walks maximal
+  runs directly and never calls the function under test. Checking a detector
+  against itself proves nothing. Verified non-vacuous by breaking the oracle's
+  walk and watching it fail against the real implementation
+- **Also pinned:** consecutive GOPs abut exactly, so no frame is double-counted or
+  dropped; the GOPs cover the whole track from the first keyframe; a track
+  declaring *no* keyframes yields *no* GOPs, because "no keyframes declared" and
+  "one GOP spanning the track" are different claims and only the first is true;
+  reported runs never overlap or cover more frames than the track; and a run of one
+  is never reported whatever `min_run` says, since a single repeated frame is
+  indistinguishable from ordinary encoder behaviour on a static scene
+
+One test bug of my own is worth recording: the GOP coverage property first
+underflowed on a keyframe index past the end of the track. The engine handles that
+with saturating arithmetic, but "the analyser coped" and "the GOPs tile the track"
+are different properties, and asserting the second over input where it does not
+hold asserts nothing.
+
+929 tests, up from 918.
+
 #### A master you can name is not a master you can prove
 - **Spec §67 asked "what changed?", and the engine could only answer "how do
   these two files differ".** The comparison machinery was already there and

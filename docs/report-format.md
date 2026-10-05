@@ -9,7 +9,7 @@ Reference: spec §59-§63, §68, §95, §96.
 | PDF | The deliverable an analyst hands to a client, court, or broadcaster |
 | HTML | Reviewable in a browser, embeds the evidence gallery |
 | JSON | Machine-readable; the integration format for other tools |
-| CSV | Findings and measurements for spreadsheets |
+| CSV | Findings, measurements, asset hashes, and analyst notes for spreadsheets |
 
 JSON is the canonical format. PDF, HTML, and CSV are renderings of it, so a
 JSON report must be sufficient to reconstruct any other.
