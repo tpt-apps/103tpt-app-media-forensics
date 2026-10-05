@@ -837,41 +837,117 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       `AnalysisEngine::analysis_fingerprint` derives from asset SHA-256 +
       analysis version + profile + rule set, and is embedded in every report
       format (`Methodology` has no `Default`, so it cannot be omitted).
-- [ ] Complete a full real-world professional workflow end-to-end (§96)
-
+- [x] Complete a full real-world professional workflow end-to-end (spec 96)
+      **The last unclosed item of the definition of done, and the last thing
+      nothing could reach.** Every other line in that list had a test
+      somewhere. This one needs a whole case, taken all the way through, with
+      each artefact checked as it is produced. The gap was not the absence of
+      tests but the absence of a step: `validate` could only judge a case
+      by finding severity, so a delivery could be judged but never checked
+      against a specification. `crates/tpt-app-media-forensics-cli/tests/
+      professional_workflow.rs` now runs the nine steps a QC engineer
+      performs on an incoming delivery -- author the profile and check it
+      loads; QC the file before intake; acquire into a case; analyse with the
+      full engine; record an analyst note; validate the case against both the
+      profile and the findings; render the evidence bundle; confirm the source
+      is byte-identical afterwards; and confirm two renders are
+      byte-identical (spec 77)
+      **Driven through the real binary, not the library.** Argument parsing,
+      exit codes and the read-only guarantee are all part of what
+      'completed successfully' means, and none of them live in the library
+      API. The test asserts the bundle manifest verifies against the files on
+      disk, which is the property that makes it self-checking rather than
+      merely complete, and that the analyst note and the profile version both
+      reach the rendered HTML
+      **The verdict is the worse of the two halves.** A delivery can meet its
+      specification and still carry a significant finding, and a clean analysis
+      does not make an under-specified delivery acceptable. The test derives the
+      expected verdict from whichever half failed and asserts the command agrees,
+      so a requirement table reading all-MET beside a severity FAIL cannot pass
 ## Phase 2 (spec §85)
 - [ ] Advanced codec internals
 - [ ] Richer container analysis
 - [ ] MXF/broadcast workflow support
 - [ ] Archive validation profile + batch validation (§48)
 - [ ] Watch folder automation (§50)
-- [~] Delivery validation profiles (pass/fail/warn) (§68)
+- [x] Delivery validation profiles (pass/fail/warn) (spec 68)
       **The verdict machinery existed and nothing could produce a verdict.**
       `ValidationResult` with its PASS / PASS WITH WARNINGS / FAIL labels,
       `ValidationResult::from_findings`, and `Severity::fails_validation` were all
       implemented, documented, and unit-tested. Nothing called any of them:
       `Report.validation` was hardcoded `None` at both production construction
-      sites, so the HTML header's result banner could never render, and `pdf.rs`
+      sites, so the HTML header result banner could never render, and `pdf.rs`
       branched on a value that was always absent.
       **Two definitions of the same rule, free to drift.** `from_findings`
       inlined the severity list `matches!(Critical | Significant)` while
-      `fails_validation` existed alongside it stating the same thing. `from_findings`
-      is the one that actually produces verdicts, so a change to the predicate
-      would have missed it and left the answer unchanged while the rule it names
-      looked changed. `from_findings` now delegates to `fails_validation`.
-      **Now reachable:** `validate --case-dir <case>` derives the verdict from the
-      stored findings, names the blocking findings rather than only counting them,
-      emits JSON, and exits 2 on FAIL so it composes in a pipeline. `--write`
-      renders the verdict into a report bundle, off by default — a verdict is a
-      claim about delivery and must not be added to a record unasked.
-      **Still open:** §68's actual content is a *delivery profile* — declared
-      requirements for codec, resolution, frame rate, channels, sample rate, and
-      container format, checked against the file. What is delivered here is the
-      severity-derived verdict only, which answers "do the findings permit
-      delivery" and not "does this file meet the specification". §69's
-      user-defined profiles and §95's executable specification are what the
-      requirement-checking half depends on.
-- [ ] Custom user-defined profiles (§69) with profile versioning (§70)
+      `fails_validation` existed alongside it stating the same thing. A change to
+      the predicate would have missed the function that actually produces
+      verdicts, leaving the answer unchanged while the rule it names looked
+      changed. `from_findings` now delegates to `fails_validation`.
+      **The requirement half is now built.** §68's actual content is a *delivery
+      profile*: declared requirements for codec, resolution, frame rate, channels,
+      sample rate, and container format, checked against the file.
+      `model::delivery` holds the domain types and `-rules::delivery` the checker,
+      which takes a `ContainerInspection` rather than a path so it stays a pure
+      function of measured properties and is testable with no media present
+      **Three states, not two, and the third blocks delivery.** `MET | NOT MET |
+      NOT MEASURED`. A WebM checked against `video.resolution` reports NOT
+      MEASURED because this build's Matroska reader exposes no picture geometry;
+      folding that into `Met` would let a profile print PASS for a file it never
+      checked, which is the precise failure this product exists to prevent
+      **A prerequisite nobody had recorded: MP4 declared no audio at all.**
+      `convert_track` hardcoded `audio: None` on every MP4 track and the demuxer
+      exposes no channel count, sample size, or sample rate, so the requirement
+      checking half of §68's own example -- `audio.channels: 2`,
+      `audio.sample_rate: 48000` -- was unbuildable against the format this engine
+      reads most. `container/src/audio_sample_entry.rs` reads the `mp4a` entry
+      from the specification's offsets, which differ from the `VisualSampleEntry`
+      ones: read at the visual offsets it would take a channel count out of the
+      middle of a reserved run and report a plausible wrong answer. The fixture
+      wrote a `VisualSampleEntry` for audio tracks too, so it could not have
+      tested the fix even once the reader existed
+      **Tolerances are mandatory and printed.** A frame rate states its own
+      tolerance, and a profile without one is rejected rather than defaulted -- an
+      omitted field is exactly what a hand-written specification gets wrong.
+      `Expected: 25 (+/- 0.5)`, because `Expected: 25` beside a check that allowed
+      24.5 is a claim the report cannot support
+      `validate <file> --profile <p>` is now spec §95's invocation, alongside
+      `--case-dir`. `--json` carries the profile version, fingerprint, and every
+      requirement's expected/observed/outcome. Exit 2 on FAIL
+      **An honest limitation, stated rather than faked.** `container.format: mov`
+      matches any ISO-BMFF file: this build detects the family from the `ftyp`
+      signature and does not distinguish an Apple `qt  ` brand from `isom`. Closing
+      that means reading the major brand in `-container`
+- [x] Custom user-defined profiles (spec 69) with profile versioning (spec 70)
+      **A profile is data, and nothing could hold any.** `RuleProfile` was a
+      hardcoded struct of tolerances with no file format, no loader, and no way for
+      a customer to express a delivery specification at all. `profile template |
+      check | show` and a JSON format now carry one, and `validate --profile`
+      reads it
+      **The template must parse, and that is asserted rather than assumed.**
+      `profile template` parses the string it is about to write, and a test runs
+      the emitted file back through `profile check`. A template that does not load
+      turns the most likely first use of `profile` into an error message
+      **The template refuses to overwrite.** A profile is maintained across versions
+      (spec 70); overwriting one because someone asked for a template would destroy
+      the record of what the previous version actually required, and a delivery
+      judged against it could no longer be explained
+      **Version and fingerprint are both recorded, and they can disagree -- on
+      purpose.** The fingerprint is derived from the requirements themselves, so a
+      requirement edited without a version bump produces a different fingerprint
+      beside the same version number. That disagreement is what makes "never
+      silently change an existing profile" checkable rather than merely stated
+      **An unknown requirement kind is an error.** A typo silently dropped would
+      be a delivery that passes without ever having been checked against that
+      requirement. Four tests in `-model` cover the format: round-trip, spec-shaped
+      JSON, the rejected missing tolerance, and the rejected unknown kind
+
+      JSON rather than the YAML the spec illustrates. `serde_json` is already a
+      dependency of every crate here, and a parser added for one config file would
+      be the only dependency in this project not pinned to a revision -- which is
+      the trade spec §63 and §77 exist to prevent. The structure is identical
+      either way. Stated here as a deliberate deviation from the spec's
+      presentation
 - [x] Rule explainability output (what/why/observed/limitations) (§71)
       **The prose existed; nothing read it.** Every rule implements
       `what_it_checks` and `why_it_matters` as mandatory trait methods, and

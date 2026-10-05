@@ -20,7 +20,7 @@
 //! constructed without them.
 
 use serde::{Deserialize, Serialize};
-use tpt_app_media_forensics_model::{AssetId, Evidence, Finding};
+use tpt_app_media_forensics_model::{AssetId, DeliveryReport, Evidence, Finding};
 
 /// The disclaimer required on every report (spec §59).
 pub const DISCLAIMER: &str = "\
@@ -128,6 +128,48 @@ impl ValidationResult {
             (false, false) => Self::Pass,
         }
     }
+
+    /// Derives the result from a checked delivery profile (spec §68, §95).
+    ///
+    /// A requirement that was not met *or* not measured blocks, which is the
+    /// difference between this and [`Self::from_findings`]: findings describe
+    /// what the engine noticed, and a requirement describes what someone
+    /// demanded. A file that satisfies nothing measurable has not been shown to
+    /// meet a specification, and reporting `PASS` for it would be a claim the run
+    /// does not support.
+    ///
+    /// The severity half is delegated rather than restated, so a delivery
+    /// profile cannot disagree with the report about what blocks delivery.
+    #[must_use]
+    pub fn from_delivery(delivery: &DeliveryReport) -> Self {
+        if delivery.blocking().is_empty() {
+            Self::Pass
+        } else {
+            Self::Fail
+        }
+    }
+
+    /// Combines a checked delivery profile with the findings' severities.
+    ///
+    /// The two halves answer different questions and both belong in one verdict:
+    /// a file can meet its specification and still carry a significant finding
+    /// (a container that announces one duration and delivers another), and
+    /// conversely a clean analysis does not make an under-specified delivery
+    /// acceptable.
+    ///
+    /// `FAIL` dominates, because either half failing means the file is not
+    /// deliverable. `PASS WITH WARNINGS` is reachable from either side alone.
+    #[must_use]
+    pub fn combine(delivery: Option<&DeliveryReport>, findings: &[Finding]) -> Self {
+        let from_profile = delivery.map_or(Self::Pass, Self::from_delivery);
+        let from_severity = Self::from_findings(findings);
+
+        match (from_profile, from_severity) {
+            (Self::Fail, _) | (_, Self::Fail) => Self::Fail,
+            (Self::PassWithWarnings, _) | (_, Self::PassWithWarnings) => Self::PassWithWarnings,
+            (Self::Pass, Self::Pass) => Self::Pass,
+        }
+    }
 }
 
 /// One analysed asset as recorded in a report (spec §59).
@@ -153,7 +195,10 @@ pub struct AssetSummary {
 /// [`Report`] without bumping this would let a consumer read a report it cannot
 /// fully understand and treat the missing field as "nothing was recorded" rather
 /// than "this build did not know about it". Version 2 added `notes` (spec §65).
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+/// Version 3 added `delivery` (spec §68, §95) — and because that field is what
+/// makes `validation` meaningful, a v2 report read by a v3 consumer would show a
+/// verdict derived from findings alone and call it a delivery decision.
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
 
 /// One analyst note, as carried into a report (spec §65).
 ///
@@ -244,8 +289,24 @@ pub struct Report {
     #[serde(default)]
     pub notes: Vec<Note>,
     /// Present for a validation report (spec §68), absent for a forensic one.
+    ///
+    /// Always derived by [`ValidationResult`] rather than supplied by a caller:
+    /// a verdict is a claim about the file, and letting a renderer or a command
+    /// layer pass one in is how two definitions of "what blocks a delivery" get
+    /// written. `None` means no delivery decision was made — a plain forensic
+    /// report, which is a different document from a QC result and must not
+    /// borrow the other's banner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationResult>,
+    /// The delivery profile this file was checked against, and each requirement's
+    /// result (spec §68, §95).
+    ///
+    /// Carried beside `validation` rather than folded into it: the verdict is one
+    /// word, and a client disputing a rejection needs the line of their
+    /// specification that was missed and the value that was observed instead.
+    /// `validation` without this could only be defended by re-running the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryReport>,
 }
 
 impl Report {

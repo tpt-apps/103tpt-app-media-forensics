@@ -147,7 +147,14 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       and the `* 3` for bytes-per-pixel was unchecked.
 - [ ] Verify: analysis is reproducible from recorded profile + software
       version (analysis fingerprint, §63)
-- [ ] Complete a full real-world professional workflow end-to-end (§96)
+- [x] Complete a full real-world professional workflow end-to-end (§96)
+      Nine steps through the real binary in
+      `-cli/tests/professional_workflow.rs`: profile authored and checked,
+      file QC'd before intake, acquired into a case, analysed, annotated,
+      validated against both the profile and the findings, bundled, source
+      confirmed byte-identical afterwards, and two renders confirmed
+      byte-identical. The verdict is asserted to be the worse of its two
+      halves. See `docs/delivery-profiles.md`.
 
 ## Phase 2 (spec §85)
 - [ ] Advanced codec internals
@@ -155,8 +162,21 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
 - [ ] MXF/broadcast workflow support
 - [ ] Archive validation profile + batch validation (§48)
 - [ ] Watch folder automation (§50)
-- [ ] Delivery validation profiles (pass/fail/warn) (§68)
-- [ ] Custom user-defined profiles (§69) with profile versioning (§70)
+- [x] Delivery validation profiles (pass/fail/warn) (§68)
+      Declared requirements for codec, resolution, frame rate, channels,
+      sample rate, and container format, each with an explicit tolerance, each
+      reporting `MET` / `NOT MET` / `NOT MEASURED` with an expected and an
+      observed value. `NOT MEASURED` blocks: a file nobody could measure is not
+      a file that passed. Required a fix nobody had recorded — MP4 hardcoded
+      `audio: None` on every track, so §68's own `audio.channels` example was
+      unbuildable; see `container/src/audio_sample_entry.rs`
+- [x] Custom user-defined profiles (§69) with profile versioning (§70)
+      `profile template | check | show`, a JSON format where every numeric
+      requirement states its own tolerance and an unknown `kind` is rejected.
+      The version and a fingerprint of the requirements both travel into every
+      report, so a requirement edited without a version bump is visible as a
+      disagreement rather than a silent change
+
 - [ ] Rule explainability output (what/why/observed/limitations) (§71)
 - [ ] Review workflow for findings (new/reviewed/accepted/rejected) (§66)
 - [ ] Analyst notes on asset/stream/timestamp/frame/finding/evidence (§65)

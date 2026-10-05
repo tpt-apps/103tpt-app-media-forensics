@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod audio_sample_entry;
 pub mod boxes;
 pub mod colr;
 pub mod damage;
@@ -36,6 +37,7 @@ pub mod mp4;
 pub mod packets;
 pub mod probe;
 
+pub use audio_sample_entry::{parse_track_audio, TrackAudio};
 pub use colr::{parse_track_colour, TrackColour};
 pub use damage::{scan_isobmff, SampleIndex, SampleOrigin, SamplePosition, StructuralDamage};
 pub use elst::{parse_edit_lists, EditList};

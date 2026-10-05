@@ -1581,3 +1581,403 @@ fn validate_rejects_a_directory_that_is_not_a_case() {
         "the error must say what is wrong: {stderr}"
     );
 }
+
+/// Writes spec §68's example profile and returns its path.
+fn write_delivery_profile(dir: &Path, version: u32, width: u32, height: u32) -> std::path::PathBuf {
+    let path = dir.join(format!("profile-v{version}.json"));
+    let json = serde_json::json!({
+        "name": "Client X Delivery",
+        "version": version,
+        "requirements": [
+            { "kind": "video_codec", "any_of": ["h264"] },
+            { "kind": "video_resolution", "width": width, "height": height },
+            { "kind": "frame_rate", "fps": 25.0, "tolerance": 0.5 },
+            { "kind": "container_format", "any_of": ["mov"] }
+        ]
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json).expect("serialises"),
+    )
+    .expect("writes profile");
+    path
+}
+
+/// Writes a 1080p 25 fps MP4 and returns its path.
+fn conforming_file(dir: &Path) -> std::path::PathBuf {
+    let file = dir.join("delivery.mp4");
+    std::fs::write(&file, build_mp4(&TrackSpec::video_25fps(1920, 1080, 50)))
+        .expect("writes fixture");
+    file
+}
+
+/// Writes a 720p 25 fps MP4 and returns its path.
+fn non_conforming_file(dir: &Path) -> std::path::PathBuf {
+    let file = dir.join("delivery.mp4");
+    std::fs::write(&file, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes fixture");
+    file
+}
+
+#[test]
+fn profile_template_writes_a_profile_that_actually_parses() {
+    // The template exists so a customer starts from something that works. A
+    // template that does not load would turn the most likely first use of `profile`
+    // into an error message.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let out = dir.path().join("delivery.json");
+
+    let output = cli()
+        .args(["profile", "template", "--out", out.to_str().expect("utf-8")])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+    assert!(ok, "profile template failed: {stderr}");
+    assert!(out.exists(), "the template was not written");
+
+    // And it must load through the same parser a real profile goes through.
+    let checked = cli()
+        .args(["profile", "check", out.to_str().expect("utf-8")])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(checked);
+    assert!(
+        ok,
+        "the emitted template must pass `profile check`: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("delivery v1"),
+        "the identifier must name the version (spec §70): {stdout}"
+    );
+}
+
+#[test]
+fn profile_template_refuses_to_overwrite_an_existing_profile() {
+    // A profile is maintained across versions (§70). Overwriting one because
+    // someone asked for a template would destroy what the previous version
+    // required, and a delivery judged against it could no longer be explained.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let out = dir.path().join("delivery.json");
+    let first = cli()
+        .args(["profile", "template", "--out", out.to_str().expect("utf-8")])
+        .output()
+        .expect("runs CLI");
+    assert!(first.status.success());
+
+    let second = cli()
+        .args(["profile", "template", "--out", out.to_str().expect("utf-8")])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(second);
+    assert!(!ok, "the second template silently overwrote the first");
+    assert!(
+        stderr.contains("refusing to overwrite"),
+        "the refusal must say why: {stderr}"
+    );
+}
+
+#[test]
+fn validate_checks_a_file_against_a_profile_and_reports_each_requirement() {
+    // Spec §95's invocation, and the reason `validate` gained a file mode: a QC
+    // pass starts with a file and a specification, not with an analysed case.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = conforming_file(dir.path());
+    let profile = write_delivery_profile(dir.path(), 1, 1920, 1080);
+
+    let output = cli()
+        .args([
+            "validate",
+            file.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(
+        ok,
+        "a conforming delivery must not fail: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("PASS"),
+        "the verdict must be stated: {stdout}"
+    );
+    for requirement in ["video.codec", "video.resolution", "video.frame_rate"] {
+        assert!(
+            stdout.contains(requirement),
+            "{requirement} must be reported: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("25 (+/- 0.5)"),
+        "the tolerance must be printed, not merely applied: {stdout}"
+    );
+}
+
+#[test]
+fn validate_fails_a_non_conforming_file_and_says_exactly_which_requirement() {
+    // The output a client disputes a rejection against. A bare `FAIL` tells nobody
+    // which line of their specification was missed or what the file actually is.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = non_conforming_file(dir.path());
+    let profile = write_delivery_profile(dir.path(), 1, 1920, 1080);
+
+    let output = cli()
+        .args([
+            "validate",
+            file.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let code = output.status.code();
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(!ok, "a 720p delivery must not pass a 1080p profile");
+    assert_eq!(
+        code,
+        Some(2),
+        "a delivery gate that always exits 0 is not a gate.\nstdout:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("FAIL"),
+        "the verdict must be stated: {stdout}"
+    );
+    assert!(
+        stdout.contains("Expected: 1920x1080") && stdout.contains("Observed: 1280x720"),
+        "both sides of the mismatch must be shown: {stdout}"
+    );
+    // The requirement that passed must still be listed. A report showing only the
+    // failure reads as though nothing else was checked.
+    assert!(
+        stdout.contains("video.frame_rate"),
+        "passing requirements must appear too: {stdout}"
+    );
+}
+
+#[test]
+fn validate_reports_an_unmeasurable_requirement_as_not_measured_and_blocks() {
+    // The claim the whole three-way outcome exists to defend. A file with no audio
+    // track checked against a profile requiring channels cannot be shown to meet
+    // it, so it must not report PASS.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = conforming_file(dir.path());
+
+    let profile = dir.path().join("with-audio.json");
+    std::fs::write(
+        &profile,
+        r#"{"name":"Needs audio","version":1,"requirements":[
+            {"kind":"audio_channels","channels":2}
+        ]}"#,
+    )
+    .expect("writes profile");
+
+    let output = cli()
+        .args([
+            "validate",
+            file.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let code = output.status.code();
+    let (ok, stdout, _) = split(output);
+
+    assert!(!ok, "an unmeasured requirement must not pass");
+    assert_eq!(code, Some(2));
+    assert!(
+        stdout.contains("NOT MEASURED"),
+        "an unmeasured requirement must say so, not read as a pass: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Observed: 0"),
+        "no value was measured, so none may be printed: {stdout}"
+    );
+}
+
+#[test]
+fn validate_emits_json_naming_the_profile_version_and_each_requirement() {
+    // The machine-readable half. A pipeline consuming this needs the exact profile
+    // version (§70) and per-requirement results, not a single word.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = non_conforming_file(dir.path());
+    let profile = write_delivery_profile(dir.path(), 3, 1920, 1080);
+
+    let output = cli()
+        .args([
+            "--json",
+            "validate",
+            file.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (_, stdout, stderr) = split(output);
+
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}"));
+
+    assert_eq!(value["result"], "FAIL");
+    assert_eq!(value["profile"]["version"], 3, "the version must travel");
+    assert_eq!(value["profile"]["identifier"], "client-x-delivery v3");
+
+    let requirements = value["requirements"]
+        .as_array()
+        .unwrap_or_else(|| panic!("requirements must be an array: {stdout}\n{stderr}"));
+    let resolution = requirements
+        .iter()
+        .find(|r| r["id"] == "video.resolution")
+        .unwrap_or_else(|| panic!("no video.resolution entry: {stdout}"));
+    assert_eq!(resolution["outcome"], "NOT MET");
+    assert_eq!(resolution["expected"], "1920x1080");
+    assert_eq!(resolution["observed"], "1280x720");
+
+    // A file check ran no analysis. Saying `0` findings would imply a clean one.
+    assert!(
+        value["findings_considered"].is_null(),
+        "a file check must not report a finding count: {stdout}"
+    );
+}
+
+#[test]
+fn validate_writes_a_bundle_only_when_asked_and_the_bundle_carries_the_verdict() {
+    // Off by default: a verdict is a claim about delivery, and silently adding one
+    // to a report bundle would change a record the analyst did not ask to change.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = non_conforming_file(dir.path());
+    let profile = write_delivery_profile(dir.path(), 1, 1920, 1080);
+    let bundle = file.with_extension("validated");
+
+    let without = cli()
+        .args([
+            "validate",
+            file.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let _ = split(without);
+    assert!(
+        !bundle.exists(),
+        "validate wrote a bundle without being asked"
+    );
+
+    let with = cli()
+        .args([
+            "validate",
+            file.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+            "--write",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (_, _, stderr) = split(with);
+
+    assert!(bundle.exists(), "--write produced no bundle: {stderr}");
+    let html = std::fs::read_to_string(bundle.join("case-report.html")).expect("reads HTML");
+    assert!(
+        html.contains("FAIL"),
+        "the written report must render the verdict: {html}"
+    );
+    assert!(
+        html.contains("video.resolution") && html.contains("1280x720"),
+        "the written report must carry the requirement table: {html}"
+    );
+}
+
+#[test]
+fn a_case_validated_against_a_profile_combines_both_halves_of_the_verdict() {
+    // A file can meet its specification and still carry a significant finding. The
+    // verdict has to be the worse of the two, or a clean profile check would paper
+    // over a damaged container.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case = analysed_case(dir.path());
+    // A profile the analysed file comfortably meets, so the findings decide.
+    let profile = write_delivery_profile(dir.path(), 1, 320, 240);
+
+    let output = cli()
+        .args([
+            "--json",
+            "validate",
+            "--case-dir",
+            case.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (_, stdout, stderr) = split(output);
+
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}"));
+    assert!(value["profile"].is_object(), "the profile must be applied");
+    assert!(
+        value["findings_considered"].is_number(),
+        "the severity half must still be considered: {stdout}\n{stderr}"
+    );
+    // Whatever the findings are, the two halves must agree on one verdict: a
+    // requirements table saying everything passed beside a FAIL from severities is
+    // the confusion this combination exists to prevent.
+    let requirements_all_met = value["requirements"]
+        .as_array()
+        .expect("requirements")
+        .iter()
+        .all(|r| r["outcome"] == "MET");
+    let severity_failed = value["result"] == "FAIL";
+    assert!(
+        !(requirements_all_met && severity_failed),
+        "requirements all met but the verdict is FAIL with no blocking finding: {stdout}"
+    );
+}
+
+#[test]
+fn validate_rejects_a_profile_that_does_not_parse_with_a_reason() {
+    // The most likely thing to go wrong with a hand-written profile (§69), and the
+    // error has to say more than "invalid".
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = conforming_file(dir.path());
+
+    let profile = dir.path().join("broken.json");
+    // A frame rate with no tolerance: rejected rather than defaulted.
+    std::fs::write(
+        &profile,
+        r#"{"name":"x","version":1,"requirements":[{"kind":"frame_rate","fps":25.0}]}"#,
+    )
+    .expect("writes profile");
+
+    let output = cli()
+        .args([
+            "validate",
+            file.to_str().expect("utf-8"),
+            "--profile",
+            profile.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(
+        !ok,
+        "a profile with no tolerance must not load with an assumed one"
+    );
+    assert!(
+        stderr.contains("tolerance"),
+        "the error must say what is wrong: {stderr}"
+    );
+}
+
+#[test]
+fn help_lists_the_profile_subcommand() {
+    let output = cli().arg("--help").output().expect("runs CLI");
+    let (_, stdout, _) = split(output);
+    assert!(
+        stdout.contains("profile"),
+        "`profile` is missing from the help output"
+    );
+}

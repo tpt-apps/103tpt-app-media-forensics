@@ -652,9 +652,7 @@ fn a_case_with_no_analysis_is_not_reported_as_a_complete_empty_timeline() {
     // footing, which is the conflation the type exists to prevent.
     let store = Store::open_in_memory().expect("opens");
     store.upsert_case("case-1", "Case", None).expect("case");
-    store
-        .insert_asset(&asset("a1", "aa"))
-        .expect("asset");
+    store.insert_asset(&asset("a1", "aa")).expect("asset");
 
     assert_eq!(
         store.timeline_retention_in_case("case-1").expect("reads"),
@@ -743,7 +741,10 @@ fn an_analysis_records_the_schema_version_that_wrote_it() {
         )
         .expect("reads");
 
-    assert_eq!(version, Some(tpt_app_media_forensics_core::store::schema::SCHEMA_VERSION));
+    assert_eq!(
+        version,
+        Some(tpt_app_media_forensics_core::store::schema::SCHEMA_VERSION)
+    );
 }
 
 #[test]

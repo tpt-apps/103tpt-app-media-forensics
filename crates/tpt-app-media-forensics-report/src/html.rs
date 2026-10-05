@@ -42,6 +42,39 @@ pub fn to_html(report: &Report) -> String {
     }
     out.push_str("</header>\n");
 
+    // The delivery profile's requirement table, beside the verdict rather than
+    // after the findings. A client disputing a rejection reads the specification
+    // line that was missed and the value observed instead; burying that below
+    // several pages of forensic findings is how the wrong page gets attached to
+    // an email.
+    if let Some(delivery) = &report.delivery {
+        out.push_str(&format!(
+            "<section id=\"delivery\"><h2>Delivery validation</h2>\n<p class=\"profile\">Profile {} (fingerprint {})</p>\n<table>\n",
+            escape_html(&delivery.profile_identifier),
+            escape_html(&delivery.profile_fingerprint)
+        ));
+        out.push_str(
+            "<tr><th>Requirement</th><th>Expected</th><th>Observed</th><th>Result</th></tr>\n",
+        );
+        for check in &delivery.checks {
+            out.push_str(&format!(
+                "<tr class=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                outcome_class(check.outcome),
+                escape_html(&check.requirement_id),
+                escape_html(&check.expected),
+                // "not measured" rather than a dash or a blank: an empty cell
+                // beside a MET/FAIL verdict reads as a value that was zero.
+                escape_html(check.observed.as_deref().unwrap_or("not measured")),
+                escape_html(check.outcome.label())
+            ));
+            out.push_str(&format!(
+                "<tr class=\"detail\"><td colspan=\"4\">{}</td></tr>\n",
+                escape_html(&check.detail)
+            ));
+        }
+        out.push_str("</table>\n</section>\n");
+    }
+
     // Summary counts, so the reader sees the shape before the detail.
     let counts = report.severity_counts();
     out.push_str("<section id=\"summary\"><h2>Summary</h2>\n<table>\n");
@@ -220,6 +253,21 @@ fn severity_class(severity: tpt_app_media_forensics_model::Severity) -> &'static
         Severity::Significant => "significant",
         Severity::Warning => "warning",
         Severity::Info => "info",
+    }
+}
+
+/// Maps a requirement outcome to its row class.
+///
+/// `Undetermined` gets its own class rather than sharing `fail`: both block
+/// delivery, but a reader acts on them differently — one fixes the file, the
+/// other fixes the analysis. Styling them identically would tell a client their
+/// master is wrong when the truth is that the tool could not look.
+fn outcome_class(outcome: tpt_app_media_forensics_model::RequirementOutcome) -> &'static str {
+    use tpt_app_media_forensics_model::RequirementOutcome;
+    match outcome {
+        RequirementOutcome::Met => "met",
+        RequirementOutcome::NotMet => "notmet",
+        RequirementOutcome::Undetermined => "undetermined",
     }
 }
 

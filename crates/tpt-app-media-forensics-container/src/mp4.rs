@@ -144,6 +144,13 @@ pub fn inspect_bytes(data: Vec<u8>) -> Result<ContainerInspection, ContainerErro
     // constant rather than a measurement.
     let track_colour = crate::colr::parse_track_colour(&data);
 
+    // Audio sample descriptions, for the same reason: `Mp4Track` carries no
+    // channel count, sample size, or sample rate. Before this,
+    // `StreamAnalysis::audio` was hardcoded to `None` on every MP4 track, which
+    // left spec §68's own `audio.channels` and `audio.sample_rate` requirements
+    // uncheckable against the format this engine reads most.
+    let track_audio = crate::audio_sample_entry::parse_track_audio(&data);
+
     let demuxer = Mp4Demuxer::new(data).map_err(|e| ContainerError::Parse(e.to_string()))?;
     let tracks = demuxer.tracks();
 
@@ -173,6 +180,11 @@ pub fn inspect_bytes(data: Vec<u8>) -> Result<ContainerInspection, ContainerErro
                 // both.
                 video.colour.hdr_metadata = colour.static_metadata.clone();
             }
+            // Audio parameters, from the same per-track indexing. A video track
+            // keeps `None`, and an audio track whose sample entry this reader
+            // could not parse keeps `None` too — both read as "not measured"
+            // rather than as a file that declares stereo at 48 kHz.
+            stream.audio = track_audio.get(index).and_then(|a| a.format.clone());
             stream
         })
         .collect();

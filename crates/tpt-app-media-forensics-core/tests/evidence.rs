@@ -142,6 +142,7 @@ fn report_of(outcome: &AnalysisOutcome) -> tpt_app_media_forensics_report::Repor
             analysis_fingerprint: "test".to_owned(),
         },
         validation: None,
+        delivery: None,
     }
 }
 

@@ -33,6 +33,7 @@
 
 pub mod builtin;
 pub mod comparison;
+pub mod delivery;
 pub mod engine;
 pub mod profile;
 
@@ -41,5 +42,6 @@ pub use comparison::{
     compare, compare_self, compare_with, Comparison, ComparisonInput, MetadataComparison,
     SelfComparison, SilenceComparison, Tolerances, WithinTolerance,
 };
+pub use delivery::codec_family;
 pub use engine::{AnalysisBundle, BundleInput, ForensicRule, RuleEngine, RuleError};
 pub use profile::RuleProfile;

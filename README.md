@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   844 passing
+tests   903 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -83,6 +83,14 @@ one that names the gap:
 - **Rule-driven findings** — severity, confidence, timeline placement, and an
   explanation of what was observed, what the rule checks, why that condition
   matters, and what the observation does not establish
+- **Delivery validation** — a declared specification of codec, resolution, frame
+  rate, channels, sample rate, and container format, checked against a file with
+  an expected and an observed value per requirement, and a `PASS` / `PASS WITH
+  WARNINGS` / `FAIL` verdict that exits 2 on failure so it gates a pipeline.
+  Profiles are versioned data, not code: a customer writes one, ships it with the
+  job, and the exact version and a fingerprint of its requirements travel into
+  every report. A requirement that could not be measured reports `NOT MEASURED`
+  and blocks delivery — "we could not look" is not "it was fine"
 - **Reports** — PDF, HTML, JSON, CSV, all reproducible
 - **Progress and cancellation** — stage-by-stage progress with an honest
   cancellation token; a cancelled run writes nothing rather than leaving a

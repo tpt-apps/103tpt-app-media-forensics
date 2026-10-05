@@ -39,7 +39,7 @@ fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Builds an `stsd` payload declaring one sample entry.
+/// Builds an `stsd` payload declaring one **video** sample entry.
 ///
 /// Each entry is a nested box (`size` + `type` + payload), which is how the
 /// real format encodes it and how the demuxer resolves the codec `fourcc`.
@@ -70,9 +70,44 @@ fn stsd(fourcc: &[u8; 4], width: u16, height: u16, extra: &[u8]) -> Vec<u8> {
     debug_assert_eq!(entry.len(), 78, "VisualSampleEntry is 78 bytes");
     entry.extend_from_slice(extra);
 
+    stsd_around(fourcc, &entry)
+}
+
+/// Builds an `stsd` payload declaring one **audio** sample entry.
+///
+/// `AudioSampleEntry` is a different fixed-width structure from the visual one:
+/// 28 bytes, laid out per ISO/IEC 14496-12, carrying the channel count, sample
+/// size, and a 16.16 fixed-point sample rate. Those are exactly the fields spec
+/// §68's delivery profile has to check, and [`crate::audio_sample_entry`] reads
+/// them from these offsets.
+///
+/// Before this, every audio track in the corpus wrote a `VisualSampleEntry` with
+/// a zero width and height — a video sample entry describing an audio track. A
+/// reader at the audio offsets would have taken its channel count out of the
+/// middle of the visual entry's reserved run, so the fixture could not have
+/// tested the audio requirements even after the reader existed.
+fn audio_stsd(fourcc: &[u8; 4], channels: u16, sample_size: u16, sample_rate: u32) -> Vec<u8> {
+    let mut entry = vec![0u8; 6]; // reserved
+    entry.extend_from_slice(&u16be(1)); // data_reference_index
+    entry.extend_from_slice(&[0u8; 8]); // reserved
+    entry.extend_from_slice(&u16be(channels)); // channelcount
+    entry.extend_from_slice(&u16be(sample_size)); // samplesize
+    entry.extend_from_slice(&u16be(0)); // pre_defined (compression id)
+    entry.extend_from_slice(&u16be(0)); // reserved
+                                        // 16.16 fixed point. The fractional half is zero, which is what every real
+                                        // muxer writes: a fractional sample rate is expressed by the `mdhd`
+                                        // timescale, not here.
+    entry.extend_from_slice(&(sample_rate << 16).to_be_bytes());
+    debug_assert_eq!(entry.len(), 28, "AudioSampleEntry is 28 bytes");
+
+    stsd_around(fourcc, &entry)
+}
+
+/// Wraps one sample-entry body in the `stsd` full-box payload.
+fn stsd_around(fourcc: &[u8; 4], entry: &[u8]) -> Vec<u8> {
     let mut entry_box = u32be((entry.len() + 8) as u32).to_vec();
     entry_box.extend_from_slice(fourcc);
-    entry_box.extend_from_slice(&entry);
+    entry_box.extend_from_slice(entry);
 
     let mut payload = vec![0u8; 4]; // version + flags
     payload.extend_from_slice(&u32be(1)); // entry_count
@@ -181,6 +216,20 @@ pub struct TrackSpec {
     /// would, and without a fixture for it the rule could only ever be tested
     /// by asserting that it finds nothing.
     pub declared_duration: Option<u64>,
+    /// Code width written into the audio sample entry, in bits.
+    ///
+    /// 16 is what a 48 kHz delivery carries, and is the value spec §68's example
+    /// profile is written against. It is a field rather than a constant because a
+    /// 24-bit master is the case where a delivery profile and a broadcast one
+    /// genuinely disagree.
+    pub audio_sample_size: u16,
+    /// Channel count written into the audio sample entry.
+    ///
+    /// Unused for a video track, whose sample entry carries no audio fields. It
+    /// is a field rather than a constant because this is the value spec §68's
+    /// example profile checks, and a fixture that always wrote stereo could not
+    /// produce a delivery failing on channel count at all.
+    pub audio_channels: u16,
     /// A half-open range of frames whose samples are made byte-identical.
     ///
     /// `None` — the default, and what a normal file looks like — gives every
@@ -255,21 +304,66 @@ impl TrackSpec {
     /// A 25 fps video track of `frames` frames.
     #[must_use]
     pub fn video_25fps(width: u16, height: u16, frames: u32) -> Self {
+        Self::video_at_rate(width, height, frames, 25)
+    }
+
+    /// A 30 fps video track of `frames` frames.
+    ///
+    /// Present because a frame-rate *requirement* needs a file whose rate is
+    /// wrong. With only `video_25fps` in the corpus, a `video.frame_rate` check
+    /// could be tested against a matching rate or an absent one, but never
+    /// against a real mismatch — which is the case a delivery actually fails.
+    #[must_use]
+    pub fn video_30fps(width: u16, height: u16, frames: u32) -> Self {
+        Self::video_at_rate(width, height, frames, 30)
+    }
+
+    /// A video track of `frames` frames at an exact `fps`.
+    ///
+    /// The rate comes from the `mdhd` timescale and an `stts` delta of 1, so the
+    /// reader derives it from the sample table rather than from any declared
+    /// value — which is how this engine actually measures a frame rate. A
+    /// fixture that set some other declared field would not exercise that
+    /// reader at all.
+    ///
+    /// The timescale is the rate itself rather than a round number like 1000,
+    /// because 1000/33 is 30.303 rather than 30: a corpus frame rate has to be
+    /// exactly representable for a requirement that demands an exact one to be
+    /// meaningfully testable.
+    #[must_use]
+    pub fn video_at_rate(width: u16, height: u16, frames: u32, fps: u32) -> Self {
+        let timescale = fps.max(1);
         Self {
             handler: *b"vide",
             width,
             height,
-            timescale: 25,
+            timescale,
             timing: vec![(frames, 1)],
             declared_duration: None,
+            // Unused for a video track: the sample entry written is a
+            // `VisualSampleEntry`, which carries no audio fields at all.
+            audio_sample_size: 16,
+            audio_channels: 0,
             repeated_frames: None,
             reduced_payload_frames: None,
         }
     }
 
-    /// A 48 kHz audio track.
+    /// A 48 kHz stereo audio track.
+    ///
+    /// Two channels because that is what spec §68's example delivery profile
+    /// requires; [`Self::audio_48khz_channels`] builds the rest.
     #[must_use]
     pub fn audio_48khz(frames: u32) -> Self {
+        Self::audio_48khz_channels(frames, 2)
+    }
+
+    /// A 48 kHz audio track with the given channel count.
+    ///
+    /// The sample rate is the track's `mdhd` timescale, which is what an audio
+    /// track's timescale *is* — the same 48 000 a delivery profile checks.
+    #[must_use]
+    pub fn audio_48khz_channels(frames: u32, channels: u16) -> Self {
         Self {
             handler: *b"soun",
             width: 0,
@@ -277,6 +371,8 @@ impl TrackSpec {
             timescale: 48_000,
             timing: vec![(frames, 1)],
             declared_duration: None,
+            audio_sample_size: 16,
+            audio_channels: channels,
             repeated_frames: None,
             reduced_payload_frames: None,
         }
@@ -718,12 +814,24 @@ fn build_trak(track: &TrackSpec, extras: TrackExtras<'_>, track_id: u32) -> (Vec
 
     let mut stbl = mp4_box(
         b"stsd",
-        &stsd(
-            &track.sample_entry_fourcc(),
-            track.width,
-            track.height,
-            &extras.colour_boxes,
-        ),
+        // An audio track gets an `AudioSampleEntry`, not a `VisualSampleEntry`.
+        // Writing the visual layout for a sound track would leave the channel
+        // count, sample size, and sample rate unreadable at their own offsets —
+        // and every one of those is a field a delivery profile has to check.
+        &match &track.handler {
+            b"soun" => audio_stsd(
+                &track.sample_entry_fourcc(),
+                track.audio_channels,
+                track.audio_sample_size,
+                track.timescale,
+            ),
+            _ => stsd(
+                &track.sample_entry_fourcc(),
+                track.width,
+                track.height,
+                &extras.colour_boxes,
+            ),
+        },
     );
 
     let mut stts = vec![0u8; 4];

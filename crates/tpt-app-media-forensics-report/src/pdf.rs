@@ -87,6 +87,36 @@ fn layout(report: &Report) -> Vec<Page> {
         push(format!("Validation result: {}", result.label()), 12.0, 10.0);
     }
 
+    // The delivery profile, immediately after the verdict. A recipient disputing
+    // a rejection needs the specification line that was missed beside the value
+    // that was observed; putting it after the findings buries the only part of
+    // this document a client will argue with.
+    if let Some(delivery) = &report.delivery {
+        push("Delivery validation".to_owned(), 14.0, 16.0);
+        push(
+            format!(
+                "Profile {} (fingerprint {})",
+                delivery.profile_identifier, delivery.profile_fingerprint
+            ),
+            9.0,
+            2.0,
+        );
+        for check in &delivery.checks {
+            push(
+                format!(
+                    "{}: {}  [{}]",
+                    check.requirement_id,
+                    check.outcome.label(),
+                    check.observed.as_deref().unwrap_or("not measured")
+                ),
+                10.0,
+                4.0,
+            );
+            push(format!("  Expected: {}", check.expected), 9.0, 0.0);
+            push(format!("  {}", check.detail), 9.0, 0.0);
+        }
+    }
+
     // Summary counts first, so the reader sees the shape before the detail.
     let counts = report.severity_counts();
     push("Summary".to_owned(), 14.0, 16.0);

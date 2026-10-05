@@ -88,6 +88,7 @@ fn report() -> Report {
         limitations: standard_limitations(true, false, Some(48_000)),
         notes: Vec::new(),
         validation: None,
+        delivery: None,
     }
 }
 

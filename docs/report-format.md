@@ -83,23 +83,52 @@ Given the same case, report output is byte-identical (spec §77):
 ## Validation reports
 
 Delivery validation (spec §68, §95) uses the same machinery with a different
-header:
+header. A validation report is a normal forensic report carrying a verdict and a
+requirement table — not a separate document format, because a client disputing a
+rejection needs the hashes and the methodology beside the verdict.
 
 ```text
 Result: FAIL
 
-VIDEO.FRAME_RATE
-  Expected: 25
-  Observed: 24.0
+video.frame_rate
+  Expected: 25 (+/- 0.5)
+  Observed: 24
+  Result:    NOT MET
+  the measured rate differs from the profile by 1 fps, past the 0.5 fps tolerance
 
-AUDIO.CHANNELS
+audio.channels
   Expected: 2
-  Observed: 6
+  Observed: not measured
+  Result:    NOT MEASURED
+  the audio sample entry declares no channel layout
 ```
 
-One of three results: `PASS`, `PASS WITH WARNINGS`, `FAIL`. Critical and
-significant findings fail; warnings produce PASS WITH WARNINGS
-(`Severity::fails_validation`).
+One of three results: `PASS`, `PASS WITH WARNINGS`, `FAIL`. There are two halves,
+and the verdict is the worse of them:
+
+- **Requirements** (spec §68). A requirement is `MET`, `NOT MET`, or
+  `NOT MEASURED`. `NOT MEASURED` blocks delivery — "we could not look" is not
+  "it was fine". A WebM checked against `video.resolution` cannot pass, because
+  this build's Matroska reader exposes no picture geometry.
+- **Findings.** Critical and significant fail; warnings produce
+  `PASS WITH WARNINGS` (`Severity::fails_validation`).
+
+The two halves are independent and both are printed. A file can meet its
+specification and still carry a significant finding, and a clean analysis does not
+make an under-specified delivery acceptable.
+
+Three states rather than two is the load-bearing decision here. `NOT MEASURED`
+gets its own label and its own row styling precisely because it is not a near-miss
+of `NOT MET`: a reviewer acts on the first by fixing the analysis and on the
+second by fixing the file.
+
+Every requirement carries its **own tolerance**, and none has a default. A
+profile that silently supplied one would change its verdict because a field was
+omitted — which is exactly what happens to a hand-written specification.
+
+`REPORT_SCHEMA_VERSION` is 3. Version 3 added `delivery`; a v2 report read by a v3
+consumer would show a verdict derived from findings alone and call it a delivery
+decision.
 
 This is what lets one engine serve both media QC and forensic analysis without
 collapsing them into a single product.

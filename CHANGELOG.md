@@ -4,6 +4,58 @@ All notable changes to this project are documented in this file, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+#### A delivery could be judged, but never checked against a specification
+- **`validate` could only read finding severities.** Spec §68's actual content is
+  a *delivery profile* — declared requirements for codec, resolution, frame rate,
+  channels, sample rate, and container format — and nothing in the codebase could
+  express those requirements, let alone check them. What existed answered "do the
+  findings permit delivery", not "does this file meet the specification". A QC
+  pass had no way to reject a 720p delivery against a 1080p profile
+- **`validate <file> --profile <p>` is now spec §95's invocation**, alongside the
+  existing `--case-dir`. Each requirement prints its expected and observed value
+  and one of `MET` / `NOT MET` / `NOT MEASURED`. `--json` carries the profile
+  version, a fingerprint of its requirements, and every result. Exit 2 on `FAIL`,
+  so a delivery gate can gate a pipeline
+- **Three states, not two, and the third blocks delivery.** A WebM checked
+  against `video.resolution` reports `NOT MEASURED`, because this build's
+  Matroska reader exposes no picture geometry and nothing established the
+  resolution either way. Folding that into `MET` would let a profile print `PASS`
+  for a file it never checked — the precise failure this product exists to
+  prevent. `NOT MEASURED` prints no observed value, gets its own label and its own
+  styling, and says what was missing, because a reviewer acts on it by fixing the
+  analysis rather than by fixing the file
+- **MP4 declared no audio at all, and that blocked §68's own example.** Two
+  commits before this, `AudioFormat` and `ChannelLayout` were implemented,
+  documented, and unit-tested, and `convert_track` hardcoded `audio: None` on
+  every MP4 track while the demuxer exposes no channel count, sample size, or
+  sample rate. `audio.channels: 2` and `audio.sample_rate: 48000` — the exact
+  requirements in the spec's example profile — were unbuildable against the
+  format this engine reads most. `container/src/audio_sample_entry.rs` reads the
+  `mp4a` entry from the specification's offsets, which are *not* the visual
+  entry's: read at the visual offsets it takes a channel count out of the middle
+  of a reserved run and reports a plausible wrong answer, which is worse than no
+  answer. The fixture wrote a `VisualSampleEntry` for audio tracks too, so it
+  could not have tested the fix even once the reader existed
+- **Tolerances are mandatory and printed.** A frame rate states its own tolerance
+  and a profile without one is rejected rather than defaulted — an omitted field
+  is exactly what a hand-written specification gets wrong. The report prints
+  `Expected: 25 (+/- 0.5)`, because `Expected: 25` beside a check that allowed
+  24.5 is a claim the report cannot support
+- **Profiles are versioned data.** `profile template | check | show` writes and
+  reads a JSON specification (see the note below on YAML), `validate --profile`
+  loads one, and `profile template` refuses to overwrite an existing file: a
+  profile is maintained across versions, and overwriting one would destroy the
+  record of what the previous version required. Both the version and a
+  fingerprint of the requirements travel into every report, and because the
+  fingerprint is derived from the requirements themselves, a requirement edited
+  without a version bump shows up as a disagreement rather than a silent change.
+  That is what makes spec §70's "never silently change an existing profile"
+  checkable rather than merely stated
+- **`Report` gained `delivery` and schema version 3.** The verdict is one word; a
+  client disputing a rejection needs the line of their specification that was
+  missed beside the value observed instead. The requirement table renders into
+  HTML and PDF, and the bundle carries the profile fingerprint
+
 #### Three open questions, answered
 - **`startup_log` ships in release builds — but it can no longer forge a log entry.**
   The reason it exists is a *release* build opening a blank window: that is the one

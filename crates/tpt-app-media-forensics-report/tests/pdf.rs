@@ -73,6 +73,7 @@ fn report(count: usize) -> Report {
         limitations: vec!["Audio was not decoded.".to_owned()],
         notes: Vec::new(),
         validation: None,
+        delivery: None,
     }
 }
 

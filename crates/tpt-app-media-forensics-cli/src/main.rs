@@ -172,24 +172,58 @@ enum Command {
         limit: Option<usize>,
     },
 
-    /// Report whether a case's findings permit delivery (spec §68).
+    /// Report whether a file meets a delivery specification (spec §68, §69, §95).
     ///
-    /// Reads the case rather than re-analysing it: the verdict is a statement
-    /// about findings that were already measured, and re-running the engine to
-    /// reach the same numbers would risk reporting a verdict against a different
-    /// run than the one the findings came from.
+    /// Two ways in, because a QC pass and a forensic review start from different
+    /// places:
+    ///
+    /// * a file plus `--profile` — spec §95's invocation. The file is inspected
+    ///   read-only and nothing is written.
+    /// * `--case-dir` with no profile — the verdict over findings already
+    ///   recorded, which is what the previous revision of this command did and
+    ///   what a reviewer reaches for when auditing a past case.
+    ///
+    /// The verdict is always derived by `ValidationResult`, which is the one
+    /// place that decides what blocks a delivery. Nothing here restates that
+    /// rule: a second copy in the command layer would be free to disagree with
+    /// the one the report renders.
+    ///
+    /// Exits 2 on `FAIL` so the command composes in a pipeline. A delivery gate
+    /// that always exits 0 is not a gate.
     Validate {
-        /// Case directory produced by `analyze`.
-        #[arg(long)]
-        case_dir: std::path::PathBuf,
+        /// File to validate. Opened read-only. Mutually exclusive with
+        /// `--case-dir`.
+        path: Option<std::path::PathBuf>,
 
-        /// Also write the verdict into the case's report bundle.
+        /// Case directory produced by `analyze`.
+        #[arg(long, conflicts_with = "path")]
+        case_dir: Option<std::path::PathBuf>,
+
+        /// Delivery profile to check the file against (spec §68, §69).
+        ///
+        /// Required with a file. Without it, a case directory is validated
+        /// against its findings instead — which is a different, weaker claim,
+        /// and one the output says so.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<std::path::PathBuf>,
+
+        /// Also write the verdict into a report bundle.
         ///
         /// Off by default: a verdict is a claim about delivery, and silently
         /// adding one to an existing report bundle would change a record the
         /// analyst has not asked to change.
         #[arg(long)]
         write: bool,
+    },
+
+    /// Inspect, list, and render delivery profiles (spec §69, §70).
+    ///
+    /// Profiles are data, not code: a customer writes one, ships it with the
+    /// job, and the exact version used travels with the report.
+    Profile {
+        /// What to do with profiles.
+        #[command(subcommand)]
+        action: ProfileAction,
     },
 
     /// Analyse every media file found beneath a directory.
@@ -199,6 +233,37 @@ enum Command {
         /// Case directory to write results and evidence into.
         #[arg(long)]
         case_dir: std::path::PathBuf,
+    },
+}
+
+/// What `profile` does.
+#[derive(Debug, Clone, Subcommand)]
+enum ProfileAction {
+    /// Show a profile's identity, fingerprint, and requirements.
+    Show {
+        /// Profile file to read.
+        path: std::path::PathBuf,
+    },
+
+    /// Check that a profile file parses, without validating any media.
+    ///
+    /// Exists because a hand-written profile (spec §69) that fails to load is
+    /// otherwise discovered at the end of a long QC pass, when the media has
+    /// already been analysed and the rejection has already been promised.
+    Check {
+        /// Profile file to read.
+        path: std::path::PathBuf,
+    },
+
+    /// Write an example profile to start from.
+    ///
+    /// Emits spec §68's example specification. A customer writes their profile
+    /// from a blank file far less reliably than from one that already parses and
+    /// already names every field correctly.
+    Template {
+        /// Where to write it. Refuses to overwrite an existing file.
+        #[arg(long)]
+        out: std::path::PathBuf,
     },
 }
 
@@ -352,7 +417,20 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 
         Command::Compare { left, right } => compare(left, right, cli.json),
 
-        Command::Validate { case_dir, write } => validate_delivery(case_dir, *write, cli.json),
+        Command::Validate {
+            path,
+            case_dir,
+            profile,
+            write,
+        } => validate_delivery(
+            path.as_deref(),
+            case_dir.as_deref(),
+            profile.as_deref(),
+            *write,
+            cli.json,
+        ),
+
+        Command::Profile { action } => run_profile(action, cli.json),
 
         Command::Search {
             case_dir,
@@ -1199,6 +1277,12 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
         notes: notes_for(&directory),
         methodology,
         validation: None,
+        // No delivery profile was checked. `analyze` produces a forensic report;
+        // `validate` attaches a verdict and a requirement table to one.
+        // Defaulting this to an empty report would print a "Delivery validation"
+        // section with no requirements in it, implying a specification was
+        // applied when none was.
+        delivery: None,
     };
 
     let bundle_dir = directory.root().join("reports");
@@ -1738,77 +1822,412 @@ fn directory_manifest_name(directory: &CaseDirectory) -> String {
         })
 }
 
-/// Reports whether a case's findings permit delivery (spec §68).
+/// Reports whether a file meets a delivery specification (spec §68, §69, §95).
 ///
-/// The verdict is derived from the findings' severities through
-/// `ValidationResult::from_findings`, which is the single place that decides what
-/// blocks a delivery. Nothing here restates that rule: a second copy in the
-/// command layer would be free to disagree with the one the report renders.
+/// The verdict is derived by `ValidationResult`, which is the single place that
+/// decides what blocks a delivery. Nothing here restates that rule: a second copy
+/// in the command layer would be free to disagree with the one the report
+/// renders.
 ///
-/// Reads the stored findings rather than re-analysing, for the same reason
+/// A case directory is read rather than re-analysed, for the same reason
 /// `generate_report` does — a verdict computed from a fresh run would be a
 /// statement about that run, not about the findings in the case.
-fn validate_delivery(case_dir: &std::path::Path, write: bool, json: bool) -> anyhow::Result<()> {
+///
+/// # Errors
+///
+/// Returns an error when the profile cannot be read or parsed, or when the file
+/// cannot be inspected. A file that inspects but fails its requirements is not an
+/// error: it is a `FAIL` with exit code 2.
+fn validate_delivery(
+    path: Option<&std::path::Path>,
+    case_dir: Option<&std::path::Path>,
+    profile_path: Option<&std::path::Path>,
+    write: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let outcome = match (path, case_dir) {
+        // A file needs a specification to be judged against. Validating one with
+        // no profile would print a verdict about a file against a standard nobody
+        // named, which is the claim this command exists to avoid.
+        (Some(path), None) => {
+            let profile_path = profile_path.context(
+                "validating a file needs a specification: pass --profile <file>, or \
+                 use --case-dir to judge a case's recorded findings instead",
+            )?;
+            validate_file(path, profile_path, write)?
+        }
+        // A case with a profile still works: the profile is checked against the
+        // media the case recorded, and the findings come from the database. The
+        // two answers are combined rather than one replacing the other.
+        (None, Some(case_dir)) => validate_case(case_dir, profile_path, write)?,
+        // clap's `conflicts_with` rejects this, but the match must be total.
+        (Some(_), Some(_)) => anyhow::bail!("pass either a file or --case-dir, not both"),
+        (None, None) => anyhow::bail!(
+            "nothing to validate: pass a file path, or --case-dir <case> for a recorded case"
+        ),
+    };
+
+    print_validation(&outcome, json)
+}
+
+/// Validates a single file against a profile (spec §95).
+///
+/// Reads the source read-only and writes nothing unless `--write` is given. No
+/// case directory is involved: a delivery check is a question about one file
+/// against one specification, and requiring an analysed case to ask it would make
+/// the QC path redo the forensic path's work.
+fn validate_file(
+    path: &std::path::Path,
+    profile_path: &std::path::Path,
+    write: bool,
+) -> anyhow::Result<ValidationOutcome> {
+    use tpt_app_media_forensics_report::ValidationResult;
+
+    let profile = load_profile(profile_path)?;
+    let inspection = inspect_for_validation(path)?;
+
+    // No A/V offset is supplied: this path inspects the container and does not run
+    // the timing analysis. A profile asking for `timing.max_av_offset_ms` therefore
+    // reports NOT MEASURED, which blocks — the honest answer, because "we could not
+    // look" is not "it was fine", and the requirement is reported rather than
+    // quietly skipped.
+    let delivery = tpt_app_media_forensics_rules::delivery::check_profile(&profile, &inspection);
+
+    let bundle = if write {
+        let report = build_validation_report(path, &delivery);
+        let at = path.with_extension("validated");
+        Some((
+            at.clone(),
+            tpt_app_media_forensics_report::write_bundle(&report, &at)?,
+        ))
+    } else {
+        None
+    };
+
+    Ok(ValidationOutcome {
+        verdict: ValidationResult::from_delivery(&delivery),
+        source: path.display().to_string(),
+        case_dir: None,
+        findings_considered: None,
+        delivery: Some(delivery),
+        blocking_findings: Vec::new(),
+        warning_findings: Vec::new(),
+        bundle,
+    })
+}
+/// Validates a recorded case, optionally against a profile (spec §68).
+fn validate_case(
+    case_dir: &std::path::Path,
+    profile_path: Option<&std::path::Path>,
+    write: bool,
+) -> anyhow::Result<ValidationOutcome> {
     use tpt_app_media_forensics_core::pipeline::load_report;
-    use tpt_app_media_forensics_report::{write_bundle, ValidationResult};
+    use tpt_app_media_forensics_report::ValidationResult;
 
     let directory = CaseDirectory::open(case_dir)
         .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
     let loaded = load_report(&directory)?;
     let report = &loaded.report;
 
-    let verdict = ValidationResult::from_findings(&report.findings);
+    // When a profile is supplied, the media the case recorded is inspected against
+    // it. Reading that path from the case rather than taking one on the command
+    // line keeps the two in agreement: a verdict about a different file than the
+    // one analysed would be worse than no verdict at all.
+    let delivery = match profile_path {
+        Some(profile_path) => {
+            let profile = load_profile(profile_path)?;
+            let source = report
+                .assets
+                .first()
+                .map(|a| &a.source_path)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} records no asset to validate against {}",
+                        case_dir.display(),
+                        profile_path.display()
+                    )
+                })?;
+            Some(tpt_app_media_forensics_rules::delivery::check_profile(
+                &profile,
+                &inspect_for_validation(std::path::Path::new(source))?,
+            ))
+        }
+        None => None,
+    };
+
+    let verdict = ValidationResult::combine(delivery.as_ref(), &report.findings);
 
     // The blocking findings, named rather than counted. "FAIL" on its own tells an
     // analyst nothing about what to fix; the rule id and summary are what they act
     // on, and a verdict that does not carry them is not actionable.
-    let blocking: Vec<&tpt_app_media_forensics_model::Finding> = report
+    //
+    // Cloned rather than borrowed: `ValidationOutcome` outlives the loaded report
+    // it was built from, and a finding is a small value next to the database it
+    // came out of.
+    let blocking: Vec<tpt_app_media_forensics_model::Finding> = report
         .findings
         .iter()
         .filter(|f| f.severity.fails_validation())
+        .cloned()
         .collect();
-    let warnings: Vec<&tpt_app_media_forensics_model::Finding> = report
+    let warnings: Vec<tpt_app_media_forensics_model::Finding> = report
         .findings
         .iter()
         .filter(|f| f.severity == tpt_app_media_forensics_model::Severity::Warning)
+        .cloned()
         .collect();
 
-    if write {
-        // Rewritten from the loaded report with the verdict attached, so the bundle
-        // on disk and the report rendered from the database agree. Written to a
-        // sibling directory rather than over the caller's, because an existing
-        // bundle is a record of a previous render.
-        let bundle_dir = directory.root().join("reports").join("validated");
-        let mut validated = loaded.report.clone();
+    let bundle = if write {
+        let mut validated = report.clone();
         validated.validation = Some(verdict);
-        let manifest = write_bundle(&validated, &bundle_dir)?;
-        println!("Bundle        {}", bundle_dir.display());
-        for entry in &manifest.files {
-            println!("  {}  sha256 {}", entry.name, entry.sha256);
+        validated.delivery = delivery.clone();
+        let at = directory.root().join("reports").join("validated");
+        Some((
+            at.clone(),
+            tpt_app_media_forensics_report::write_bundle(&validated, &at)?,
+        ))
+    } else {
+        None
+    };
+
+    Ok(ValidationOutcome {
+        verdict,
+        source: report
+            .assets
+            .first()
+            .map_or_else(String::new, |a| a.source_path.clone()),
+        case_dir: Some(directory.root().display().to_string()),
+        findings_considered: Some(report.findings.len()),
+        delivery,
+        blocking_findings: blocking,
+        warning_findings: warnings,
+        bundle,
+    })
+}
+
+/// Everything one validation run produced, before it is rendered.
+struct ValidationOutcome {
+    /// The single verdict both halves were combined into.
+    verdict: tpt_app_media_forensics_report::ValidationResult,
+    /// The media that was checked.
+    source: String,
+    /// The case the findings came from, when a case was read.
+    case_dir: Option<String>,
+    /// How many findings informed the severity half, when any did.
+    ///
+    /// `None` for a bare file check, where no analysis ran. Printing a finding
+    /// count of zero there would imply a clean analysis rather than no analysis.
+    findings_considered: Option<usize>,
+    /// The requirement results, when a profile was applied.
+    delivery: Option<tpt_app_media_forensics_model::DeliveryReport>,
+    blocking_findings: Vec<tpt_app_media_forensics_model::Finding>,
+    warning_findings: Vec<tpt_app_media_forensics_model::Finding>,
+    /// Where the bundle was written, with its manifest, when `--write` was given.
+    bundle: Option<(
+        std::path::PathBuf,
+        tpt_app_media_forensics_report::BundleManifest,
+    )>,
+}
+/// Reads and parses a delivery profile file (spec §69).
+///
+/// A parse failure names the file and says what a valid profile looks like,
+/// because a hand-written profile that does not load is the most likely thing to
+/// go wrong here and "invalid profile" alone sends the reader nowhere.
+fn load_profile(
+    path: &std::path::Path,
+) -> anyhow::Result<tpt_app_media_forensics_model::DeliveryProfile> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the delivery profile {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{} is not a valid delivery profile: requirements are objects tagged with \
+             \"kind\", and every numeric requirement states its own tolerance",
+            path.display()
+        )
+    })
+}
+
+/// Inspects a file for validation, refusing anything this build cannot read.
+fn inspect_for_validation(
+    path: &std::path::Path,
+) -> anyhow::Result<tpt_app_media_forensics_container::ContainerInspection> {
+    use tpt_app_media_forensics_container::{
+        detect_file, inspect_file, inspect_matroska_file, ContainerFormat,
+    };
+
+    let format = detect_file(path).with_context(|| format!("cannot read {}", path.display()))?;
+    match format {
+        ContainerFormat::IsoBmff => {
+            inspect_file(path).with_context(|| format!("cannot inspect {}", path.display()))
         }
+        ContainerFormat::Matroska => inspect_matroska_file(path)
+            .with_context(|| format!("cannot inspect {}", path.display())),
+        // An unrecognised signature is a fact about the evidence, not a gap in the
+        // tool. Conflating the two would tell an analyst their file is fine once a
+        // format is added, when in fact it is not a container this build reads.
+        other => anyhow::bail!(
+            "{} is a {} file; this build cannot check a delivery profile against it",
+            path.display(),
+            other.tag()
+        ),
     }
+}
+
+/// Builds the report a file-only validation writes, when `--write` is given.
+///
+/// A validation report is a real forensic report with a verdict and a requirement
+/// table attached, not a separate document format: a client disputing a rejection
+/// needs the hashes and the methodology beside the verdict, and a second format
+/// would be one more thing that can disagree with the first.
+fn build_validation_report(
+    path: &std::path::Path,
+    delivery: &tpt_app_media_forensics_model::DeliveryReport,
+) -> tpt_app_media_forensics_report::Report {
+    use tpt_app_media_forensics_report::{AssetSummary, Methodology, Report, ValidationResult};
+
+    let verdict = ValidationResult::from_delivery(delivery);
+
+    Report {
+        schema_version: tpt_app_media_forensics_report::REPORT_SCHEMA_VERSION,
+        case_name: delivery.profile_name.clone(),
+        case_id: path.display().to_string(),
+        case_description: Some(format!(
+            "Delivery validation of {} against {}",
+            path.display(),
+            delivery.profile_identifier
+        )),
+        assets: vec![AssetSummary {
+            name: path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+            source_path: path.display().to_string(),
+            sha256: file_sha256(path),
+            blake3: None,
+            size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            stream_count: 0,
+        }],
+        // No analysis ran, so there are no findings to carry. A validation report
+        // listing findings would be claiming an examination this path did not
+        // perform.
+        findings: Vec::new(),
+        evidence: Vec::new(),
+        methodology: Methodology {
+            application_version: env!("CARGO_PKG_VERSION").to_owned(),
+            analysis_version: tpt_app_media_forensics_model::AnalysisVersion::CURRENT.to_string(),
+            profile: delivery.profile_identifier.clone(),
+            profile_fingerprint: delivery.profile_fingerprint.clone(),
+            enabled_rules: Vec::new(),
+            rule_set_fingerprint: "none (no forensic rules ran)".to_owned(),
+            input_hashes: Vec::new(),
+            analysis_timestamp_unix: tpt_app_media_forensics_core::pipeline::analysis_timestamp(),
+            applicable_standards: vec![delivery.profile_name.clone()],
+            analysis_fingerprint: delivery.profile_fingerprint.clone(),
+        },
+        limitations: vec![
+            "This is a delivery-specification check. No forensic rules were run, so the \
+             report contains no findings and makes no claim about the file's integrity \
+             beyond the requirements listed above."
+                .to_owned(),
+        ],
+        notes: Vec::new(),
+        validation: Some(verdict),
+        delivery: Some(delivery.clone()),
+    }
+}
+
+/// The SHA-256 of a file, lowercase hex.
+///
+/// `None` rather than a fabricated value if the file cannot be read: a report
+/// claiming a digest nobody computed is worse than one admitting it has none.
+/// Unreachable in practice, because the inspection that already succeeded proves
+/// the file is readable � which is exactly why it must not be an `unwrap`.
+fn file_sha256(path: &std::path::Path) -> Option<String> {
+    use sha2::Digest as _;
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| tpt_app_media_forensics_model::asset::to_hex(&sha2::Sha256::digest(&bytes)))
+}
+
+/// Renders a validation outcome and sets the exit code.
+///
+/// # Errors
+///
+/// Returns an error only if the output cannot be written. The exit code is set
+/// here rather than by each caller, because a delivery gate that always exits 0
+/// is not a gate — and a second place deciding the exit code is a second place
+/// that can disagree about the verdict.
+fn print_validation(outcome: &ValidationOutcome, json: bool) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_report::ValidationResult;
 
     let payload = serde_json::json!({
-        "case_dir": case_dir.display().to_string(),
-        "result": verdict.label(),
-        "blocking": blocking.iter().map(|f| serde_json::json!({
+        "source": outcome.source,
+        "case_dir": outcome.case_dir,
+        "result": outcome.verdict.label(),
+        "profile": outcome.delivery.as_ref().map(|d| serde_json::json!({
+            "name": d.profile_name,
+            "version": d.profile_version,
+            "identifier": d.profile_identifier,
+            "fingerprint": d.profile_fingerprint,
+        })),
+        "requirements": outcome.delivery.as_ref().map(|d| d.checks.iter()
+            .map(|c| serde_json::json!({
+                "id": c.requirement_id,
+                "expected": c.expected,
+                "observed": c.observed,
+                "outcome": c.outcome.label(),
+                "detail": c.detail,
+            }))
+            .collect::<Vec<_>>()),
+        "findings_considered": outcome.findings_considered,
+        "blocking": outcome.blocking_findings.iter().map(|f| serde_json::json!({
             "rule_id": f.rule_id,
             "severity": f.severity.tag(),
             "summary": f.observation.summary,
         })).collect::<Vec<_>>(),
-        "warnings": warnings.iter().map(|f| serde_json::json!({
+        "warnings": outcome.warning_findings.iter().map(|f| serde_json::json!({
             "rule_id": f.rule_id,
             "summary": f.observation.summary,
         })).collect::<Vec<_>>(),
-        "written_to_case": write,
+        "bundle": outcome.bundle.as_ref().map(|(at, manifest)| serde_json::json!({
+            "directory": at.display().to_string(),
+            "files": manifest.files,
+        })),
     });
 
     let mut text = String::new();
-    text.push_str(&format!("Result        {}\n", verdict.label()));
-    text.push_str(&format!("Findings      {}\n", report.findings.len()));
-    if !blocking.is_empty() {
+    text.push_str(&format!("Result        {}\n", outcome.verdict.label()));
+    text.push_str(&format!("Source        {}\n", outcome.source));
+
+    if let Some(delivery) = &outcome.delivery {
+        text.push_str(&format!("Profile       {}\n", delivery.profile_identifier));
+        text.push_str(&format!("Fingerprint   {}\n", delivery.profile_fingerprint));
+        text.push('\n');
+        for check in &delivery.checks {
+            text.push_str(&format!("{}\n", check.requirement_id));
+            text.push_str(&format!("  Expected: {}\n", check.expected));
+            // "not measured" rather than a blank, matching the HTML and PDF. An
+            // empty line beside a verdict reads as a value that was zero.
+            text.push_str(&format!(
+                "  Observed: {}\n",
+                check.observed.as_deref().unwrap_or("not measured")
+            ));
+            text.push_str(&format!("  Result:    {}\n", check.outcome.label()));
+            text.push_str(&format!("  {}\n", check.detail));
+        }
+    }
+
+    match outcome.findings_considered {
+        Some(count) => text.push_str(&format!("\nFindings      {count}\n")),
+        // Said explicitly rather than omitted: the absence of a finding count is
+        // the difference between "the analysis found nothing" and "no analysis ran",
+        // and a reader of this output is entitled to know which.
+        None => text.push_str("\nNo forensic analysis was run for this check.\n"),
+    }
+
+    if !outcome.blocking_findings.is_empty() {
         text.push_str("Blocking\n");
-        for finding in &blocking {
+        for finding in &outcome.blocking_findings {
             text.push_str(&format!(
                 "  [{}] {}  {}\n",
                 finding.severity.tag(),
@@ -1817,9 +2236,9 @@ fn validate_delivery(case_dir: &std::path::Path, write: bool, json: bool) -> any
             ));
         }
     }
-    if !warnings.is_empty() {
+    if !outcome.warning_findings.is_empty() {
         text.push_str("Warnings\n");
-        for finding in &warnings {
+        for finding in &outcome.warning_findings {
             text.push_str(&format!(
                 "  [{}] {}  {}\n",
                 finding.severity.tag(),
@@ -1828,20 +2247,107 @@ fn validate_delivery(case_dir: &std::path::Path, write: bool, json: bool) -> any
             ));
         }
     }
-    if blocking.is_empty() && warnings.is_empty() {
-        text.push_str("No finding at WARNING or above.\n");
+    if let Some((at, manifest)) = &outcome.bundle {
+        text.push_str(&format!("Bundle        {}\n", at.display()));
+        for entry in &manifest.files {
+            text.push_str(&format!("  {}  sha256 {}\n", entry.name, entry.sha256));
+        }
     }
 
     emit(json, &payload, &text);
 
-    // A non-zero exit on FAIL so `validate` composes in a pipeline. A delivery
-    // gate that always exits 0 is not a gate.
-    if verdict == ValidationResult::Fail {
+    if outcome.verdict == ValidationResult::Fail {
         std::process::exit(2);
     }
 
     Ok(())
 }
+
+/// Shows or checks a delivery profile (spec §69, §70).
+fn run_profile(action: &ProfileAction, json: bool) -> anyhow::Result<()> {
+    match action {
+        ProfileAction::Show { path } | ProfileAction::Check { path } => {
+            let profile = load_profile(path)?;
+            let payload = serde_json::json!({
+                "name": profile.name,
+                "version": profile.version,
+                "identifier": profile.identifier(),
+                "fingerprint": profile.fingerprint(),
+                "requirements": profile.requirements.iter().map(|r| serde_json::json!({
+                    "id": r.id(),
+                    "expected": r.expected_text(),
+                })).collect::<Vec<_>>(),
+            });
+
+            let mut text = String::new();
+            text.push_str(&format!("Profile       {}\n", profile.identifier()));
+            text.push_str(&format!("Name          {}\n", profile.name));
+            text.push_str(&format!("Version       {}\n", profile.version));
+            text.push_str(&format!("Fingerprint   {}\n", profile.fingerprint()));
+            text.push_str(&format!("Requirements  {}\n", profile.requirements.len()));
+            for requirement in &profile.requirements {
+                text.push_str(&format!(
+                    "  {:<24} {}\n",
+                    requirement.id(),
+                    requirement.expected_text()
+                ));
+            }
+
+            emit(json, &payload, &text);
+            Ok(())
+        }
+
+        ProfileAction::Template { out } => {
+            // Refuses rather than overwrites. A profile is a specification a
+            // customer maintains across versions (spec §70), and overwriting one
+            // because someone asked for a template would destroy the record of
+            // what the previous version actually required.
+            if out.exists() {
+                anyhow::bail!(
+                    "{} already exists; refusing to overwrite an existing profile. Write a \
+                     new file, or bump the version of the existing one deliberately.",
+                    out.display()
+                );
+            }
+
+            // Parsed before writing, so a template that does not load is caught
+            // here rather than by the analyst who later runs it against a delivery.
+            let _: tpt_app_media_forensics_model::DeliveryProfile =
+                serde_json::from_str(DELIVERY_PROFILE_TEMPLATE)
+                    .context("the built-in template does not parse")?;
+
+            std::fs::write(out, DELIVERY_PROFILE_TEMPLATE)
+                .with_context(|| format!("writing {}", out.display()))?;
+            println!("Profile       {}", out.display());
+            println!(
+                "Edit the requirements, bump `version` when they change (spec §70), then:\n  \
+                 tpt-media-forensics validate <file> --profile {}",
+                out.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Spec §68's example specification, as a starting point for `profile template`.
+///
+/// JSON rather than the YAML the spec illustrates. `serde_json` is already a
+/// dependency of every crate here, and a parser added for one config file would be
+/// the one dependency in this project not pinned to a revision — which is the
+/// trade spec §63 and §77 exist to prevent. The structure is identical either way.
+const DELIVERY_PROFILE_TEMPLATE: &str = r#"{
+  "name": "Delivery",
+  "version": 1,
+  "requirements": [
+    { "kind": "video_codec", "any_of": ["h264"] },
+    { "kind": "video_resolution", "width": 1920, "height": 1080 },
+    { "kind": "frame_rate", "fps": 25.0, "tolerance": 0.5 },
+    { "kind": "audio_channels", "channels": 2 },
+    { "kind": "audio_sample_rate", "sample_rate": 48000 },
+    { "kind": "container_format", "any_of": ["mov"] }
+  ]
+}
+"#;
 
 /// Renders a report from a previously analysed case.
 ///

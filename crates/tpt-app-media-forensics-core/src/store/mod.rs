@@ -628,10 +628,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns a `rusqlite` error if the query fails.
-    pub fn timeline_retention_in_case(
-        &self,
-        case_id: &str,
-    ) -> rusqlite::Result<TimelineRetention> {
+    pub fn timeline_retention_in_case(&self, case_id: &str) -> rusqlite::Result<TimelineRetention> {
         // The count is over `analyses`, not `timeline_entries`: a run that
         // recorded an empty strip and a run that recorded nothing at all are
         // indistinguishable from the entries alone, and treating them as equal

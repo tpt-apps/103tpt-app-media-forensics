@@ -2287,6 +2287,12 @@ pub fn load_report(case_dir: &CaseDirectory) -> Result<CaseReport, CoreError> {
         limitations: Vec::new(),
         notes,
         validation: None,
+        // No delivery profile was checked. This rebuilds a *forensic* report from
+        // stored findings; `validate` attaches the profile check when one is run.
+        // Defaulting this to an empty report would print a "Delivery validation"
+        // section with no requirements in it, implying a specification was applied
+        // when none was.
+        delivery: None,
     };
 
     Ok(CaseReport {
