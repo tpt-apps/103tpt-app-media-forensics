@@ -1307,6 +1307,7 @@ name = "tpt-app-media-forensics-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",

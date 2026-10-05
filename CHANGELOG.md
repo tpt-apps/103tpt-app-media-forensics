@@ -56,6 +56,41 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### The first fuzz run found a crash, and in release it was worse than a panic
+- **`mkv.rs` computed `0xFFu8 >> len` for the EBML VINT value mask.** `len` can
+  legitimately be 8 — the range check above it admits that — and shifting a `u8` by
+  8 overflows. Any byte in `0x01..=0x0F` produces it
+- **Debug panics; release silently wraps to a shift of zero.** So the shipping
+  build did not crash — it read every 8-byte VINT as carrying a full byte of value
+  bits, which is not what the encoding says. This is the failure mode a debug-only
+  test run cannot catch, and the reason the harness is verified in release as well
+- **Fixed by computing the mask in a wider integer**, `(1 << (8 - len)) - 1`, which
+  is the low `8 - len` bits: the marker occupies the leading bit and everything
+  below it is value. For `len == 8` the mask is zero, so the existing unknown-size
+  check correctly rejects it — an 8-byte VINT carries no value bits at all
+- **Two regression tests, not one.** The crash case, plus the mask arithmetic
+  across all eight legal lengths, because a mask computed for one length and
+  reused for the others would pass the crashing case and misread every other size.
+  That is the subtler half of the same defect
+- **Verified at 2000 cases in release mode**, which is where the silent wrap lived
+
+On the harness itself, the honest framing: **this is not coverage-guided fuzzing.**
+`cargo-fuzz` and libFuzzer need clang, which this machine does not have, so a real
+fuzzing target could neither run in CI nor be reproduced by a contributor. What
+runs is `proptest`'s seeded generator over the same input class — attacker-
+controlled bytes — on every build and on every platform. libFuzzer would find
+deeper bugs faster because coverage feedback steers it at new paths; this finds
+shallow bounds and memory-safety bugs reliably, and as above, immediately.
+Coverage-guided fuzzing is recorded as still undone rather than quietly checked
+off.
+
+One generator earned its place: `plausible_container` wraps arbitrary bytes in a
+valid `moov` header. Pure noise is rejected by the first length check, so a
+harness built only from noise would mostly be measuring the top-level check and
+would probably never have reached the Matroska reader at all.
+
+935 tests, up from 929.
+
 #### A report can be faithful and still lose the analyst's words
 - **Notes reached HTML, PDF and JSON — and none of the CSVs.** `todo.md` had
   carried this as a known limitation: "the CSV renderers omit notes (they are

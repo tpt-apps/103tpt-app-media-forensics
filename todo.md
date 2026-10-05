@@ -1149,7 +1149,32 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       decodes the output back and compares byte-for-byte rather than merely
       checking the text is present.
       The bundle now writes `notes.csv` alongside the other five deliverables.
-- [ ] Fuzzing for container/codec/metadata/packet/timestamp parsers
+- [x] Fuzzing for container/codec/metadata/packet/timestamp parsers (§77)
+      `-core/tests/fuzz.rs`, 4 properties, 256 cases each. **It found a real
+      crash on its first run**: `mkv.rs` computed `0xFFu8 >> len` for the EBML
+      VINT value mask, which overflows when `len == 8` — reachable from any byte
+      in `0x01..=0x0F`. A panic in a debug build, and worse in release, where the
+      shift wraps to zero and every 8-byte VINT was read as carrying a full byte
+      of value bits. Fixed by computing the mask in a wider integer as
+      `(1 << (8 - len)) - 1`, with two regression tests: the crash case, and the
+      mask arithmetic for all eight legal lengths (a mask computed for one length
+      and reused would pass the crashing case and misread every other).
+      Verified at 2000 cases in **release** mode, which is where the silent wrap
+      lived — a debug-only run would have proven only that the panic was gone.
+      **This is not coverage-guided fuzzing and the difference is recorded.**
+      `cargo-fuzz` and libFuzzer need clang, which is not available on this
+      machine, so a real fuzzing target could not run in CI or be reproduced by a
+      contributor. What runs instead is `proptest`'s seeded generator over the
+      same input class — bytes an attacker controls — on every build and every
+      platform. libFuzzer would find deeper bugs faster; this finds shallow
+      bounds and memory-safety bugs reliably, and as just shown, immediately.
+      Coverage-guided fuzzing remains undone and is stated as such rather than
+      checked off.
+      The `plausible_container` generator matters more than it looks: a file that
+      is a valid `moov` header around arbitrary inner bytes walks the box tree and
+      the sample tables, where a file of pure noise is rejected by the first
+      length check. Without it the harness would mostly be measuring the
+      top-level check, and would probably never have reached the Matroska reader.
 - [ ] Golden tests against known fixtures (metadata, structure, findings)
 - [~] Build corrupt-media test corpus (§76): synthetic generator in place;
       fixtures generated on demand. **Truncated is now built and analysed** —

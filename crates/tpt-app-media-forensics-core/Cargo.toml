@@ -40,6 +40,10 @@ tpt-av-cadence-ogg = { workspace = true }
 tpt-av-cadence-core = { workspace = true }
 tpt-kinetix-av1 = { workspace = true }
 tpt-kinetix-core = { workspace = true }
+# Drives the robustness harness in `-core/tests/fuzz.rs`. Arbitrary bytes into
+# every reader is the closest thing to coverage-guided fuzzing that runs on a
+# machine without clang, and it runs on every build rather than on demand.
+proptest = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

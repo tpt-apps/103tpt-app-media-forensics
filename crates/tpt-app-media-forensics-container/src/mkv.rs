@@ -167,7 +167,18 @@ fn ebml_next(data: &[u8], offset: usize) -> Option<(&[u8], &[u8], usize)> {
         return None;
     }
     let raw = data.get(size_at..size_at + len)?;
-    let value_mask = 0xFFu8 >> len;
+    // The mask is computed in a wider integer on purpose. `len` can legitimately
+    // be 8 — the range check above admits it — and `0xFFu8 >> 8` overflows, which
+    // is a panic in a debug build and a silent wrap to a shift of 0 in a release
+    // one. A release build would therefore have read every 8-byte VINT as having
+    // a full byte of value bits, which is not what the encoding says.
+    //
+    // Computed as `(1 << (8 - len)) - 1`, which is the low `8 - len` bits: the
+    // marker occupies the leading bit of the first byte and everything below it
+    // is value. For `len == 8` that is zero, and the unknown-size check below
+    // then correctly rejects it — an 8-byte VINT carries no value bits at all,
+    // so a well-formed one is the "unknown length" encoding.
+    let value_mask = ((1u16 << (8 - len)) - 1) as u8;
     if raw[0] & value_mask == value_mask {
         // All value bits set is the "unknown size" encoding, meaning "to the end of
         // the file". Nothing here needs an unbounded element, so the walk stops
@@ -555,6 +566,63 @@ fn read_bounded(path: &std::path::Path) -> Result<Vec<u8>, ContainerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An eight-byte VINT must be refused, not panic and not be misread.
+    ///
+    /// Found by the robustness harness in `-core/tests/fuzz.rs` on its first run:
+    /// `0xFFu8 >> len` overflows when `len == 8`, which any byte in `0x01..=0x0F`
+    /// produces. That is a panic in a debug build and, worse, a silent wrap to a
+    /// shift of zero in a release one — where every 8-byte VINT would have been
+    /// read as carrying a full byte of value bits.
+    ///
+    /// An 8-byte VINT has no value bits in its first byte: the marker occupies the
+    /// whole byte, so the value mask is zero and the element is the "unknown
+    /// length" encoding. The walk must stop rather than guess at its extent.
+    ///
+    /// Asserted as a *return*, not a panic, because the panic was the bug — and in
+    /// a release build this input would have returned a size instead, so the value
+    /// is pinned too: the reader must yield nothing for the segment, not a bogus
+    /// element.
+    #[test]
+    fn an_eight_byte_vint_is_refused_rather_than_overflowing() {
+        // `0xE7` is the Cluster ID: one leading zero, so a 2-byte ID. `0x01` then
+        // has seven leading zeros, giving an 8-byte size VINT — the widest the
+        // range check admits, and the one that overflowed.
+        let document = [0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+        // The property under test: this must not panic, and must not report a
+        // parseable document. Before the fix this panicked in debug and, in
+        // release, walked past the eight-byte size as though it were small.
+        assert!(
+            ebml_child(&document, b"\x18\x53\x80\x67").is_none(),
+            "an 8-byte VINT is the unknown-length encoding and must not be walked"
+        );
+    }
+
+    /// The value mask is the low `8 - len` bits, for every legal length.
+    ///
+    /// Pins the arithmetic the fix introduced. A mask computed for one length and
+    /// reused for the others would pass the single crashing case and misread every
+    /// other size, which is the subtler half of the same defect.
+    #[test]
+    fn the_value_mask_covers_exactly_the_non_marker_bits() {
+        for len in 1u8..=8 {
+            let mask = ((1u16 << (8 - len)) - 1) as u8;
+            assert_eq!(
+                mask.count_ones(),
+                u32::from(8 - len),
+                "a {len}-byte VINT has {}-value bits in its first byte",
+                8 - len
+            );
+            // The marker bit is always clear in the mask, so the two can never
+            // overlap: `raw[0] & mask` reads value and never reads the length.
+            assert_eq!(
+                mask & (1u8 << (8 - len)),
+                0,
+                "the mask must exclude the marker"
+            );
+        }
+    }
 
     /// Builds a minimal but structurally valid WebM document.
     ///
