@@ -27,9 +27,12 @@
 use tpt_app_media_forensics_container::{
     build_mp4, build_mp4_av, build_mp4_empty_moov, build_mp4_stsd_gop_change,
     build_mp4_with_bitrate_drop, build_mp4_with_colour, build_mp4_with_declared_track_mismatch,
-    build_mp4_with_frame_rate_change, build_mp4_with_hdr_signalling_only, build_mp4_with_keyframes,
-    build_mp4_with_reordered_frames, build_mp4_with_repeated_frames,
-    build_mp4_with_wrong_declared_duration, build_webm, build_webm_without_duration, TrackSpec,
+    build_mp4_with_frame_rate_change, build_mp4_with_hdr_signalling_only,
+    build_mp4_with_impossible_box_size, build_mp4_with_keyframes,
+    build_mp4_with_negative_presentation_times, build_mp4_with_nonprintable_box_type,
+    build_mp4_with_overlapping_presentation_times, build_mp4_with_reordered_frames,
+    build_mp4_with_repeated_frames, build_mp4_with_wrong_declared_duration, build_webm,
+    build_webm_with_empty_block, build_webm_without_duration, TrackSpec,
 };
 use tpt_app_media_forensics_core::case_dir::CaseDirectory;
 use tpt_app_media_forensics_core::AnalysisEngine;
@@ -382,6 +385,62 @@ fn corpus(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     // from unsigned deltas and is therefore monotonic by construction. Reading
     // composition offsets is what makes presentation order observable at all.
     put("reordered.mp4", &build_mp4_with_reordered_frames(40));
+
+    // The two structural variants nothing else in the corpus reaches.
+    //
+    // `trailing-data.mp4` already fires `CONTAINER.STRUCTURAL_DEFECT`, so the rule
+    // was never unfireable and its guard was satisfied. What was missing is
+    // *variant* coverage: a rule can pass every end-to-end test while one of the
+    // enum variants it matches on has never been produced by a real file, which
+    // leaves its `describe`, `offset` and severity branches unexercised and makes
+    // an unreachable case look like a correct silent one.
+    put(
+        "impossible-box-size.mp4",
+        &build_mp4_with_impossible_box_size(),
+    );
+    put(
+        "nonprintable-box-type.mp4",
+        &build_mp4_with_nonprintable_box_type(),
+    );
+
+    // An access unit with no bytes at all: `PacketDamage::EmptySample`.
+    //
+    // Matroska specifically, and that asymmetry is the point. `read_samples` stops
+    // at the first zero-byte packet by design — a packet carrying nothing cannot
+    // advance a reader — so no ISO-BMFF fixture can express this condition, while
+    // a Matroska block with a zero-length payload parses and is recovered
+    // normally. Without this file, `EmptySample` was reachable only from a
+    // hand-built `SampleRecord` in a unit test.
+    //
+    // Note the container scan stays silent: every size and length in the document
+    // is correct, so `CONTAINER.UNREADABLE_PACKET` reports a file with no
+    // structural damage at all, which is exactly the packet-layer rule's purpose.
+    put(
+        "empty-block.webm",
+        &build_webm_with_empty_block("V_VP9", 1, 2),
+    );
+
+    // A genuinely negative presentation time.
+    //
+    // Spec §24 calls this legitimate before an edit list is applied, and no
+    // correct muxer writes it. `reordered.mp4` reaches `TIMING.NON_MONOTONIC_PTS`
+    // but every sample it produces still lands at or after zero, so
+    // `Anomaly::NegativeTimestamp` was the one timing variant no fixture reached.
+    put(
+        "negative-pts.mp4",
+        &build_mp4_with_negative_presentation_times(40),
+    );
+
+    // Two samples claiming one presentation instant: `Anomaly::Overlap`.
+    //
+    // Reachable only because `ctts` composition offsets are read and applied.
+    // `stts` builds decode times from *unsigned* deltas, so decode times can
+    // never repeat — if presentation time still equalled decode time, this
+    // variant would be unreachable in every file the engine can read.
+    put(
+        "overlapping-pts.mp4",
+        &build_mp4_with_overlapping_presentation_times(40),
+    );
 
     written
 }
@@ -1014,6 +1073,159 @@ fn every_rule_fires_end_to_end_or_is_recorded_as_unexercised() {
     );
 }
 
+/// Damage and anomaly variants that no fixture reaches.
+///
+/// The gap the rule-level guard above cannot see. It asks whether a *rule* can
+/// produce a finding; it cannot ask whether every branch inside the rule's
+/// `match` has ever been taken. `CONTAINER.STRUCTURAL_DEFECT` fired from
+/// `trailing-data.mp4` long before `ImpossibleBoxSize` and
+/// `NonPrintableBoxType` had a fixture, so the rule was fully green while a
+/// third of its variants had never run against a real file.
+///
+/// An unreachable variant is worse than an untested one, because nothing fails.
+/// The rule is exercised, the assertion passes, and the branch that would
+/// describe a badly damaged header stays permanently unproven.
+///
+/// Three shapes belong here, and an entry should say which:
+///
+/// - **No fixture yet** — a builder or an in-corpus mutation fixes it.
+/// - **No fixture could exist** — the reader that would carry it cannot express
+///   the condition at all. `PacketDamage::EmptySample` is reached through
+///   Matroska precisely because the ISO-BMFF reader stops at a zero-byte packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// A [`tpt_app_media_forensics_container::StructuralDamage`] tag.
+    Damage(&'static str),
+    /// A [`tpt_app_media_forensics_container::packets::PacketDamage`] tag.
+    Packet(&'static str),
+    /// A [`tpt_app_media_forensics_timing::pts_dts::Anomaly`] variant name.
+    Timing(&'static str),
+}
+
+impl Variant {
+    /// The name this variant is expected to report under.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Damage(tag) | Self::Packet(tag) | Self::Timing(tag) => tag,
+        }
+    }
+}
+
+/// Every damage and timing variant the engine can report.
+///
+/// Written out rather than derived from the enums: the guard's value is that a
+/// new variant has to be *written down here* before it is covered, which is the
+/// prompt to go and build its fixture. Deriving the list instead would make the
+/// guard pass on the day a variant is added, which is the opposite of its
+/// purpose.
+const ALL_VARIANTS: &[Variant] = &[
+    Variant::Damage("truncated"),
+    Variant::Damage("trailing_data"),
+    Variant::Damage("impossible_box_size"),
+    Variant::Damage("non_printable_box_type"),
+    Variant::Packet("empty_sample"),
+    Variant::Packet("sample_count_mismatch"),
+    Variant::Timing("NonMonotonicDts"),
+    Variant::Timing("NonMonotonicPts"),
+    Variant::Timing("Gap"),
+    Variant::Timing("Overlap"),
+    Variant::Timing("NegativeTimestamp"),
+];
+
+/// Variants no fixture reaches, and why.
+///
+/// **One entry, and it is "no fixture could exist".**
+///
+/// - `NonMonotonicDts` — the pipeline calls `pts_dts::scan_presentation` and never
+///   `scan_decode`, so no file of any kind reaches this variant. It is not a
+///   corpus gap and no builder would close it: `bundle.timestamps` is populated
+///   from presentation times alone, so a decode-time anomaly has no route into the
+///   bundle at all.
+///
+///   Recorded rather than quietly dropped because the scanner is real, correct,
+///   and unit-tested against backwards decode times — a reader seeing this list
+///   should conclude the analysis is unwired, not that the condition is absent
+///   from the format. Whether to wire `scan_decode` is an engine decision about
+///   what a forensic report should claim, and the two sequences being the same for
+///   the common case is precisely why it was not done implicitly.
+///
+/// The other six were "no fixture yet", each fixed by a builder that now backs a
+/// named file in the corpus.
+const UNREACHED_VARIANTS: &[(&str, &str)] = &[(
+    "NonMonotonicDts",
+    "no fixture could exist: the pipeline calls scan_presentation and never scan_decode, \
+     so no decode-time anomaly reaches the bundle",
+)];
+
+#[test]
+fn every_damage_and_timing_variant_is_reached_by_some_fixture() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let engine = AnalysisEngine::new();
+
+    let mut reached: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for path in corpus(dir.path()) {
+        let (bundle, _reasons) = engine.observe_stages(&path);
+        for damage in &bundle.damage {
+            reached.insert(damage.tag());
+        }
+        for packet in &bundle.packet_damage {
+            reached.insert(packet.tag());
+        }
+        for report in &bundle.timestamps {
+            for anomaly in &report.anomalies {
+                // `Anomaly` has no `tag()`, and adding one purely for a test
+                // would push a presentation concern into the engine. The derived
+                // name is matched instead, which is why these entries read as
+                // variant names rather than lower-case tags.
+                reached.insert(
+                    [
+                        "NonMonotonicDts",
+                        "NonMonotonicPts",
+                        "Gap",
+                        "Overlap",
+                        "NegativeTimestamp",
+                    ]
+                    .into_iter()
+                    .find(|name| format!("{anomaly:?}").starts_with(name))
+                    .unwrap_or("UnknownAnomaly"),
+                );
+            }
+        }
+    }
+
+    let excused: std::collections::BTreeSet<&str> =
+        UNREACHED_VARIANTS.iter().map(|(tag, _)| *tag).collect();
+
+    let missing: Vec<&str> = ALL_VARIANTS
+        .iter()
+        .filter(|variant| !reached.contains(variant.tag()) && !excused.contains(variant.tag()))
+        .map(Variant::tag)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these damage and timing variants are produced by no fixture: {}. A rule can be \
+         fully green while a variant it matches on has never run against a real file — \
+         nothing fails, because the rule itself is reachable through another variant.\n\
+         Add a fixture, or record the variant in UNREACHED_VARIANTS saying whether no \
+         fixture yet or no fixture could exist.",
+        missing.join(", ")
+    );
+
+    // The reverse direction: an entry recorded as unreached that a fixture now
+    // reaches. The list stops being a record of anything the moment it is stale.
+    let resolved: Vec<&str> = UNREACHED_VARIANTS
+        .iter()
+        .map(|(tag, _)| *tag)
+        .filter(|tag| reached.contains(tag))
+        .collect();
+    assert!(
+        resolved.is_empty(),
+        "recorded in UNREACHED_VARIANTS but now produced by a fixture: {}. Remove them and \
+         their fixtures are doing the work.",
+        resolved.join(", ")
+    );
+}
+
 #[test]
 fn observing_stages_does_not_write_to_the_case() {
     // `observe_stages` is an observation surface, not a second analysis path.
@@ -1399,6 +1611,34 @@ fn a_rule_fires_only_on_files_built_for_its_condition() {
         // similar without being identical. A real near-duplicate run, and a
         // property of the content rather than of the damage.
         ("decode-failure.webm", "VIDEO.NEAR_DUPLICATE_FRAME"),
+        // The two structural variants. Each is a *different* `StructuralDamage`
+        // variant reaching the one rule that consumes them, which is exactly why
+        // they needed their own fixtures: with only `trailing-data.mp4` the rule
+        // was green while two of its four variants had never run.
+        ("impossible-box-size.mp4", "CONTAINER.STRUCTURAL_DEFECT"),
+        ("nonprintable-box-type.mp4", "CONTAINER.STRUCTURAL_DEFECT"),
+        // The empty block. `CONTAINER.UNREADABLE_PACKET` is the purpose, seen from
+        // the packet layer on a document whose every size is correct — the
+        // complementary case to `truncated.mp4`, which reaches the same rule with
+        // structural damage present as well.
+        ("empty-block.webm", "CONTAINER.UNREADABLE_PACKET"),
+        // Also intended, and recorded rather than engineered away: the surrounding
+        // blocks are 32-byte stubs, not real VP9, so the decoder genuinely rejects
+        // them. Same situation as `no-duration.webm` above.
+        ("empty-block.webm", "VIDEO.DECODE_FAILURE"),
+        // The negative presentation time itself. `TIMING.TIMESTAMP_GAP` beside it
+        // is a true consequence of shifting the first sample backwards by two frame
+        // durations, which leaves a hole between it and the second sample — the
+        // same real property that makes `reordered.mp4` report a gap.
+        ("negative-pts.mp4", "TIMING.TIMESTAMP_GAP"),
+        ("negative-pts.mp4", "VIDEO.FRAME_RATE_CHANGE"),
+        // The collision in `overlapping-pts.mp4`. `Overlap` is recorded rather than
+        // graded, so no rule fires on it: the anomaly lives in the timing layer and
+        // there is no `TIMING.OVERLAP` rule to consume it. The two entries below
+        // are the conditions that file incidentally produces, recorded rather than
+        // engineered away.
+        ("overlapping-pts.mp4", "TIMING.TIMESTAMP_GAP"),
+        ("overlapping-pts.mp4", "VIDEO.FRAME_RATE_CHANGE"),
     ];
 
     for path in corpus(dir.path()) {

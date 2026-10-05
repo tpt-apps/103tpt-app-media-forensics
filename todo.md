@@ -1081,8 +1081,45 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       `stage_guard.rs` truncates a real MP4 to half length, which is what
       populates `BundleInput::Damage`; without it the two damage rules are
       registered, documented, and unfireable.
-      Pending: bad-header, invalid-timestamps, missing-index,
-      bad-audio-packet, duplicate-frame, duration-mismatch, metadata-conflict
+      Pending: ~~bad-header~~, invalid-timestamps, missing-index,
+      ~~bad-audio-packet~~, ~~duplicate-frame~~, ~~duration-mismatch~~,
+      ~~metadata-conflict~~
+      **Re-audited by measurement rather than by reading the list.** Three of
+      these were already covered: `repeated-frames.mp4` is the duplicate-frame
+      case, `wrong-duration.mp4` the duration mismatch, and `metadata.mp4`
+      carries the metadata conflict. All 29 rules already fired end to end, and
+      `NO_END_TO_END_FIXTURE` was empty — so the real gap was never
+      unfireability.
+      It was **variant coverage**. A rule can be reachable and green while one
+      of the enum variants it matches on has never been produced by a real file,
+      and nothing fails: `CONTAINER.STRUCTURAL_DEFECT` fired from
+      `trailing-data.mp4` while two of its four variants had never run.
+- [x] The four unreachable damage/timing variants (§76)
+      `impossible_box_size`, `non_printable_box_type`, `empty_sample` and
+      `NegativeTimestamp` — plus `Overlap`, which the new guard found once the
+      first four were closed. Builders: `build_mp4_with_impossible_box_size`,
+      `build_mp4_with_nonprintable_box_type`, `build_webm_with_empty_block`,
+      `build_mp4_with_negative_presentation_times` and
+      `build_mp4_with_overlapping_presentation_times`. Damage tags are now 4/4
+      and packet tags 2/2.
+      `empty_sample` needed a **Matroska** fixture, verified empirically rather
+      than assumed: `read_samples` stops at the first zero-byte packet by design,
+      so no ISO-BMFF file can express it, while a zero-length WebM block parses
+      and is recovered normally. The fixture is the evidence for that asymmetry.
+      `Overlap` looked impossible at first — `stts` builds decode times from
+      *unsigned* deltas, so they can never repeat — and is only reachable
+      because `ctts` composition offsets are signed.
+- [x] A guard so the variant gap cannot silently return (§76)
+      `every_damage_and_timing_variant_is_reached_by_some_fixture` in
+      `stage_guard.rs`, the gap the rule-level guard above cannot see. `ALL_VARIANTS`
+      is written out rather than derived from the enums, so adding a variant
+      fails the guard on the day it is added rather than passing vacuously.
+      Verified non-vacuous by inserting a fake tag and watching it fail.
+      `UNREACHED_VARIANTS` holds one entry, `NonMonotonicDts`, recorded as **"no
+      fixture could exist"** because the pipeline calls `scan_presentation` and
+      never `scan_decode` — no file of any kind reaches it. That is an
+      unwired *analysis*, not a corpus gap, and saying so is what distinguishes
+      the two.
 - [x] Determinism checks (stable rule ordering, no unseeded randomness) (§77)
       Checked at three levels: `results_are_ordered_deterministically` (rule
       output order), `hash_is_deterministic_across_invocations` and

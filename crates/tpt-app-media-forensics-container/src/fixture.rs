@@ -1084,6 +1084,192 @@ pub fn build_webm_without_duration(
     doc
 }
 
+/// Builds a Matroska / WebM document holding one block with no payload.
+///
+/// The only route to [`crate::packets::PacketDamage::EmptySample`] through a real
+/// container, and it is a Matroska route specifically. ISO-BMFF cannot express
+/// this fixture: `read_samples` stops at the first zero-byte packet by design,
+/// because a packet that carries nothing cannot advance a reader, so a zero-size
+/// `stsz` entry is never recovered and never scanned.
+///
+/// That asymmetry is why this takes the general [`build_webm`] rather than a
+/// dedicated builder. The document is entirely well-formed — every size and
+/// length is correct, and a real muxer can emit an empty block after a flush —
+/// so the container's structural scan finds nothing and only the packet-layer
+/// scan sees the defect. `CONTAINER.UNREADABLE_PACKET` therefore reports a file
+/// with no structural damage at all, which is the whole point of the rule.
+///
+/// The neighbours carry real payloads rather than more empty blocks: a document
+/// of nothing but empty samples would be an obviously synthetic file, and would
+/// also reach `VIDEO.DUPLICATE_FRAME_RUN` for reasons that have nothing to do
+/// with what this fixture is for.
+#[must_use]
+pub fn build_webm_with_empty_block(codec_id: &str, track_type: u8, empty_at: usize) -> Vec<u8> {
+    const REAL_PAYLOAD: usize = 32;
+    let blocks: Vec<(u16, bool, Vec<u8>)> = (0..6u16)
+        .map(|index| {
+            let payload = if usize::from(index) == empty_at {
+                Vec::new()
+            } else {
+                // Distinct per block, so no two adjacent samples collide and the
+                // file carries no duplicate run other than the empty one.
+                let mut payload = vec![0u8; REAL_PAYLOAD];
+                payload[0] = index as u8;
+                payload[1] = (index as u8).wrapping_mul(7);
+                payload
+            };
+            (index * 40, index % 4 == 0, payload)
+        })
+        .collect();
+    build_webm(codec_id, track_type, &blocks)
+}
+
+/// Builds an ISO-BMFF file whose box list contains a structurally impossible
+/// header: a box declaring a size smaller than the eight bytes describing it.
+///
+/// This is the only way [`crate::StructuralDamage::ImpossibleBoxSize`] can be
+/// produced end to end. `trailing-data.mp4` reaches `CONTAINER.STRUCTURAL_DEFECT`
+/// through a different variant, so the rule does fire from the corpus — but
+/// without this fixture its `describe`, `offset` and severity branches for an
+/// impossible size would never run on a real file, and a rule can pass every
+/// test while one of its variants is unreachable.
+///
+/// The bytes are otherwise a complete, ordinary MP4. That is deliberate: the
+/// defect is localized to one header word, which is what a partially-overwritten
+/// or hand-edited file looks like, and keeping the rest intact means the fixture
+/// is testing the impossible size rather than whatever else a truncated file
+/// would drag in with it.
+///
+/// A size of `4` is used because the scan refuses `1..8` exclusive — `0` and `1`
+/// are legal size encodings meaning "to end of file" and "64-bit size follows",
+/// and treating either as a tiny literal would report damage in a valid file.
+#[must_use]
+pub fn build_mp4_with_impossible_box_size() -> Vec<u8> {
+    let base = build_mp4(&TrackSpec::video_25fps(320, 240, 30));
+
+    // Spliced in after `ftyp` so the rest of the file still parses: the walk
+    // consumes what it can and records the defect rather than stopping at it.
+    let ftyp_len = mp4_box(b"ftyp", FTYP_BODY).len();
+
+    let mut impossible = Vec::new();
+    impossible.extend_from_slice(&u32be(4)); // smaller than the 8-byte header
+    impossible.extend_from_slice(b"junk"); // printable, so only the size is wrong
+
+    let mut out = Vec::with_capacity(base.len() + impossible.len());
+    out.extend_from_slice(&base[..ftyp_len]);
+    out.extend_from_slice(&impossible);
+    out.extend_from_slice(&base[ftyp_len..]);
+    out
+}
+
+/// Builds an ISO-BMFF file containing a box whose type is not printable ASCII.
+///
+/// The only route to [`crate::StructuralDamage::NonPrintableBoxType`]. The scan
+/// records this separately from an impossible size because the two point at
+/// different causes: a nonsense size is a bad header, whereas a type made of
+/// control bytes is almost always a reader that has lost sync and is walking
+/// sample payload as if it were structure.
+///
+/// Four bytes of `0x01` are used rather than a single odd byte. A box type is
+/// exactly four bytes wide, so a name containing one control character among
+/// three printable ones is a much rarer thing to encounter than a wholly
+/// unreadable one, and this keeps the fixture aimed at the condition the variant
+/// names: the type is not a printable box name at all.
+#[must_use]
+pub fn build_mp4_with_nonprintable_box_type() -> Vec<u8> {
+    let base = build_mp4(&TrackSpec::video_25fps(320, 240, 30));
+    let ftyp_len = mp4_box(b"ftyp", FTYP_BODY).len();
+
+    let mut out = Vec::with_capacity(base.len() + 16);
+    out.extend_from_slice(&base[..ftyp_len]);
+    // A well-formed box whose *name* is the defect. The size is correct, so this
+    // reaches the type check without being swallowed by the size check first.
+    out.extend_from_slice(&u32be(12));
+    out.extend_from_slice(&[0x01, 0x01, 0x01, 0x01]);
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&base[ftyp_len..]);
+    out
+}
+
+/// Builds an MP4 whose `ctts` shifts early samples to negative presentation time.
+///
+/// The only route to [`tpt_app_media_forensics_timing::pts_dts::Anomaly::NegativeTimestamp`].
+/// `reordered.mp4` reaches `NonMonotonicPts` by shuffling offsets within a group,
+/// but every sample it produces still lands at or after zero, because an IBBP
+/// encoder's offsets straddle a small positive window. Reaching a genuinely
+/// negative time needs an offset larger than the sample's own decode time, which
+/// no correct muxer writes.
+///
+/// The offsets are therefore extreme on purpose: the first sample is pushed
+/// backwards by two frame durations. This is the shape spec §24 describes as
+/// legitimate before an edit list is applied, which is exactly why the anomaly
+/// exists — the engine must distinguish "negative before an edit" from "corrupt"
+/// rather than treating the sign itself as damage.
+///
+/// Decode time stays strictly increasing throughout, so the anomaly is about
+/// *presentation* and not a broken timestamp table.
+#[must_use]
+pub fn build_mp4_with_negative_presentation_times(frames: u32) -> Vec<u8> {
+    let spec = TrackSpec::video_25fps(320, 240, frames);
+    let one_frame = i64::from(spec.timescale) / 25;
+
+    let mut offsets = vec![0i64; frames as usize];
+    // Only the first sample moves. Every later sample keeps offset zero, so the
+    // sequence is [negative, 0, 1, 2, ...] — one backwards step and then a
+    // perfectly regular track, rather than a whole file of scrambled timing.
+    if let Some(first) = offsets.first_mut() {
+        *first = -one_frame * 2;
+    }
+
+    build_mp4_multi(&[(
+        &spec,
+        TrackExtras {
+            composition_offsets: Some(offsets),
+            ..TrackExtras::default()
+        },
+    )])
+}
+
+/// Builds an MP4 in which two consecutive samples claim the same presentation
+/// time, producing [`tpt_app_media_forensics_timing::pts_dts::Anomaly::Overlap`].
+///
+/// Reachability of this variant is worth recording, because it looks impossible
+/// at first glance. `scan_presentation` flags a zero delta between neighbours,
+/// and an ISO-BMFF `stts` builds decode times from *unsigned* deltas — so decode
+/// times can never repeat, and if presentation time equalled decode time this
+/// condition would be unreachable in every file. That was true until `ctts` was
+/// read: composition offsets are signed, so two samples with different decode
+/// times can be shifted onto one presentation instant.
+///
+/// The shift required is therefore exactly one tick: with a timescale equal to
+/// the frame rate, sample 1 decodes one tick after sample 0, so an offset of
+/// `-1` on sample 1 alone lands it back on sample 0's presentation time. Every
+/// other sample keeps offset zero, so the file is [0, 0, 2, 3, 4, ...] — one
+/// collision and then a perfectly regular track.
+///
+/// Two samples sharing an instant is not corruption on its own, and the anomaly
+/// records it rather than grading it. That is the point of separating `Overlap`
+/// from `NonMonotonicPts`: reordering is normal in B-frame video, whereas this is
+/// a sample table that says two different pictures happen at the same moment.
+#[must_use]
+pub fn build_mp4_with_overlapping_presentation_times(frames: u32) -> Vec<u8> {
+    let spec = TrackSpec::video_25fps(320, 240, frames);
+
+    let mut offsets = vec![0i64; frames as usize];
+    // The timescale is the frame rate, so one tick is one frame duration.
+    if offsets.len() > 1 {
+        offsets[1] = -1;
+    }
+
+    build_mp4_multi(&[(
+        &spec,
+        TrackExtras {
+            composition_offsets: Some(offsets),
+            ..TrackExtras::default()
+        },
+    )])
+}
+
 /// Encodes an EBML variable-length size integer for `value`.
 ///
 /// The width is the narrowest that can hold `value`, chosen so that the leading

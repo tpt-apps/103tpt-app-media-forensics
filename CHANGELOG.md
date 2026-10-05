@@ -56,6 +56,39 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### A rule can be reachable, green, and still have a variant that never runs
+- **The corpus was audited by running it, not by reading the checklist.** The
+  pending list in `todo.md` named seven outstanding fixtures. Measuring the
+  corpus showed all 29 rules already firing end to end and
+  `NO_END_TO_END_FIXTURE` empty — so three of the seven were already covered
+  (`repeated-frames.mp4`, `wrong-duration.mp4`, `metadata.mp4`), and the real
+  gap was somewhere else entirely
+- **The gap was variant coverage, which nothing was checking.** A rule matches
+  on an enum, and the guards asked whether the rule can fire — not whether every
+  branch inside it has been taken. `CONTAINER.STRUCTURAL_DEFECT` was fully green
+  off `trailing-data.mp4` while two of its four variants had never been produced
+  by a real file. An unreachable variant is worse than an untested one, because
+  nothing fails: the rule is exercised, the assertion passes, and the branch
+  that would describe a badly mangled header stays permanently unproven
+- **Five variants closed**, and four of them looked unreachable on inspection.
+  `empty_sample` needed a *Matroska* fixture, verified rather than assumed:
+  `read_samples` stops at the first zero-byte packet by design, so no ISO-BMFF
+  file can express the condition, while a zero-length WebM block parses and
+  recovers normally. `Overlap` looked impossible — `stts` builds decode times
+  from *unsigned* deltas, so they can never repeat — and is reachable only
+  because `ctts` composition offsets are signed
+- **The guard is written so adding a variant fails it.** `ALL_VARIANTS` is
+  spelled out rather than derived from the enums, because a derived list would
+  pass on the day a variant is added, which is the opposite of the point.
+  Confirmed non-vacuous by inserting a fake tag and watching the guard catch it
+- **`UNREACHED_VARIANTS` holds one entry, and it is "no fixture could exist".**
+  `NonMonotonicDts` is unreachable because the pipeline calls
+  `pts_dts::scan_presentation` and never `scan_decode`, so no file of any kind
+  reaches it. That is an unwired *analysis*, not a corpus gap, and the two call
+  for different work — which is why the entry says so instead of being quietly
+  dropped. The scanner is real and unit-tested; a reader seeing this list should
+  conclude the pipeline does not call it, not that the condition cannot occur
+
 #### Three open questions, answered
 - **`startup_log` ships in release builds — but it can no longer forge a log entry.**
   The reason it exists is a *release* build opening a blank window: that is the one
