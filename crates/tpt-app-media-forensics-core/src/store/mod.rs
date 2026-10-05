@@ -351,6 +351,47 @@ pub struct StoredAsset {
     pub sha256: Option<String>,
     /// BLAKE3 recorded at acquisition, verbatim.
     pub blake3: Option<String>,
+    /// The role this asset plays in the case (spec §67), verbatim.
+    ///
+    /// `None` means "not recorded as any role" — either genuinely undesignated, or
+    /// written by a build predating the column. Both read the same way on purpose:
+    /// an asset nobody called a reference must never be used as one.
+    pub role: Option<String>,
+}
+
+impl StoredAsset {
+    /// Whether this asset is the case's declared reference (spec §67).
+    ///
+    /// The content digest is already on the row, so a reference is bound to
+    /// specific bytes the moment it is designated — nothing further has to be
+    /// recorded to make "what changed?" reproducible.
+    #[must_use]
+    pub fn is_reference(&self) -> bool {
+        self.role.as_deref() == Some(AssetRole::Reference.tag())
+    }
+}
+
+/// The role an asset plays in a case (spec §67).
+///
+/// A tag rather than a boolean so the schema does not have to change to record a
+/// second role; see [`schema`]'s migration for why the column is nullable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetRole {
+    /// The asset every delivery in the case is measured against.
+    ///
+    /// Spec §67's "known reference": the master a delivery is checked against to
+    /// answer "what changed?".
+    Reference,
+}
+
+impl AssetRole {
+    /// The stored spelling. Stable, because the database outlives the enum.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+        }
+    }
 }
 
 /// The stored spelling of how a timeline position was arrived at.
@@ -433,7 +474,7 @@ impl Store {
     /// Returns an error if the query fails.
     pub fn assets_in_case(&self, case_id: &str) -> rusqlite::Result<Vec<StoredAsset>> {
         let mut stmt = self.connection.prepare(
-            "SELECT id, case_id, name, source_path, size_bytes, sha256, blake3 \
+            "SELECT id, case_id, name, source_path, size_bytes, sha256, blake3, role \
              FROM assets WHERE case_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([case_id], |row| {
@@ -445,9 +486,100 @@ impl Store {
                 size_bytes: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
                 sha256: row.get(5)?,
                 blake3: row.get(6)?,
+                role: row.get(7)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// Records an asset's role in the case (spec §67).
+    ///
+    /// # Why this is a write and not a derived fact
+    ///
+    /// "This is the master" is a decision somebody made about a file, and nothing
+    /// in the bytes can recover it. The engine can tell a delivery from a master by
+    /// inspecting both, and it will be wrong sometimes — which of two encodes is
+    /// authoritative is a question about the job, not the media. So it is recorded,
+    /// and recorded against the asset rather than the case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails, including when `case_id` does not name
+    /// an asset in that case. Silently succeeding would leave the designation
+    /// claimed and unrecorded, which is the one outcome a reviewer could not detect.
+    pub fn set_asset_role(
+        &self,
+        case_id: &str,
+        asset_id: &str,
+        role: Option<AssetRole>,
+    ) -> rusqlite::Result<()> {
+        let updated = self.connection.execute(
+            "UPDATE assets SET role = ?3 WHERE case_id = ?1 AND id = ?2",
+            rusqlite::params![case_id, asset_id, role.map(AssetRole::tag)],
+        )?;
+        if updated == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    }
+
+    /// The case's declared reference assets (spec §67).
+    ///
+    /// A list rather than a single asset because a case may legitimately hold more
+    /// than one master — a campaign's masters, one per deliverable — and collapsing
+    /// them to "the" reference would have to pick one arbitrarily. Ordered by id so
+    /// two reads of the same case agree (spec §77).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn reference_assets(&self, case_id: &str) -> rusqlite::Result<Vec<StoredAsset>> {
+        Ok(self
+            .assets_in_case(case_id)?
+            .into_iter()
+            .filter(StoredAsset::is_reference)
+            .collect())
+    }
+
+    /// The one asset matching `selector` by id, else by exact name (spec §67).
+    ///
+    /// An analyst has the file name to hand, not the row id, so a name has to work.
+    /// Names are matched exactly rather than fuzzily: two assets in one case can
+    /// share a name only if their content differs, and picking the "closest" match
+    /// would designate a master nobody chose. Ambiguity is reported rather than
+    /// resolved, because the alternative is measuring a delivery against a file the
+    /// analyst did not name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query fails. A miss is `Ok(None)`.
+    pub fn find_asset(
+        &self,
+        case_id: &str,
+        selector: &str,
+    ) -> rusqlite::Result<Option<StoredAsset>> {
+        let assets = self.assets_in_case(case_id)?;
+        if let Some(by_id) = assets.iter().find(|a| a.id == selector) {
+            return Ok(Some(by_id.clone()));
+        }
+        if let Some(exact) = assets.iter().find(|a| a.name == selector) {
+            return Ok(Some(exact.clone()));
+        }
+
+        // Case-insensitive fallback, and only when it is unambiguous. A file name
+        // comes off a filesystem and through an analyst's keyboard, and on Windows
+        // neither is case-sensitive, so `MASTER.MP4` must reach `master.mp4`. But
+        // two assets in one case differing *only* in case are two different files,
+        // and picking one would designate a master nobody named.
+        let lowered = selector.to_lowercase();
+        let mut matches = assets
+            .into_iter()
+            .filter(|a| a.name.to_lowercase() == lowered);
+        let first = matches.next();
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(first)
     }
 
     /// Counts rows in a table, for verification.

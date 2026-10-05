@@ -1436,6 +1436,10 @@ impl AnalysisEngine {
             size_bytes: asset.size_bytes(),
             sha256: asset.sha256().map(ToOwned::to_owned),
             blake3: asset.blake3().map(ToOwned::to_owned),
+            // Roles are designations, not observations (spec §67). Acquisition
+            // learns nothing about whether this file is a master, so it records no
+            // role; `set_asset_role` is the only thing that may set one.
+            role: None,
         };
 
         // An asset already in the case is left alone: the same file analysed

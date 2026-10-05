@@ -5,7 +5,9 @@
 //! than in isolation.
 
 use tpt_app_media_forensics_core::case_dir::CaseDirectory;
-use tpt_app_media_forensics_core::store::{Store, StoredAnalysis, StoredAsset, TimelineRetention};
+use tpt_app_media_forensics_core::store::{
+    AssetRole, Store, StoredAnalysis, StoredAsset, TimelineRetention,
+};
 use tpt_app_media_forensics_model::{
     AssetId, Case, Confidence, Finding, FindingId, FindingStatus, Observation, Severity,
 };
@@ -19,7 +21,158 @@ fn asset(id: &str, sha: &str) -> StoredAsset {
         size_bytes: 4096,
         sha256: Some(sha.to_owned()),
         blake3: Some("bb".repeat(32)),
+        role: None,
     }
+}
+
+#[test]
+fn a_designated_reference_is_recorded_and_survives_reopening() {
+    // The point of persisting the designation (spec §67): a case reopened later
+    // must still know which file was the master. If this only held in memory, the
+    // whole promise would evaporate at process exit.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::open(dir.path()).expect("opens");
+    store
+        .upsert_case("case-1", "Case", None)
+        .expect("case inserted");
+    store
+        .insert_asset(&asset("master", &"a".repeat(64)))
+        .expect("master inserted");
+    store
+        .insert_asset(&asset("delivery", &"c".repeat(64)))
+        .expect("delivery inserted");
+
+    store
+        .set_asset_role("case-1", "master", Some(AssetRole::Reference))
+        .expect("designation recorded");
+
+    drop(store);
+    let reopened = Store::open(dir.path()).expect("reopens");
+    let references = reopened
+        .reference_assets("case-1")
+        .expect("references read");
+
+    assert_eq!(
+        references.len(),
+        1,
+        "exactly the designated asset is a reference: {references:?}"
+    );
+    assert_eq!(references[0].id, "master");
+    assert!(references[0].is_reference());
+    // And the digest travels with it, which is what makes "what changed?"
+    // reproducible rather than merely repeatable.
+    assert_eq!(
+        references[0].sha256.as_deref(),
+        Some("a".repeat(64).as_str())
+    );
+}
+
+#[test]
+fn an_undesignated_asset_is_never_treated_as_a_reference() {
+    // `NULL` must read as "not a reference", not as "unknown, assume yes". An asset
+    // written before the column existed lands in exactly this state, so getting it
+    // wrong would silently promote old rows to masters.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::open(dir.path()).expect("opens");
+    store
+        .upsert_case("case-1", "Case", None)
+        .expect("case inserted");
+    store
+        .insert_asset(&asset("delivery", &"c".repeat(64)))
+        .expect("delivery inserted");
+
+    assert!(
+        store.reference_assets("case-1").expect("reads").is_empty(),
+        "an asset nobody designated is not a reference"
+    );
+    assert!(!store.assets_in_case("case-1").expect("reads")[0].is_reference());
+}
+
+#[test]
+fn designating_an_asset_that_is_not_in_the_case_is_refused() {
+    // Silently succeeding would leave the designation claimed in the command's
+    // output and absent from the database — the one outcome a reviewer cannot
+    // detect from the report.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::open(dir.path()).expect("opens");
+    store
+        .upsert_case("case-1", "Case", None)
+        .expect("case inserted");
+    store
+        .insert_asset(&asset("master", &"a".repeat(64)))
+        .expect("master inserted");
+
+    assert!(
+        store
+            .set_asset_role("case-1", "not-an-asset", Some(AssetRole::Reference))
+            .is_err(),
+        "a designation for an asset outside the case must fail rather than no-op"
+    );
+}
+
+#[test]
+fn an_asset_is_found_by_name_or_by_id() {
+    // An analyst has the file name to hand, not the row id, so a name has to work.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::open(dir.path()).expect("opens");
+    store
+        .upsert_case("case-1", "Case", None)
+        .expect("case inserted");
+    store
+        .insert_asset(&asset("master", &"a".repeat(64)))
+        .expect("master inserted");
+
+    assert_eq!(
+        store
+            .find_asset("case-1", "master")
+            .expect("reads")
+            .map(|a| a.id),
+        Some("master".to_owned()),
+        "the file name must resolve"
+    );
+    assert_eq!(
+        store
+            .find_asset("case-1", "MASTER.MP4")
+            .expect("reads")
+            .map(|a| a.id),
+        Some("master".to_owned()),
+        "a file name that differs only in case must still resolve, because Windows \
+         paths and analyst typing are both case-insensitive in practice"
+    );
+    assert!(
+        store
+            .find_asset("case-1", "nothing-like-it")
+            .expect("reads")
+            .is_none(),
+        "an unmatched selector is a miss, not an error"
+    );
+}
+
+#[test]
+fn a_designation_can_be_cleared() {
+    // Demoting a master is a normal correction, not a schema problem. Leaving no
+    // way back would mean a wrong designation could only be fixed by opening the
+    // database by hand.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::open(dir.path()).expect("opens");
+    store
+        .upsert_case("case-1", "Case", None)
+        .expect("case inserted");
+    store
+        .insert_asset(&asset("master", &"a".repeat(64)))
+        .expect("master inserted");
+
+    store
+        .set_asset_role("case-1", "master", Some(AssetRole::Reference))
+        .expect("designated");
+    store
+        .set_asset_role("case-1", "master", None)
+        .expect("cleared");
+
+    assert!(
+        store.reference_assets("case-1").expect("reads").is_empty(),
+        "a cleared designation must not survive"
+    );
 }
 
 #[test]
@@ -205,6 +358,7 @@ fn seeded_store() -> Store {
             size_bytes: 4096,
             sha256: Some("aa".to_owned()),
             blake3: None,
+            role: None,
         })
         .expect("asset");
     store
@@ -681,6 +835,7 @@ fn a_case_written_before_timeline_retention_is_reported_as_partial() {
             size_bytes: 4096,
             sha256: Some("aa".to_owned()),
             blake3: None,
+            role: None,
         })
         .expect("asset");
     store

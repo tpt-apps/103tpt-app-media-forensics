@@ -853,6 +853,7 @@ mod tests {
             size_bytes: 1,
             sha256: None,
             blake3: None,
+            role: None,
         };
         store.insert_asset(&asset).expect("asset inserted");
         // The timeline table references the analysis it belongs to, so the test

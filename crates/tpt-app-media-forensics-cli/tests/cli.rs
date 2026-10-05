@@ -848,6 +848,131 @@ fn analysed_case(dir: &Path) -> std::path::PathBuf {
 }
 
 #[test]
+fn a_reference_designation_is_recorded_listed_and_cleared() {
+    // Spec §67's "users should be able to define a reference asset", driven through
+    // the real binary. The engine could have guessed which file was the master and
+    // the point of the command is that it does not: which of two encodes is
+    // authoritative is a decision about the job, and the designation has to survive
+    // the process exiting for a reopened case to know it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+
+    // Nothing designated yet, and saying so plainly rather than printing nothing.
+    let listed = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(listed.status.success(), "listing failed");
+    let empty = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        empty.contains("No reference designated"),
+        "an undesignated case must say so rather than print an empty list: {empty}"
+    );
+
+    let designated = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            "sample.mp4",
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(
+        designated.status.success(),
+        "designation failed: {}",
+        String::from_utf8_lossy(&designated.stderr)
+    );
+    let output = String::from_utf8_lossy(&designated.stdout).into_owned();
+    assert!(
+        output.contains("sample.mp4"),
+        "the designation must name the file: {output}"
+    );
+    // And print the digest. A designation an analyst cannot see is a designation
+    // they cannot check, and the digest is what a later comparison is bound to.
+    assert!(
+        output.contains("sha256"),
+        "the designation must carry the reference's digest: {output}"
+    );
+
+    // Listing again must find it — this is the reopen-later path, proved through
+    // the binary rather than by trusting the in-process store.
+    let relisted = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let after = String::from_utf8_lossy(&relisted.stdout).into_owned();
+    assert!(
+        after.contains("sample.mp4") && !after.contains("No reference designated"),
+        "the designation must persist across invocations: {after}"
+    );
+
+    let cleared = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            "sample.mp4",
+            "--clear",
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(
+        cleared.status.success(),
+        "clearing failed: {}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let relisted = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(
+        String::from_utf8_lossy(&relisted.stdout).contains("No reference designated"),
+        "a cleared designation must not come back"
+    );
+}
+
+#[test]
+fn designating_an_asset_the_case_does_not_hold_is_refused() {
+    // Silently succeeding would print a confirmation for a designation nothing
+    // recorded — the one failure a reviewer could not detect from the report.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+
+    let out = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            "no-such-file.mp4",
+        ])
+        .output()
+        .expect("runs CLI");
+
+    assert!(
+        !out.status.success(),
+        "an unknown asset must not report success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no-such-file.mp4"),
+        "the refusal must name what it could not find: {stderr}"
+    );
+}
+
+#[test]
 fn report_writes_each_supported_format() {
     let dir = tempfile::tempdir().expect("temp dir");
     let case_dir = analysed_case(dir.path());

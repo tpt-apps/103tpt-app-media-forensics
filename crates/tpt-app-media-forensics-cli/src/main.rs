@@ -137,6 +137,32 @@ enum Command {
         subject: Option<String>,
     },
 
+    /// Designate, clear, or list a case's reference asset (spec §67).
+    ///
+    /// "This file is the master" is a decision somebody made about a file.
+    /// Nothing in the bytes can recover it, so it is recorded against the asset
+    /// rather than derived — the engine can guess which of two encodes is
+    /// authoritative, and which one is authoritative is a question about the job,
+    /// not the media.
+    Reference {
+        /// Case directory produced by `acquire` or `analyze`.
+        #[arg(long)]
+        case_dir: std::path::PathBuf,
+
+        /// The asset to designate, by file name or asset id.
+        ///
+        /// Omit to list the current designations instead of changing them.
+        asset: Option<String>,
+
+        /// Clear this asset's designation rather than set it.
+        ///
+        /// Takes the asset, unlike most clear-flags: "clear *which* one" is a
+        /// question with no default, and clearing every designation because nobody
+        /// named one would be a destructive action taken by omission.
+        #[arg(long)]
+        clear: bool,
+    },
+
     /// Compare two media files across every measured axis (spec §38–40).
     ///
     /// Both files are analysed directly. No case directory is involved: a
@@ -430,6 +456,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             directory,
             case_dir,
         } => run_batch(directory, case_dir, cli.json),
+
+        Command::Reference {
+            case_dir,
+            asset,
+            clear,
+        } => run_reference(case_dir, asset.as_deref(), *clear),
 
         Command::Compare {
             left,
@@ -1405,6 +1437,86 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
         println!("Source was opened read-only; it has not been modified.");
     }
 
+    Ok(())
+}
+
+/// Designates, clears, or lists a case's reference asset (spec §67).
+///
+/// Prints the designation with the reference's SHA-256, because the point of
+/// recording it is that a later `compare --reference` can name the exact bytes it
+/// measured against. A designation an analyst cannot see is a designation they
+/// cannot check.
+fn run_reference(
+    case_dir: &std::path::Path,
+    asset: Option<&str>,
+    clear: bool,
+) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::store::{AssetRole, Store};
+
+    let store = Store::open(case_dir)?;
+    let case_id = store.only_case_id()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds no case, so there is no asset to designate",
+            case_dir.display()
+        )
+    })?;
+
+    // No asset named: list. Listing is the read-only mode and deliberately needs
+    // neither an asset nor a flag, so "what does this case think its master is?"
+    // is one command rather than a flag combination someone has to remember.
+    let Some(selector) = asset else {
+        let references = store.reference_assets(&case_id)?;
+        if references.is_empty() {
+            println!("No reference designated.");
+        }
+        for asset in &references {
+            println!(
+                "{}  sha256 {}",
+                asset.name,
+                asset.sha256.as_deref().unwrap_or("not recorded")
+            );
+        }
+        return Ok(());
+    };
+
+    let found = store.find_asset(&case_id, selector)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no asset named or identified by `{selector}` in this case; run without \
+                 an argument to see what the case holds"
+        )
+    })?;
+
+    let role = if clear {
+        None
+    } else {
+        Some(AssetRole::Reference)
+    };
+    store.set_asset_role(&case_id, &found.id, role)?;
+
+    if clear {
+        println!("Cleared the reference designation for {}.", found.name);
+        return Ok(());
+    }
+
+    println!(
+        "Designated {} as the reference.\n  sha256 {}",
+        found.name,
+        found.sha256.as_deref().unwrap_or("not recorded")
+    );
+    // Naming the others is not decoration: replacing a master silently would leave
+    // a reviewer unable to tell which of two files the report meant.
+    let designated = store.reference_assets(&case_id)?;
+    let others: Vec<&str> = designated
+        .iter()
+        .filter(|a| a.id != found.id)
+        .map(|a| a.name.as_str())
+        .collect();
+    if !others.is_empty() {
+        println!(
+            "  (other assets are also designated: {})",
+            others.join(", ")
+        );
+    }
     Ok(())
 }
 

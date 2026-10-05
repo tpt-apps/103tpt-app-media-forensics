@@ -22,7 +22,7 @@
 //! what the file says.
 
 /// Current schema version. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Migrations, applied in order. Index + 1 is the version it produces.
 const MIGRATIONS: &[&str] = &[
@@ -31,7 +31,29 @@ const MIGRATIONS: &[&str] = &[
     EVIDENCE_PAYLOADS,
     TIMELINE_ENTRIES,
     ANALYSIS_WRITER_VERSION,
+    ASSET_ROLES,
 ];
+
+/// Records the role an asset plays in the case (spec §67).
+///
+/// "This file is the master" is a fact about the file, so it belongs on the asset
+/// rather than as a pointer held by the case. A case-level pointer would say the
+/// same thing twice, and the two copies could disagree — one path saying the case
+/// has a master and the other naming a different file, with nothing recording which
+/// was believed.
+///
+/// A tag rather than a boolean, so a second role can be added without a
+/// migration. Media QC already distinguishes a proxy from a master from a
+/// delivery, and a boolean column would have to be replaced to say so.
+///
+/// Deliberately no `DEFAULT`, for the same reason
+/// [`ANALYSIS_WRITER_VERSION`] has none: stamping every existing row with a role
+/// would assert a designation nobody made. `NULL` therefore reads as "not recorded
+/// as a reference", which is the conservative direction — an undesignated asset
+/// will never be silently treated as the master.
+const ASSET_ROLES: &str = r#"
+ALTER TABLE assets ADD COLUMN role TEXT;
+"#;
 
 /// Records which schema version wrote each analysis row.
 ///

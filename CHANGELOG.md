@@ -56,6 +56,39 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### Recording a decision is not the same as deriving one
+- **§67's designation is now persisted** (schema v6, `assets.role`), so a case
+  reopened later can still answer "what changed?" — the gap left open when
+  `compare --reference` shipped recording only what it was handed
+- **It lives on the asset, not as a pointer held by the case.** "This file is the
+  master" is a fact about the file; a case-level pointer would say the same thing
+  twice and the two copies could disagree, with nothing recording which was
+  believed. Neither the engine nor a schema constraint can derive the designation —
+  which of two encodes is authoritative is a question about the job, not the media
+- **No `DEFAULT` on the column**, following the precedent set by
+  `analyses.writer_schema_version`. Stamping every existing row would assert a
+  designation nobody made, and `NULL` is the conservative direction: an
+  undesignated asset is never silently treated as a master. An asset written before
+  this column existed lands in exactly that state, which is why it is the state
+  that must be safe
+- **`reference --case-dir C [asset] [--clear]` designates, lists, or clears, and
+  prints the reference's SHA-256.** A designation an analyst cannot see is one they
+  cannot check. The digest was already recorded at acquisition, so designating an
+  asset binds it to specific bytes for free
+- **`--clear` deliberately still takes the asset name.** Clearing *every*
+  designation because nobody named one would be a destructive action taken by
+  omission; "clear which one" has no default answer
+- **Assets resolve by id, then exact name, then unambiguous case-insensitive
+  match.** A name comes off a filesystem and through a keyboard, and on Windows
+  neither is case-sensitive — but two assets in one case differing *only* in case
+  are two different files, and picking one would designate a master nobody named.
+  The ambiguity returns "not found" rather than guessing
+- **A designation for an asset outside the case is refused**, not silently
+  no-op'd. Succeeding would print a confirmation for something nothing recorded —
+  the one failure a reviewer could not detect from the report
+
+956 tests, up from 949.
+
 #### A golden that passes without testing anything is worse than no golden
 - **The fuzz harness asserts nothing panics. That is necessary and not sufficient.**
   A reader can never crash and still quietly misread a *valid* file — and that is

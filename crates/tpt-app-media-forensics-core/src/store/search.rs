@@ -567,6 +567,7 @@ mod tests {
                 size_bytes: 1024,
                 sha256: Some("a".repeat(64)),
                 blake3: None,
+                role: None,
             })
             .expect("asset inserted");
 

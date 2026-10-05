@@ -1028,11 +1028,23 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       `Comparison.reference` is `None` for an ordinary comparison, and
       `a_plain_comparison_claims_no_reference` asserts it, so §67 cannot quietly
       become every comparison and dress a question nobody asked up as provenance.
-      **Still not done:** persisting the designation. The reference is declared per
-      invocation and recorded in the comparison, but nothing stores "this asset is
-      the case's master", so a case reopened later cannot answer "what changed?"
-      without the original pair. That is a store migration and a UI surface, not a
-      flag.
+      **The designation is now persisted** (schema v6, `assets.role`). "This file
+      is the master" is a decision somebody made about a file, so it is recorded
+      *on the asset* rather than as a pointer held by the case — a case-level
+      pointer would say the same thing twice and the two copies could disagree.
+      Deliberately no `DEFAULT`: an existing row must read as "not recorded as a
+      reference" rather than being stamped with a designation nobody made, and
+      `NULL` is the conservative direction because an undesignated asset is never
+      silently treated as a master.
+      `reference --case-dir C [asset] [--clear]` designates, lists, or clears, and
+      prints the reference's digest — a designation an analyst cannot see is one
+      they cannot check. The digest was already recorded at acquisition, so a
+      reference is bound to specific bytes the moment it is designated.
+      Assets are found by id, then by exact name, then by unambiguous
+      case-insensitive match: a file name comes off a filesystem and through a
+      keyboard, and on Windows neither is case-sensitive — but two assets differing
+      *only* in case are two files, and picking one would designate a master nobody
+      named.
 - [ ] More advanced audio measurements (loudness standards, spectral) (§21–22)
 - [ ] More advanced visual anomaly detection
 - [ ] Richer comparison tooling (blink/overlay/difference views) (§39)
