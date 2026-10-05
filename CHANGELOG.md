@@ -56,6 +56,53 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### A master you can name is not a master you can prove
+- **Spec §67 asked "what changed?", and the engine could only answer "how do
+  these two files differ".** The comparison machinery was already there and
+  already good — eleven axes, kind-aware stream pairing, explicit tolerances. What
+  was missing was the *declaration*: nothing in a result said which master a
+  comparison was measured against, so the answer was bound to two filenames a
+  reviewer cannot verify
+- **A name is not evidence.** `Master.mov` survives being overwritten by a
+  different encode, renamed, or replaced by a copy from another job. Every one of
+  those leaves the name intact, so `compare` now records the reference's
+  **SHA-256** beside the answer and prints it. This is the same rule the rest of
+  the evidence model follows (spec §11, §32–33): the stored value is the evidence,
+  and a label is not
+- **`compare --reference` reuses the same axes rather than adding a path.** "What
+  changed since the master" is a question about the same measurements, and a
+  separate code path would be a second implementation to keep honest. What changes
+  is the claim: the sides are relabelled `Reference` and `Delivery`, and an
+  unmatched stream reads as "reference stream 1" — the master has it and the
+  delivery dropped it — rather than "left stream 1", which says nothing
+- **A reference that cannot be hashed is refused**, not compared and left
+  unlabelled. Silently degrading to a plain comparison would print "what changed
+  since the master?" with nothing recording which master, which is the single
+  output that must never exist. The refusal names the file, so a reviewer can tell
+  "the master is missing" from "the tool is broken"
+- **The digest is asserted to actually vary with the master**
+  (`two_different_masters_produce_two_different_answers`), because a reference
+  field that recorded a constant would be decoration on an unanswerable question
+- **`Comparison.reference` is `None` for an ordinary comparison**, and
+  `a_plain_comparison_claims_no_reference` asserts both the JSON and the rendered
+  output, so §67 cannot quietly become every comparison and dress a question
+  nobody asked up as a provenance claim
+- **A guard I did not know existed caught this work.** `readme_claims.rs` matches
+  README capability claims against source markers, and its marker for
+  file-to-file comparison was a literal call expression. Clippy then rewrote that
+  very call as a redundant closure, and the guard failed — a reminder that a
+  marker matching *implementation text* will eventually be rewritten by a linter
+  while the capability stays real. The marker is now the call that passes the
+  engine's function in, which is both clippy-stable and a truer statement of what
+  proves reachability
+
+Not done, and recorded as such: the designation is **not persisted**. Nothing
+stores "this asset is the case's master", so a case reopened later cannot answer
+"what changed?" without the original pair. That is a store migration and a UI
+surface, not a flag.
+
+918 tests, up from 914.
+
 #### A correct scanner that nothing called, recorded as an impossible condition
 - **A gap list can hide a defect by classifying it as a limit.** The variant guard
   added in the previous commit recorded `NonMonotonicDts` as "no fixture could

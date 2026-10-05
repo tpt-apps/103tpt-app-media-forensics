@@ -1,4 +1,23 @@
-//! File-to-file comparison (spec §38–40).
+//! File-to-file comparison (spec §38–40, §67).
+//!
+//! # A comparison against a declared reference is a different claim
+//!
+//! Comparing two arbitrary files answers "how do these differ". Comparing a
+//! delivery against a *declared reference* answers "what changed since the
+//! master" — spec §67's question, and the one the workflow exists for. The two
+//! produce the same axes and a very different evidentiary weight, because the
+//! second names what it is being measured against.
+//!
+//! So a reference is carried as [`ReferenceIdentity`] rather than as a filename.
+//! A name is not evidence: `Master.mov` can be overwritten, re-exported, or
+//! replaced by a copy from a different job, and every one of those leaves the
+//! name intact. A content digest cannot. Recording the digest beside the answer
+//! is what makes "what changed?" reproducible — a reviewer six months later can
+//! confirm which master produced it, or discover that the master has since been
+//! swapped.
+//!
+//! This is the same reasoning as the rest of the evidence model (spec §11,
+//! §32–33): the stored value is the evidence, and a label is not.
 //!
 //! # Comparing two assets is not the same as comparing two numbers
 //!
@@ -129,6 +148,47 @@ impl Difference {
     #[must_use]
     pub fn is_interesting(&self) -> bool {
         !matches!(self, Self::Equal)
+    }
+}
+
+/// The asset a comparison is measured against (spec §67).
+///
+/// Carries a content digest alongside the display name, and the digest is the
+/// load-bearing half. See the module header for why a name is not evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceIdentity {
+    /// Display name of the reference, usually its file name.
+    ///
+    /// For a human reading the output. Not sufficient on its own to identify the
+    /// asset, which is what `sha256` is for.
+    pub name: String,
+
+    /// Lowercase hexadecimal SHA-256 of the reference's bytes.
+    ///
+    /// Computed from the file as it was read, not copied from the file name, a
+    /// sidecar, or anything the file asserts about itself.
+    pub sha256: String,
+
+    /// BLAKE3 digest of the same bytes, where one was computed.
+    ///
+    /// Optional rather than required because a reference may be identified by a
+    /// single digest in a report; acquisition happens to compute both, and this
+    /// records the stronger of the pair where it is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blake3: Option<String>,
+}
+
+impl ReferenceIdentity {
+    /// A short, human-checkable rendering of the digest.
+    ///
+    /// Twelve hex characters rather than the full digest: enough for a reviewer to
+    /// confirm by eye that two reports name the same master, and short enough not
+    /// to wrap a table cell. The full digest travels beside it everywhere, so
+    /// nothing is lost — this is a display aid, not the identity.
+    #[must_use]
+    pub fn short_digest(&self) -> &str {
+        let take = self.sha256.len().min(12);
+        &self.sha256[..take]
     }
 }
 

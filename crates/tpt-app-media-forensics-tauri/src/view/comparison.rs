@@ -922,6 +922,8 @@ mod tests {
                 tolerance: 0.5,
             },
             tolerances: tpt_app_media_forensics_rules::comparison::Tolerances::default(),
+            // No declared reference: this is an ordinary file-to-file comparison.
+            reference: None,
         };
 
         let view = ComparisonView::build(&result);

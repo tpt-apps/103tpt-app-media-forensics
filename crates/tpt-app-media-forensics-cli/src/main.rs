@@ -143,11 +143,27 @@ enum Command {
     /// comparison is a read-only question about two files, and writing an
     /// analysis record for each would put evidence in the case that nobody
     /// examined.
+    ///
+    /// With `--reference`, the **first** file is treated as a declared master: it
+    /// is hashed, and the digest travels with the result. That is what turns
+    /// "these two files differ" into spec §67's "what changed since the master".
     Compare {
         /// The first file. Opened read-only.
+        ///
+        /// The declared reference when `--reference` is given.
         left: std::path::PathBuf,
+
         /// The second file. Opened read-only.
         right: std::path::PathBuf,
+
+        /// Treat the first file as a declared reference for this comparison.
+        ///
+        /// Its SHA-256 is computed from the bytes and recorded with the result, so
+        /// the answer stays bound to these exact bytes even after the file is
+        /// renamed or replaced. The output also relabels the two sides as
+        /// "Reference" and "Delivery".
+        #[arg(long)]
+        reference: bool,
     },
 
     /// Search a case's findings, assets, and evidence (spec §41).
@@ -415,7 +431,11 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             case_dir,
         } => run_batch(directory, case_dir, cli.json),
 
-        Command::Compare { left, right } => compare(left, right, cli.json),
+        Command::Compare {
+            left,
+            right,
+            reference,
+        } => compare(left, right, *reference, cli.json),
 
         Command::Validate {
             path,
@@ -1388,7 +1408,7 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
     Ok(())
 }
 
-/// Compares two media files across every measured axis (spec §38–40).
+/// Compares two media files across every measured axis (spec §38–40, §67).
 ///
 /// Analyses both files directly rather than reading a case, because a comparison
 /// is a question *about* two files rather than a finding *about* an asset: it
@@ -1407,9 +1427,56 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
 /// files, but only the first changed anything a reviewer would care about; a
 /// single number would discard exactly the information the command exists to
 /// surface.
-fn compare(left: &std::path::Path, right: &std::path::Path, json: bool) -> anyhow::Result<()> {
-    use tpt_app_media_forensics_core::AnalysisEngine;
+///
+/// # The declared reference
+///
+/// With `--reference`, the left side is a *declared master* rather than just a
+/// second path, and its content digest travels with the result. That is the whole
+/// of spec §67: the axes are identical, and what changes is that the answer is
+/// bound to specific bytes rather than to two filenames a reader cannot verify.
+///
+/// A reference that cannot be hashed is refused rather than compared and
+/// unlabelled. Silently falling back to a plain comparison would produce exactly
+/// the output the flag exists to prevent — "what changed since the master?" with
+/// nothing recording which master.
+fn compare(
+    left: &std::path::Path,
+    right: &std::path::Path,
+    declare_reference: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     use tpt_app_media_forensics_rules::comparison::compare as compare_inputs;
+    use tpt_app_media_forensics_rules::comparison::compare_against_reference;
+
+    if !declare_reference {
+        return compare_pair(left, right, json, compare_inputs);
+    }
+
+    // Hashing happens before the comparison, not after: a reference that cannot be
+    // identified must not produce a comparison at all. Falling back to the
+    // unlabelled form would emit exactly the output the flag exists to prevent —
+    // "what changed since the master?" with nothing recording which master.
+    let identity = read_reference_identity(left)?;
+    compare_pair(left, right, json, |a, b| {
+        compare_against_reference(a, b, identity.clone())
+    })
+}
+
+/// Runs the engine over both paths and emits the comparison.
+///
+/// Split out of [`compare`] so the two entry points — plain and reference —
+/// cannot drift on how a file is analysed, how it is named, or how the result is
+/// emitted. Only the comparison itself differs between them, which is the point.
+fn compare_pair(
+    left: &std::path::Path,
+    right: &std::path::Path,
+    json: bool,
+    run: impl Fn(
+        &tpt_app_media_forensics_rules::comparison::ComparisonInput<'_>,
+        &tpt_app_media_forensics_rules::comparison::ComparisonInput<'_>,
+    ) -> tpt_app_media_forensics_rules::comparison::Comparison,
+) -> anyhow::Result<()> {
+    use tpt_app_media_forensics_core::AnalysisEngine;
 
     let engine = AnalysisEngine::new();
     let left_bundle = engine.observe_stages(left).0;
@@ -1419,10 +1486,38 @@ fn compare(left: &std::path::Path, right: &std::path::Path, json: bool) -> anyho
     let right_name = display_name(right);
     let left_input = comparison_input(&left_bundle, &left_name);
     let right_input = comparison_input(&right_bundle, &right_name);
-    let result = compare_inputs(&left_input, &right_input);
+    let result = run(&left_input, &right_input);
 
     emit(json, &result, &render_comparison(&result));
     Ok(())
+}
+
+/// Hashes the declared reference so the comparison is bound to these bytes.
+///
+/// Read separately from the analysis rather than reused from it: the bundle
+/// deliberately does not carry the acquisition hashes, and re-hashing a media
+/// file the engine has just read is cheaper than the extra plumbing that would
+/// thread them through.
+///
+/// Fails rather than returning a partial identity. A reference named but not
+/// identified would put "what changed?" in a report with nothing recording which
+/// master it was measured against.
+fn read_reference_identity(
+    path: &std::path::Path,
+) -> anyhow::Result<tpt_app_media_forensics_model::ReferenceIdentity> {
+    let record = tpt_app_media_forensics_core::acquisition::acquire(path)?;
+    let sha256 = record.hashes.sha256().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: no SHA-256 could be computed for the reference",
+            path.display()
+        )
+    })?;
+
+    Ok(tpt_app_media_forensics_model::ReferenceIdentity {
+        name: display_name(path),
+        sha256: sha256.to_owned(),
+        blake3: record.hashes.blake3().map(ToOwned::to_owned),
+    })
 }
 
 /// The file's name, so a report identifies two files by more than a full path.
@@ -1501,8 +1596,26 @@ fn render_comparison(result: &tpt_app_media_forensics_rules::comparison::Compari
     use tpt_app_media_forensics_model::comparison::{ComparisonAxis, ComparisonSide};
 
     let mut out = String::new();
-    out.push_str(&format!("Left        {}\n", result.left_name));
-    out.push_str(&format!("Right       {}\n", result.right_name));
+    // When a reference is declared, the sides are relabelled. "Left" and "Right"
+    // describe a mechanism; "Reference" and "Delivery" describe the question the
+    // reader is actually asking (spec §67), and a difference then reads in the
+    // direction that matters — what the delivery did to the master.
+    let (left_label, right_label) = match result.reference() {
+        Some(_) => ("Reference", "Delivery"),
+        None => ("Left", "Right"),
+    };
+    out.push_str(&format!("{left_label:<11} {}\n", result.left_name));
+    out.push_str(&format!("{right_label:<11} {}\n", result.right_name));
+
+    // The reference's digest, printed in full.
+    //
+    // A name is not evidence: `Master.mov` survives being overwritten by a
+    // different encode. Printing the digest is what lets a reader confirm which
+    // master produced this answer, or discover that the master has since been
+    // swapped — which is the whole reason the flag exists.
+    if let Some(reference) = result.reference() {
+        out.push_str(&format!("             sha256 {}\n", reference.sha256));
+    }
 
     // Three outcomes, not two. "Equivalent" is deliberately strict — it is false
     // whenever any axis went uncomparable even if nothing differs — so printing a
@@ -1587,9 +1700,13 @@ fn render_comparison(result: &tpt_app_media_forensics_rules::comparison::Compari
     if !result.unmatched().is_empty() {
         out.push_str("Unmatched streams\n");
         for stream in result.unmatched() {
+            // Relabelled with the sides. "Left stream 1: no counterpart" tells a
+            // reviewer nothing about which file is missing the track; "reference
+            // stream 1" tells them the master has it and the delivery dropped it,
+            // which is the finding.
             let side = match stream.side {
-                ComparisonSide::Left => "left ",
-                ComparisonSide::Right => "right",
+                ComparisonSide::Left => left_label,
+                ComparisonSide::Right => right_label,
             };
             out.push_str(&format!(
                 "  {side} stream {} ({}): no counterpart\n",

@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use tpt_app_media_forensics_audio::{Measurement, Methodology, SilenceRegion};
 use tpt_app_media_forensics_metadata::{MetadataEntry, MetadataTree, Scope};
 use tpt_app_media_forensics_model::comparison::{
-    ComparisonAxis, ComparisonSide, Difference, FieldComparison, StreamComparisonResult,
-    UnmatchedStream,
+    ComparisonAxis, ComparisonSide, Difference, FieldComparison, ReferenceIdentity,
+    StreamComparisonResult, UnmatchedStream,
 };
 use tpt_app_media_forensics_model::StreamAnalysis;
 use tpt_app_media_forensics_video::scene::SceneReport;
@@ -197,9 +197,29 @@ pub struct Comparison {
     pub loudness: WithinTolerance,
     /// The tolerances used, recorded so a reader can judge each result.
     pub tolerances: Tolerances,
+    /// The declared reference this comparison was measured against (spec §67).
+    ///
+    /// `None` for an ordinary file-to-file comparison, which is the common case
+    /// and must not be dressed up as one measured against a master. The presence
+    /// of this field is what tells a reader that "what changed?" has an answer
+    /// bound to specific bytes rather than to two filenames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ReferenceIdentity>,
 }
 
 impl Comparison {
+    /// Whether this comparison was made against a declared reference (§67).
+    #[must_use]
+    pub fn is_against_reference(&self) -> bool {
+        self.reference.is_some()
+    }
+
+    /// The declared reference, when there is one.
+    #[must_use]
+    pub fn reference(&self) -> Option<&ReferenceIdentity> {
+        self.reference.as_ref()
+    }
+
     /// Streams with no counterpart, in either direction.
     #[must_use]
     pub fn unmatched(&self) -> &[UnmatchedStream] {
@@ -266,6 +286,42 @@ pub fn compare(left: &ComparisonInput<'_>, right: &ComparisonInput<'_>) -> Compa
     compare_with(left, right, Tolerances::default())
 }
 
+/// Compares a delivery against a **declared reference** (spec §67).
+///
+/// The same axes as [`compare`], and deliberately so: "what changed since the
+/// master" is a question about the same measurements, and a separate code path
+/// would be a second implementation to keep honest.
+///
+/// What differs is the claim. A plain comparison is between two files the caller
+/// happened to name; this one records *which master* the delivery is being
+/// measured against, by content digest, so the answer survives the file being
+/// renamed, moved, or replaced.
+///
+/// `left` is the reference and `right` is what is being examined. That ordering
+/// is not cosmetic: every difference in the result reads left-to-right, so the
+/// reference has to be the side that did not change.
+#[must_use]
+pub fn compare_against_reference(
+    reference: &ComparisonInput<'_>,
+    delivery: &ComparisonInput<'_>,
+    identity: ReferenceIdentity,
+) -> Comparison {
+    compare_against_reference_with(reference, delivery, identity, Tolerances::default())
+}
+
+/// [`compare_against_reference`] with explicit tolerances.
+#[must_use]
+pub fn compare_against_reference_with(
+    reference: &ComparisonInput<'_>,
+    delivery: &ComparisonInput<'_>,
+    identity: ReferenceIdentity,
+    tolerances: Tolerances,
+) -> Comparison {
+    let mut comparison = compare_with(reference, delivery, tolerances);
+    comparison.reference = Some(identity);
+    comparison
+}
+
 /// Compares two analysed assets using explicit tolerances.
 #[must_use]
 pub fn compare_with(
@@ -286,6 +342,10 @@ pub fn compare_with(
             tolerances.loudness_lu,
         ),
         tolerances,
+        // No reference: an ordinary file-to-file comparison is between two files
+        // the caller happened to name, and dressing it up as one measured against
+        // a master would claim provenance the run did not have.
+        reference: None,
     }
 }
 

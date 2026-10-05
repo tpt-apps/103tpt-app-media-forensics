@@ -1008,7 +1008,31 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       wrote a `cases` row — only `analyze` did — so an acquired-but-never-analysed
       case reported no case id and every read path treated it as empty. Not done:
       the CSV renderers omit notes (they are per-finding tables).
-- [ ] Comparison against a defined reference/master asset (§67)
+- [x] Comparison against a defined reference/master asset (§67)
+      `compare --reference <master> <delivery>`. The axes are unchanged from
+      `compare` and deliberately so — "what changed since the master" is a
+      question about the same measurements, and a second code path would be a
+      second implementation to keep honest. What changes is the **claim**: the
+      result records the master's SHA-256, and the two sides are relabelled
+      `Reference` and `Delivery`.
+      **A name is not evidence.** `Master.mov` survives being overwritten by a
+      different encode, so the digest is the only thing that lets a reviewer
+      confirm which master produced an answer, or discover that the master has
+      since been swapped. `two_different_masters_produce_two_different_answers`
+      asserts the digest actually varies with the master, since a reference field
+      that did not vary would be decoration.
+      **A reference that cannot be hashed is refused**, not compared and left
+      unlabelled — silently degrading to a plain comparison would print "what
+      changed since the master?" with nothing recording which master, which is the
+      one output that must never exist.
+      `Comparison.reference` is `None` for an ordinary comparison, and
+      `a_plain_comparison_claims_no_reference` asserts it, so §67 cannot quietly
+      become every comparison and dress a question nobody asked up as provenance.
+      **Still not done:** persisting the designation. The reference is declared per
+      invocation and recorded in the comparison, but nothing stores "this asset is
+      the case's master", so a case reopened later cannot answer "what changed?"
+      without the original pair. That is a store migration and a UI surface, not a
+      flag.
 - [ ] More advanced audio measurements (loudness standards, spectral) (§21–22)
 - [ ] More advanced visual anomaly detection
 - [ ] Richer comparison tooling (blink/overlay/difference views) (§39)

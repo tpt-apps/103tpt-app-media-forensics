@@ -83,7 +83,7 @@ macro_rules! claimed_exist {
 /// This is the check that would have caught the stale claims found by hand:
 /// colour/HDR (no reader populates `ColourInfo`), spectral (no FFT in the audio
 /// crate), and progress/cancellation (no such code in `-core`).
-const CLAIMED_EXIST: [(&str, &str, &str); 26] = claimed_exist![
+const CLAIMED_EXIST: [(&str, &str, &str); 27] = claimed_exist![
     (
         "container inspection",
         "../../tpt-app-media-forensics-container/src/mp4.rs",
@@ -254,7 +254,17 @@ const CLAIMED_EXIST: [(&str, &str, &str); 26] = claimed_exist![
     (
         "file-to-file comparison",
         "../../tpt-app-media-forensics-cli/src/main.rs",
-        "compare_inputs(&left_input, &right_input)"
+        "compare_pair(left, right, json, compare_inputs)"
+    ),
+    // Claimed as "Comparison against a declared reference" (spec §67). Checked
+    // against the *caller* for the same reason as `compare` above: the aggregate
+    // gained `compare_against_reference` in the model and rules crates, and a
+    // marker on those files would have proved nothing about a reviewer being able
+    // to reach it. The CLI is what makes the claim true.
+    (
+        "comparison against a declared reference",
+        "../../tpt-app-media-forensics-cli/src/main.rs",
+        "compare_against_reference(a, b, identity.clone())"
     ),
 ];
 

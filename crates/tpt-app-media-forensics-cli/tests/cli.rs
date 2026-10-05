@@ -125,6 +125,203 @@ fn compare_reports_a_file_as_identical_to_itself() {
 }
 
 #[test]
+fn a_declared_reference_is_recorded_by_digest_and_relabels_the_sides() {
+    // Spec §67: "users should be able to define a reference asset... what
+    // changed?". The load-bearing part is that the answer is bound to *bytes*.
+    //
+    // A file name is not evidence — `Master.mov` survives being overwritten by a
+    // different encode — so this asserts the digest travels with the result, and
+    // that the two sides are named for the question being asked rather than for
+    // their position on the command line.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let master = dir.path().join("Master.mp4");
+    let delivery = dir.path().join("Delivery.mp4");
+    std::fs::write(&master, build_mp4(&TrackSpec::video_25fps(1920, 1080, 50)))
+        .expect("writes master");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes delivery");
+
+    let output = cli()
+        .args([
+            "compare",
+            master.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+            "--reference",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "compare --reference failed: {stderr}");
+    assert!(
+        stdout.contains("Reference"),
+        "the declared side must be labelled as the reference: {stdout}"
+    );
+    assert!(
+        stdout.contains("Delivery"),
+        "the examined side must be labelled as the delivery: {stdout}"
+    );
+    assert!(
+        stdout.contains("sha256"),
+        "the reference digest must be printed or the answer names no master: {stdout}"
+    );
+    // And the differences themselves must still be reported: a reference
+    // designation is not an excuse to summarise.
+    assert!(
+        stdout.contains("DIFFERS"),
+        "what changed must still be reported: {stdout}"
+    );
+}
+
+#[test]
+fn a_plain_comparison_claims_no_reference() {
+    // The reverse direction, and the one that stops §67 from quietly becoming
+    // every comparison. An ordinary file-to-file comparison has no declared
+    // master, and printing one — or an empty placeholder for one — would dress a
+    // question nobody asked up as a provenance claim.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let left = dir.path().join("left.mp4");
+    let right = dir.path().join("right.mp4");
+    std::fs::write(&left, build_mp4(&TrackSpec::video_25fps(640, 480, 30))).expect("writes left");
+    std::fs::write(&right, build_mp4(&TrackSpec::video_25fps(320, 240, 30))).expect("writes right");
+
+    // Two runs, because the two claims live in two different outputs: the JSON
+    // document carries the structured fields, and only the rendered text carries
+    // the side labels. Checking one for the other would pass vacuously.
+    let json_run = cli()
+        .args([
+            "compare",
+            left.to_str().expect("utf-8 path"),
+            right.to_str().expect("utf-8 path"),
+            "--json",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, json_out, stderr) = split(json_run);
+    assert!(ok, "compare failed: {stderr}");
+
+    let value: serde_json::Value =
+        serde_json::from_str(&json_out).unwrap_or_else(|e| panic!("not JSON ({e}): {json_out}"));
+    assert!(
+        value.get("reference").is_none(),
+        "a comparison with no declared reference must not carry one: {json_out}"
+    );
+
+    let text_run = cli()
+        .args([
+            "compare",
+            left.to_str().expect("utf-8 path"),
+            right.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, text_out, stderr) = split(text_run);
+    assert!(ok, "compare failed: {stderr}");
+    assert!(
+        text_out.contains("Left") && text_out.contains("Right"),
+        "without a reference the sides stay positional: {text_out}"
+    );
+    assert!(
+        !text_out.contains("Reference") && !text_out.contains("sha256"),
+        "a plain comparison must not print a reference designation: {text_out}"
+    );
+}
+
+#[test]
+fn a_reference_that_cannot_be_read_fails_rather_than_comparing_unlabelled() {
+    // The failure mode the flag exists to prevent. Silently degrading to a plain
+    // comparison would print "what changed since the master?" with nothing
+    // recording which master — the one output that must never exist.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("no-such-master.mp4");
+    let delivery = dir.path().join("delivery.mp4");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(320, 240, 30)))
+        .expect("writes delivery");
+
+    let output = cli()
+        .args([
+            "compare",
+            missing.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+            "--reference",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(
+        !ok,
+        "an unreadable reference must not report success: {stdout}"
+    );
+    // And the refusal must say *why*, naming the file. A bare non-zero exit would
+    // leave a reviewer unable to tell "the master is missing" from "the tool is
+    // broken", which is the difference between acting on the answer and filing it.
+    assert!(
+        stderr.contains("no-such-master.mp4"),
+        "the failure must name the reference that could not be read: {stderr}"
+    );
+    assert!(
+        !stdout.contains("DIFFERS"),
+        "no comparison may be emitted for an unidentified reference: {stdout}"
+    );
+}
+
+#[test]
+fn two_different_masters_produce_two_different_answers() {
+    // The property that makes the digest worth carrying. If the recorded
+    // reference did not vary with the master, then "what changed?" would be
+    // unanswerable: the same output would be presented as evidence about two
+    // different masters, and a reviewer would have no way to tell.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let master_a = dir.path().join("MasterA.mp4");
+    let master_b = dir.path().join("MasterB.mp4");
+    let delivery = dir.path().join("Delivery.mp4");
+    std::fs::write(
+        &master_a,
+        build_mp4(&TrackSpec::video_25fps(1920, 1080, 50)),
+    )
+    .expect("writes master A");
+    // Same nominal shape, different bytes: a different encode of one master, which
+    // is exactly the case a filename cannot distinguish.
+    std::fs::write(
+        &master_b,
+        build_mp4(&TrackSpec::video_25fps(1920, 1080, 40)),
+    )
+    .expect("writes master B");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes delivery");
+
+    let digest_for = |master: &std::path::Path| -> String {
+        let output = cli()
+            .args([
+                "compare",
+                master.to_str().expect("utf-8 path"),
+                delivery.to_str().expect("utf-8 path"),
+                "--reference",
+                "--json",
+            ])
+            .output()
+            .expect("runs CLI");
+        let (ok, stdout, stderr) = split(output);
+        assert!(ok, "compare --reference failed: {stderr}");
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"));
+        value["reference"]["sha256"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the JSON must carry the reference digest: {stdout}"))
+            .to_owned()
+    };
+
+    let a = digest_for(&master_a);
+    let b = digest_for(&master_b);
+    assert_ne!(
+        a, b,
+        "two different masters must record two different digests, or the digest is \
+         not identifying the reference"
+    );
+}
+
+#[test]
 fn compare_emits_machine_readable_json() {
     // `compare --json` has to be one parseable document, like every other
     // machine-readable path in this CLI.

@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   914 passing
+tests   918 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -110,6 +110,14 @@ one that names the gap:
   are reported as uncomparable rather than as agreement, and there is no
   similarity score — a re-mux and a re-encode both change bytes, but only one
   changes anything a reviewer would care about
+- **Comparison against a declared reference** — `compare --reference` measures a
+  delivery against a named master and records that master's **SHA-256** with the
+  result, which is what makes spec §67's "what changed since the master?"
+  reproducible. A file name is not evidence: `Master.mov` survives being overwritten
+  by a different encode, so the digest is what lets a reviewer confirm which master
+  produced an answer, or discover that the master has since been swapped. The two
+  sides are relabelled `Reference` and `Delivery`, and a reference that cannot be
+  hashed is refused rather than compared and left unlabelled
 
 ### Planned, not built
 

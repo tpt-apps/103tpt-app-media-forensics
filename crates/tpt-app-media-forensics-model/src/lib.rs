@@ -42,7 +42,7 @@ pub use asset::{
 pub use case::Case;
 pub use comparison::{
     compare_pair, compare_streams, compare_timing, ComparisonAxis, ComparisonSide, Difference,
-    FieldComparison, StreamComparison, StreamComparisonResult, UnmatchedStream,
+    FieldComparison, ReferenceIdentity, StreamComparison, StreamComparisonResult, UnmatchedStream,
 };
 pub use delivery::{
     trim_float, DeliveryProfile, DeliveryReport, Requirement, RequirementCheck, RequirementOutcome,
