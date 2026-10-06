@@ -385,9 +385,10 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       `readme_claims.rs` no longer denies the capability; it now *checks* it
       against the CLI rather than against the engine, so the claim is anchored to
       the caller that makes it true.
-      Not done: comparison against a designated reference master recorded in the
-      case (§67). `compare` takes two arbitrary paths and has no notion of a
-      stored reference.
+      Comparison against a designated reference master recorded in the case (§67)
+      is built: `compare --case-dir <case> <delivery>` resolves the stored
+      designation, verifies the designated file still matches its recorded
+      digest, and refuses when zero or several assets are designated.
 - [x] Implement search over case data (§41)
       `-core/src/store/search.rs`: `SearchQuery` with text, scope
       (findings/assets/evidence), severity floor, asset filter, and row limit.
@@ -1045,6 +1046,15 @@ License: dual **MIT OR Apache-2.0**, copyright TPT Solutions.
       keyboard, and on Windows neither is case-sensitive — but two assets differing
       *only* in case are two files, and picking one would designate a master nobody
       named.
+      **The designation now has its consumer:** `compare --case-dir <case>
+      <delivery>` resolves the reference from the stored role, so a reopened case
+      answers "what changed?" without the master's path. The designated file is
+      re-hashed first and refused if it no longer matches its recorded digest —
+      the designation names bytes, not a path. Zero designations refuse (nothing
+      to measure against), several refuse naming every conflict (picking one
+      would choose a master nobody did), and a mistyped `--case-dir` creates no
+      directory, because the manifest check precedes `Store::open`'s
+      `create_dir_all`.
 - [ ] More advanced audio measurements (loudness standards, spectral) (§21–22)
 - [ ] More advanced visual anomaly detection
 - [ ] Richer comparison tooling (blink/overlay/difference views) (§39)

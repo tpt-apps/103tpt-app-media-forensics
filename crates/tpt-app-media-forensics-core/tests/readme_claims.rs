@@ -83,7 +83,7 @@ macro_rules! claimed_exist {
 /// This is the check that would have caught the stale claims found by hand:
 /// colour/HDR (no reader populates `ColourInfo`), spectral (no FFT in the audio
 /// crate), and progress/cancellation (no such code in `-core`).
-const CLAIMED_EXIST: [(&str, &str, &str); 27] = claimed_exist![
+const CLAIMED_EXIST: [(&str, &str, &str); 28] = claimed_exist![
     (
         "container inspection",
         "../../tpt-app-media-forensics-container/src/mp4.rs",
@@ -265,6 +265,16 @@ const CLAIMED_EXIST: [(&str, &str, &str); 27] = claimed_exist![
         "comparison against a declared reference",
         "../../tpt-app-media-forensics-cli/src/main.rs",
         "compare_against_reference(a, b, identity.clone())"
+    ),
+    // Claimed as "Comparison against a case's designated reference". Checked
+    // against the resolver in the CLI for the same reason as the two entries
+    // above: `reference_assets` existing in the store would prove nothing about
+    // `compare` reaching it. The marker is the call that turns the stored
+    // designation into the reference side of a comparison.
+    (
+        "designated reference",
+        "../../tpt-app-media-forensics-cli/src/main.rs",
+        "let (reference, identity) = resolve_designated_reference(case_dir)?;"
     ),
 ];
 

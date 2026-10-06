@@ -165,22 +165,42 @@ enum Command {
 
     /// Compare two media files across every measured axis (spec §38–40).
     ///
-    /// Both files are analysed directly. No case directory is involved: a
-    /// comparison is a read-only question about two files, and writing an
-    /// analysis record for each would put evidence in the case that nobody
-    /// examined.
+    /// Two ways in, because the master can be named two ways:
+    ///
+    /// * `compare <left> <right>` — both files are given on the command line
+    ///   and analysed directly. No case directory is involved: a comparison is
+    ///   a read-only question about two files, and writing an analysis record
+    ///   for each would put evidence in the case that nobody examined.
+    /// * `compare --case-dir <dir> <delivery>` — the reference is whatever the
+    ///   case has designated (spec §67), so a reopened case answers "what
+    ///   changed since the master" without the analyst having to track the
+    ///   master's path back down. Still no analysis record is written for
+    ///   either file; the case is opened only to read the designation.
     ///
     /// With `--reference`, the **first** file is treated as a declared master: it
     /// is hashed, and the digest travels with the result. That is what turns
     /// "these two files differ" into spec §67's "what changed since the master".
+    /// `--case-dir` is the same claim reached from the stored designation, so
+    /// the two flags are alternatives rather than layers and clap refuses them
+    /// together.
     Compare {
         /// The first file. Opened read-only.
         ///
-        /// The declared reference when `--reference` is given.
+        /// The declared reference when `--reference` is given. With
+        /// `--case-dir` this is the **delivery**: the case supplies the
+        /// reference, so the one file named here is the side being examined.
         left: std::path::PathBuf,
 
         /// The second file. Opened read-only.
-        right: std::path::PathBuf,
+        ///
+        /// Required unless `--case-dir` is given, which resolves the reference
+        /// side from the case's designation and therefore takes only the
+        /// delivery. The two rules are complementary: without `--case-dir`
+        /// this argument is required, and with it this argument is refused —
+        /// `compare --case-dir <dir> <left> <right>` would be ambiguous about
+        /// which side the stored master replaced.
+        #[arg(required_unless_present = "case_dir", conflicts_with = "case_dir")]
+        right: Option<std::path::PathBuf>,
 
         /// Treat the first file as a declared reference for this comparison.
         ///
@@ -188,8 +208,21 @@ enum Command {
         /// the answer stays bound to these exact bytes even after the file is
         /// renamed or replaced. The output also relabels the two sides as
         /// "Reference" and "Delivery".
-        #[arg(long)]
+        #[arg(long, conflicts_with = "case_dir")]
         reference: bool,
+
+        /// Measure the delivery against this case's designated reference (spec §67).
+        ///
+        /// The reference comes from the stored designation rather than the
+        /// command line. The designated file is re-hashed before anything is
+        /// compared and refused if it no longer matches the digest recorded
+        /// when it was designated: a master replaced at the same path is not
+        /// the master the case names. With no designation the command refuses
+        /// (there would be nothing to compare against), and with several it
+        /// refuses naming all of them, because picking one would measure a
+        /// delivery against a master nobody chose for it.
+        #[arg(long)]
+        case_dir: Option<std::path::PathBuf>,
     },
 
     /// Search a case's findings, assets, and evidence (spec §41).
@@ -467,7 +500,14 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             left,
             right,
             reference,
-        } => compare(left, right, *reference, cli.json),
+            case_dir,
+        } => compare(
+            left,
+            right.as_deref(),
+            *reference,
+            case_dir.as_deref(),
+            cli.json,
+        ),
 
         Command::Validate {
             path,
@@ -1443,9 +1483,10 @@ fn analyse(path: &std::path::Path, case_dir: &std::path::Path, json: bool) -> an
 /// Designates, clears, or lists a case's reference asset (spec §67).
 ///
 /// Prints the designation with the reference's SHA-256, because the point of
-/// recording it is that a later `compare --reference` can name the exact bytes it
-/// measured against. A designation an analyst cannot see is a designation they
-/// cannot check.
+/// recording it is that a later `compare --case-dir` can measure a delivery
+/// against those exact bytes without the path being tracked down again — and
+/// can refuse when the file no longer hashes to what is printed here. A
+/// designation an analyst cannot see is a designation they cannot check.
 fn run_reference(
     case_dir: &std::path::Path,
     asset: Option<&str>,
@@ -1527,6 +1568,26 @@ fn run_reference(
 /// creates no case, writes no analysis record, and touches nothing. Both sources
 /// are opened read-only.
 ///
+/// # The declared reference
+///
+/// The reference side can be named two ways, and both land on the same claim:
+///
+/// * `--reference` declares the first file a master for this run — hashed here,
+///   now, with the digest travelling into the result.
+/// * `--case-dir` takes the reference from the case's designation (spec §67),
+///   re-hashing the designated file first so a master replaced at its recorded
+///   path is refused rather than silently measured. The first file is then the
+///   delivery. The case is opened only to read the designation; nothing is
+///   written back.
+///
+/// Either way the axes are identical, and what changes is that the answer is
+/// bound to specific bytes rather than to two filenames a reader cannot verify.
+///
+/// A reference that cannot be hashed is refused rather than compared and
+/// unlabelled. Silently falling back to a plain comparison would produce exactly
+/// the output the flag exists to prevent — "what changed since the master?" with
+/// nothing recording which master.
+///
 /// # What the output does and does not claim
 ///
 /// The result reports differences and, separately, axes it could not compare.
@@ -1539,26 +1600,34 @@ fn run_reference(
 /// files, but only the first changed anything a reviewer would care about; a
 /// single number would discard exactly the information the command exists to
 /// surface.
-///
-/// # The declared reference
-///
-/// With `--reference`, the left side is a *declared master* rather than just a
-/// second path, and its content digest travels with the result. That is the whole
-/// of spec §67: the axes are identical, and what changes is that the answer is
-/// bound to specific bytes rather than to two filenames a reader cannot verify.
-///
-/// A reference that cannot be hashed is refused rather than compared and
-/// unlabelled. Silently falling back to a plain comparison would produce exactly
-/// the output the flag exists to prevent — "what changed since the master?" with
-/// nothing recording which master.
 fn compare(
     left: &std::path::Path,
-    right: &std::path::Path,
+    right: Option<&std::path::Path>,
     declare_reference: bool,
+    case_dir: Option<&std::path::Path>,
     json: bool,
 ) -> anyhow::Result<()> {
     use tpt_app_media_forensics_rules::comparison::compare as compare_inputs;
     use tpt_app_media_forensics_rules::comparison::compare_against_reference;
+
+    // `--case-dir` mode: the reference comes from the case, so `left` — the
+    // only positional clap leaves standing — is the delivery, and the stored
+    // master takes the reference side of the comparison.
+    if let Some(case_dir) = case_dir {
+        let (reference, identity) = resolve_designated_reference(case_dir)?;
+        return compare_pair(&reference, left, json, |a, b| {
+            compare_against_reference(a, b, identity.clone())
+        });
+    }
+
+    // clap requires the second file exactly when `--case-dir` is absent, so
+    // this is an invariant of the parser rather than a runtime possibility.
+    let right = right.ok_or_else(|| {
+        anyhow::anyhow!(
+            "compare needs two files (or --case-dir with one); clap should have \
+             rejected this invocation before reaching the engine"
+        )
+    })?;
 
     if !declare_reference {
         return compare_pair(left, right, json, compare_inputs);
@@ -1572,6 +1641,106 @@ fn compare(
     compare_pair(left, right, json, |a, b| {
         compare_against_reference(a, b, identity.clone())
     })
+}
+
+/// Resolves the case's designated reference to a file path and its identity
+/// (spec §67).
+///
+/// This is what turns a recorded designation into something `compare` can
+/// measure against, and it refuses in three situations rather than guessing:
+///
+/// * **no designation** — there is nothing to compare the delivery against, and
+///   degrading to a plain comparison is impossible: `--case-dir` mode has only
+///   one positional, so a fallback would be a comparison of the delivery with
+///   nothing;
+/// * **several designations** — a case may legitimately hold one master per
+///   deliverable, and picking one here would measure the delivery against a
+///   master nobody chose for it, so every conflicting name is reported;
+/// * **a file that no longer matches its recorded digest** — the designation
+///   names bytes, not a path. `Master.mp4` survives being overwritten by a
+///   different encode, and measuring against the replacement while calling it
+///   the designated master is precisely the swap the digest exists to catch.
+///
+/// The digest check is skipped only when acquisition recorded no SHA-256 at
+/// all: there is then nothing to disagree with, and the identity computed here
+/// from the bytes still binds the comparison to what was actually read.
+///
+/// # Errors
+///
+/// Returns an error if the path is not an initialised case, the database cannot
+/// be read, no reference is designated, several are, the designated file cannot
+/// be read or hashed, or its bytes no longer match the digest recorded when it
+/// was designated.
+fn resolve_designated_reference(
+    case_dir: &std::path::Path,
+) -> anyhow::Result<(
+    std::path::PathBuf,
+    tpt_app_media_forensics_model::ReferenceIdentity,
+)> {
+    use tpt_app_media_forensics_core::store::Store;
+    use tpt_app_media_forensics_core::CaseDirectory;
+
+    // The manifest check comes first because `Store::open` creates whatever it
+    // is pointed at: a mistyped `--case-dir` must fail without materialising a
+    // directory that looks like a case. Same ordering `search` uses.
+    let directory = CaseDirectory::open(case_dir)
+        .with_context(|| format!("{} is not an initialised case", case_dir.display()))?;
+    let store = Store::open(directory.root())?;
+    let case_id = store
+        .only_case_id()?
+        .ok_or_else(|| anyhow::anyhow!("{} holds no case record", case_dir.display()))?;
+
+    let designated = store.reference_assets(&case_id)?;
+    match designated.len() {
+        0 => anyhow::bail!(
+            "{} designates no reference, so there is no master to measure the delivery \
+             against; run `reference --case-dir {} <asset>` to designate one, or compare \
+             two files on the command line without `--case-dir`",
+            case_dir.display(),
+            case_dir.display()
+        ),
+        1 => {}
+        _ => {
+            let names: Vec<&str> = designated.iter().map(|a| a.name.as_str()).collect();
+            anyhow::bail!(
+                "{} designates {} references ({}), and a delivery has one master; clear \
+                 the extras with `reference --case-dir {} <asset> --clear`, or compare on \
+                 the command line with `--reference`",
+                case_dir.display(),
+                names.len(),
+                names.join(", "),
+                case_dir.display()
+            );
+        }
+    }
+    let asset = designated
+        .into_iter()
+        .next()
+        .expect("exactly one designation, checked above");
+
+    let source = std::path::PathBuf::from(&asset.source_path);
+    let identity = read_reference_identity(&source).with_context(|| {
+        format!(
+            "the designated reference {} was recorded at {}, which could not be read",
+            asset.name, asset.source_path
+        )
+    })?;
+
+    if let Some(recorded) = asset.sha256.as_deref() {
+        if recorded != identity.sha256 {
+            anyhow::bail!(
+                "{} no longer matches the digest recorded when it was designated:\n  \
+                 recorded {}\n  current  {}\nThe file has changed since acquisition, so it \
+                 is not the master this case names; re-run `analyze` and re-designate, or \
+                 restore the original bytes",
+                asset.name,
+                recorded,
+                identity.sha256
+            );
+        }
+    }
+
+    Ok((source, identity))
 }
 
 /// Runs the engine over both paths and emits the comparison.

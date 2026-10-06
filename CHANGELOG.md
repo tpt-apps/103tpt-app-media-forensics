@@ -56,6 +56,33 @@ All notable changes to this project are documented in this file, following
   missed beside the value observed instead. The requirement table renders into
   HTML and PDF, and the bundle carries the profile fingerprint
 
+#### A reopened case can now answer "what changed?" without the master's path
+- **`compare --case-dir <case> <delivery>` measures a delivery against the case's
+  designated reference.** §67's designation was persisted and could be listed and
+  cleared, but nothing consumed it — the loop closed only when the analyst also had
+  the master's path to type. The stored designation is what names the reference side
+  now, and the output carries the same digest the `reference` command prints
+- **The designated file is re-hashed and checked against its recorded digest before
+  anything is compared.** The designation names bytes, not a path: `Master.mp4`
+  survives being overwritten by a different encode, and measuring the replacement
+  while calling it the designated master would bind the answer to bytes nobody
+  designated. A mismatch is refused with both digests shown rather than
+  downgraded — the refusal is the feature
+- **No designation refuses, and several refuse naming every conflict.** With one
+  positional there is nothing to fall back to, so an undesignated case says which
+  command creates the designation it needs rather than inventing a reference. A case
+  may legitimately hold one master per deliverable; picking one here would measure
+  the delivery against a master nobody chose for it, so all conflicting names are
+  reported with the `--clear` command that resolves them
+- **A mistyped `--case-dir` creates nothing.** `Store::open` does `create_dir_all`,
+  so the manifest check runs first — a read-only command pointed at a nonexistent
+  path must not leave behind a directory that looks like a case
+- **Plain `compare` still claims no reference**, even when the case it was never
+  given has a designation: `--case-dir` is the only thing that consumes it, so §67
+  cannot quietly become every comparison
+
+962 tests, up from 956.
+
 #### Recording a decision is not the same as deriving one
 - **§67's designation is now persisted** (schema v6, `assets.role`), so a case
   reopened later can still answer "what changed?" — the gap left open when

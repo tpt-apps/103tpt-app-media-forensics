@@ -28,7 +28,7 @@ See [`todo.md`](todo.md) for the full plan and
 
 ```text
 build   passing
-tests   956 passing
+tests   962 passing
 clippy  clean (workspace, all targets, -D warnings)
 fmt     clean
 ```
@@ -118,6 +118,14 @@ one that names the gap:
   produced an answer, or discover that the master has since been swapped. The two
   sides are relabelled `Reference` and `Delivery`, and a reference that cannot be
   hashed is refused rather than compared and left unlabelled
+- **Comparison against a case's designated reference** — `compare --case-dir <case>
+  <delivery>` resolves the reference from the designation recorded by the
+  `reference` command, so a reopened case answers "what changed since the master"
+  without the master's path being tracked down again. The designated file is
+  re-hashed first and refused if it no longer matches the digest recorded when it
+  was designated — the designation names bytes, not a path. With no designation the
+  command refuses rather than inventing a reference, and with several it refuses
+  naming every conflicting asset rather than picking one nobody chose
 
 ### Planned, not built
 
@@ -127,7 +135,6 @@ reappears in the list above.
 
 | Capability | Spec | State |
 |---|---|---|
-| Comparison against a designated *reference master* recorded in the case | §67 | not started; `compare` takes two arbitrary files and holds no notion of a stored reference |
 | Colour for Matroska / WebM | §45 | not started; the Matroska reader exposes no picture geometry, so there is no video format to attach colour to |
 | A corrupt-media corpus held on disk | §76 | directories are empty; every damaged file today is built in code by a fixture |
 

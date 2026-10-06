@@ -973,6 +973,316 @@ fn designating_an_asset_the_case_does_not_hold_is_refused() {
 }
 
 #[test]
+fn compare_with_case_dir_resolves_the_reference_recorded_in_the_case() {
+    // The §67 loop closed: the designation persisted by `reference` is what
+    // `compare` now measures against, so a reopened case answers "what changed
+    // since the master" without the master's path being supplied again. The
+    // digest in the output must be the one the case recorded — that is the
+    // whole claim, that the answer is bound to the designated bytes.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+    let designated = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            "sample.mp4",
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(designated.status.success(), "designation failed");
+    let listed = String::from_utf8_lossy(&designated.stdout).into_owned();
+    let recorded = listed
+        .split("sha256")
+        .nth(1)
+        .expect("designation prints a digest")
+        .split_whitespace()
+        .next()
+        .expect("digest token")
+        .to_owned();
+
+    let delivery = dir.path().join("delivery.mp4");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes delivery");
+
+    let output = cli()
+        .args([
+            "compare",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "compare --case-dir failed: {stderr}");
+    assert!(
+        stdout.contains("Reference") && stdout.contains("Delivery"),
+        "the stored designation must relabel the sides: {stdout}"
+    );
+    assert!(
+        stdout.contains(&recorded),
+        "the comparison must carry the digest the case recorded ({recorded}): {stdout}"
+    );
+    assert!(
+        stdout.contains("sample.mp4"),
+        "the reference side must be named as the case names it: {stdout}"
+    );
+    assert!(
+        stdout.contains("DIFFERS"),
+        "the delivery must still be measured: {stdout}"
+    );
+
+    // The structured form carries the same claim, for a report to quote.
+    let json = cli()
+        .args([
+            "compare",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+            "--json",
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, json_out, stderr) = split(json);
+    assert!(ok, "compare --case-dir --json failed: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(&json_out).unwrap_or_else(|e| panic!("not JSON ({e}): {json_out}"));
+    assert_eq!(
+        value["reference"]["sha256"], recorded,
+        "the JSON reference must be the designated bytes: {json_out}"
+    );
+}
+
+#[test]
+fn compare_with_case_dir_refuses_a_reference_whose_bytes_changed() {
+    // The designation names bytes, not a path. Overwriting the master at its
+    // recorded path with a different encode is exactly the swap the digest
+    // exists to catch: measuring the replacement while calling it the
+    // designated master would bind the answer to bytes nobody designated.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+    let designated = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            "sample.mp4",
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(designated.status.success(), "designation failed");
+
+    // Same path, different bytes — a renamed/replaced master.
+    std::fs::write(
+        dir.path().join("sample.mp4"),
+        build_mp4(&TrackSpec::video_25fps(640, 480, 30)),
+    )
+    .expect("replaces the master");
+
+    let delivery = dir.path().join("delivery.mp4");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(320, 240, 30)))
+        .expect("writes delivery");
+
+    let output = cli()
+        .args([
+            "compare",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(
+        !ok,
+        "a master that changed since designation must not be compared"
+    );
+    assert!(
+        stderr.contains("no longer matches the digest"),
+        "the refusal must name the failed check: {stderr}"
+    );
+    assert!(
+        stderr.contains("sample.mp4"),
+        "the refusal must name the asset: {stderr}"
+    );
+}
+
+#[test]
+fn compare_with_case_dir_refuses_when_the_case_designates_nothing() {
+    // With one positional there is nothing to fall back to: a plain
+    // comparison of the delivery alone is not a comparison. The refusal must
+    // say which command creates the designation it needs.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+    let delivery = dir.path().join("delivery.mp4");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes delivery");
+
+    let output = cli()
+        .args([
+            "compare",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "an undesignated case must not produce a comparison");
+    assert!(
+        stderr.contains("designates no reference"),
+        "the refusal must state what is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("reference --case-dir"),
+        "the refusal must name the command that fixes it: {stderr}"
+    );
+}
+
+#[test]
+fn compare_with_case_dir_refuses_when_several_assets_are_designated_naming_them() {
+    // A case may hold one master per deliverable, and `reference` says so when
+    // it designates a second. Picking one here would measure the delivery
+    // against a master nobody chose for *this* comparison, so every
+    // conflicting name is reported instead.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+
+    let extra = dir.path().join("extra.mp4");
+    std::fs::write(&extra, build_mp4(&TrackSpec::video_25fps(640, 480, 30))).expect("writes extra");
+    let analysed = cli()
+        .args([
+            "analyze",
+            extra.to_str().expect("utf-8 path"),
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(analysed.status.success(), "analyze failed");
+
+    for asset in ["sample.mp4", "extra.mp4"] {
+        let designated = cli()
+            .args([
+                "reference",
+                "--case-dir",
+                case_dir.to_str().expect("utf-8 path"),
+                asset,
+            ])
+            .output()
+            .expect("runs CLI");
+        assert!(designated.status.success(), "designation of {asset} failed");
+    }
+
+    let delivery = dir.path().join("delivery.mp4");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes delivery");
+
+    let output = cli()
+        .args([
+            "compare",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "several designations must not be silently arbitrated");
+    for name in ["sample.mp4", "extra.mp4"] {
+        assert!(
+            stderr.contains(name),
+            "the refusal must name every conflicting asset, {name} included: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("--clear"),
+        "the refusal must say how to resolve the conflict: {stderr}"
+    );
+}
+
+#[test]
+fn plain_compare_with_a_designated_case_still_claims_no_reference() {
+    // The wiring is opt-in. `--case-dir` is what consumes the designation; a
+    // plain comparison must not reach into an unrelated case (it is not even
+    // given one) and dress itself up as measured-against-a-master. This is the
+    // same invariant `a_plain_comparison_claims_no_reference` pins for a case
+    // with no designation — here the designation exists and is still not
+    // claimed without being asked for.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let case_dir = analysed_case(dir.path());
+    let designated = cli()
+        .args([
+            "reference",
+            "--case-dir",
+            case_dir.to_str().expect("utf-8 path"),
+            "sample.mp4",
+        ])
+        .output()
+        .expect("runs CLI");
+    assert!(designated.status.success(), "designation failed");
+
+    let left = dir.path().join("left.mp4");
+    let right = dir.path().join("right.mp4");
+    std::fs::write(&left, build_mp4(&TrackSpec::video_25fps(640, 480, 30))).expect("writes left");
+    std::fs::write(&right, build_mp4(&TrackSpec::video_25fps(320, 240, 30))).expect("writes right");
+
+    let output = cli()
+        .args([
+            "compare",
+            left.to_str().expect("utf-8 path"),
+            right.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, stdout, stderr) = split(output);
+
+    assert!(ok, "compare failed: {stderr}");
+    assert!(
+        !stdout.contains("Reference") && !stdout.contains("sha256"),
+        "a plain comparison must not import a designation it was never given: {stdout}"
+    );
+}
+
+#[test]
+fn compare_with_a_case_dir_that_does_not_exist_creates_nothing() {
+    // `Store::open` does `create_dir_all` — pointed at a mistyped path it would
+    // build a directory that looks like a case, from a read-only command. The
+    // manifest check runs first so the failure leaves the filesystem untouched.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("no-such-case.tptcase");
+    let delivery = dir.path().join("delivery.mp4");
+    std::fs::write(&delivery, build_mp4(&TrackSpec::video_25fps(1280, 720, 50)))
+        .expect("writes delivery");
+
+    let output = cli()
+        .args([
+            "compare",
+            "--case-dir",
+            missing.to_str().expect("utf-8 path"),
+            delivery.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("runs CLI");
+    let (ok, _, stderr) = split(output);
+
+    assert!(!ok, "a non-existent case must not produce a comparison");
+    assert!(
+        stderr.contains("not an initialised case"),
+        "the refusal must say the directory is not a case: {stderr}"
+    );
+    assert!(
+        !missing.exists(),
+        "a read-only command must not create the directory it was pointed at"
+    );
+}
+
+#[test]
 fn report_writes_each_supported_format() {
     let dir = tempfile::tempdir().expect("temp dir");
     let case_dir = analysed_case(dir.path());
